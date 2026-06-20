@@ -36,6 +36,37 @@ def test_api_key_resolution(tenancy):
     assert t.resolve_key("rya_sk_nonsense") is None
 
 
+def test_self_serve_signup_login_workspace(tenancy):
+    import pytest as _pytest
+    from rya.errors import RyaError
+    t, _ = tenancy
+    import psycopg
+    with psycopg.connect(PG, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("TRUNCATE rya_users CASCADE")
+
+    # signup → user + first workspace + an API key, all in one step
+    res = t.signup("Ada@Acme.io", "supersecret1", "Acme")
+    assert res["user"]["email"] == "ada@acme.io"             # normalized
+    assert res["apiKey"].startswith("rya_sk_")
+    assert t.resolve_key(res["apiKey"]) == res["workspace"]["id"]
+
+    # password is hashed, never stored plaintext
+    with psycopg.connect(PG, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT password_hash FROM rya_users WHERE email='ada@acme.io'")
+        assert "supersecret1" not in cur.fetchone()[0]
+
+    # login verifies credentials and lists the user's workspaces
+    assert t.authenticate("ada@acme.io", "supersecret1")["id"] == res["user"]["id"]
+    assert t.authenticate("ada@acme.io", "wrong") is None
+    wss = t.list_user_workspaces(res["user"]["id"])
+    assert [w["id"] for w in wss] == [res["workspace"]["id"]]
+
+    # duplicate email is rejected
+    with _pytest.raises(RyaError) as e:
+        t.signup("ada@acme.io", "anotherpass1")
+    assert e.value.code == "E_EMAIL_TAKEN"
+
+
 def test_app_layer_isolation(tenancy):
     from rya.store_postgres import PostgresStore
 

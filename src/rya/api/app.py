@@ -691,6 +691,69 @@ def build_app(root: Path) -> FastAPI:
                 "apiKey": key["key"],  # shown ONCE — only the hash is stored
                 "remoteMcp": f"{base}/mcp" if mcp_asgi is not None else None, "api": base}
 
+    # ---- self-serve onboarding (sign up → workspace → key) ----------------
+    def _require_mt():
+        if not mt:
+            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
+                "message": "Onboarding/accounts require multi-tenant mode (RYA_MULTITENANT=1 + Postgres)."})
+
+    def _session(authorization: Optional[str], x_rya_session: Optional[str]):
+        from ..accounts import verify_session
+        tok = x_rya_session or _bearer(authorization, None)
+        payload = verify_session(tok)
+        if not payload:
+            raise HTTPException(status_code=401, detail={"code": "E_UNAUTHORIZED",
+                "message": "Sign in first.", "hint": "POST /v1/login to get a session token."})
+        return payload
+
+    @api.post("/v1/signup")
+    async def signup(request: Request):
+        from ..accounts import issue_session
+        _require_mt()
+        body = await request.json()
+        try:
+            res = tenancy.signup(body.get("email", ""), body.get("password", ""),
+                                 body.get("workspaceName") or "My workspace")
+        except RyaError as e:
+            code = 409 if e.code == "E_EMAIL_TAKEN" else 400
+            raise HTTPException(status_code=code, detail=e.to_dict()["error"])
+        token = issue_session(res["user"]["id"], res["user"]["email"])
+        base = str(request.base_url).rstrip("/")
+        return {"ok": True, "token": token, "user": res["user"], "workspace": res["workspace"],
+                "apiKey": res["apiKey"],  # shown ONCE — save it
+                "remoteMcp": f"{base}/mcp" if mcp_asgi is not None else None, "api": base}
+
+    @api.post("/v1/login")
+    async def login_account(request: Request):
+        from ..accounts import issue_session
+        _require_mt()
+        body = await request.json()
+        user = tenancy.authenticate(body.get("email", ""), body.get("password", ""))
+        if not user:
+            raise HTTPException(status_code=401, detail={"code": "E_UNAUTHORIZED",
+                "message": "Invalid email or password."})
+        token = issue_session(user["id"], user["email"])
+        return {"ok": True, "token": token, "user": user,
+                "workspaces": tenancy.list_user_workspaces(user["id"])}
+
+    @api.get("/v1/me")
+    def whoami_account(authorization: Optional[str] = Header(None),
+                       x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        return {"user": {"id": s["sub"], "email": s["email"]},
+                "workspaces": tenancy.list_user_workspaces(s["sub"])}
+
+    @api.post("/v1/workspaces")
+    async def create_user_workspace(request: Request, authorization: Optional[str] = Header(None),
+                                    x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        body = await request.json()
+        ws = tenancy.create_workspace(body.get("name") or "Workspace", owner_user_id=s["sub"])
+        key = tenancy.create_api_key(ws["id"], label=body.get("label", "default"))
+        return {"ok": True, "workspace": ws, "apiKey": key["key"]}
+
     # Mount remote MCP last so its catch-all under /mcp doesn't shadow API routes.
     if mcp_asgi is not None:
         api.mount("/mcp", mcp_asgi)

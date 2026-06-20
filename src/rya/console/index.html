@@ -170,6 +170,15 @@
   .authcard input{width:100%;border:1px solid var(--border-2);border-radius:9px;padding:9px 12px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text);outline:0;margin-bottom:12px}
   .authcard input:focus{border-color:#cfcdc8;box-shadow:0 0 0 3px rgba(0,0,0,.03)}
   .authcard .btn{width:100%;justify-content:center}
+  .authtabs{display:flex;gap:4px;background:var(--subtle);border:1px solid var(--border-2);border-radius:9px;padding:3px;margin-bottom:14px}
+  .atab{flex:1;border:0;background:transparent;border-radius:6px;padding:6px;font-size:12.5px;font-weight:500;color:var(--text-2)}
+  .atab.on{background:#fff;color:var(--black);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+  .apanel.hidden{display:none}
+  .aerr{color:var(--red);font-size:12.5px;margin-top:4px;min-height:16px}
+  .wsrow{display:flex;align-items:center;gap:9px;border:1px solid var(--border-2);border-radius:9px;padding:9px 11px;margin-bottom:8px}
+  .wsrow .nm{font-size:13px;font-weight:500}.wsrow .btn{width:auto;margin-left:auto;padding:5px 10px;font-size:12px}
+  .keynote{background:var(--green-bg);border:1px solid #c3f0cd;border-radius:9px;padding:10px 12px;font-size:12px;margin-bottom:12px;word-break:break-all}
+  .keynote .mono{color:var(--black);font-weight:500}
   .thread{display:flex;flex-direction:column;gap:12px}
   .msg{max-width:74%;display:flex;flex-direction:column;gap:3px}
   .msg.in{align-self:flex-start}.msg.out{align-self:flex-end;align-items:flex-end}
@@ -270,11 +279,31 @@
 <div class="authwrap" id="authwrap">
   <div class="authcard" role="dialog" aria-modal="true" aria-labelledby="authTitle">
     <div class="al"><i data-lucide="git-commit-vertical"></i></div>
-    <h3 id="authTitle">Connect to your Rya runtime</h3>
-    <p>This runtime requires an operator token. It's stored only in your browser.</p>
-    <label for="tokInput" class="vh">Operator token</label>
-    <input id="tokInput" type="password" placeholder="RYA_TOKEN" aria-label="Operator token" onkeydown="if(event.key==='Enter')saveToken()" />
-    <button class="btn dark" onclick="saveToken()"><i data-lucide="plug"></i>Connect</button>
+    <h3 id="authTitle">Welcome to Rya</h3>
+    <p id="authSub">Create an account to get a workspace + API key, or connect with a key you have.</p>
+    <div class="authtabs">
+      <button class="atab on" data-m="signup" onclick="authTab('signup')">Sign up</button>
+      <button class="atab" data-m="login" onclick="authTab('login')">Sign in</button>
+      <button class="atab" data-m="key" onclick="authTab('key')">API key</button>
+    </div>
+    <div class="apanel" id="ap-signup">
+      <input id="suEmail" type="email" placeholder="you@company.com" aria-label="Email" />
+      <input id="suPass" type="password" placeholder="Password (8+ characters)" aria-label="Password" />
+      <input id="suWs" placeholder="Workspace name (e.g. Acme)" aria-label="Workspace name" onkeydown="if(event.key==='Enter')doSignup()" />
+      <button class="btn dark" onclick="doSignup()"><i data-lucide="sparkles"></i>Create account</button>
+    </div>
+    <div class="apanel hidden" id="ap-login">
+      <input id="liEmail" type="email" placeholder="you@company.com" aria-label="Email" />
+      <input id="liPass" type="password" placeholder="Password" aria-label="Password" onkeydown="if(event.key==='Enter')doLogin()" />
+      <button class="btn dark" onclick="doLogin()"><i data-lucide="log-in"></i>Sign in</button>
+    </div>
+    <div class="apanel hidden" id="ap-key">
+      <label for="tokInput" class="vh">API key or operator token</label>
+      <input id="tokInput" type="password" placeholder="rya_sk_… or operator token" aria-label="API key" onkeydown="if(event.key==='Enter')saveToken()" />
+      <button class="btn dark" onclick="saveToken()"><i data-lucide="plug"></i>Connect</button>
+    </div>
+    <div class="apanel hidden" id="ap-ws"></div>
+    <div class="aerr" id="authErr"></div>
   </div>
 </div>
 
@@ -300,7 +329,54 @@ async function api(path,opts){
   if (!r.ok){ let e; try{ e=(await r.json()).detail||{}; }catch{ e={}; } throw new Error(e.message||('HTTP '+r.status)); }
   return r.status===204 ? null : r.json();
 }
-function showAuth(){ const w=document.getElementById('authwrap'); if(w.style.display==='grid')return; lastFocus=document.activeElement; w.style.display='grid'; setTimeout(()=>document.getElementById('tokInput').focus(),50); }
+function showAuth(){ const w=document.getElementById('authwrap'); if(w.style.display==='grid')return; lastFocus=document.activeElement; w.style.display='grid';
+  fetch(API+'/v1/info').then(r=>r.json()).then(configAuth).catch(()=>{});
+  setTimeout(()=>{const e=document.getElementById('suEmail'); if(e&&!e.closest('.apanel').classList.contains('hidden'))e.focus(); else document.getElementById('tokInput').focus();},50); }
+function configAuth(info){
+  const mt = !!(info && info.multiTenant);
+  document.querySelectorAll('.atab').forEach(b=>{ if(b.dataset.m!=='key') b.style.display = mt?'':'none'; });
+  document.getElementById('authSub').textContent = mt
+    ? 'Create an account to get a workspace + API key, or connect with a key you have.'
+    : 'This runtime requires an operator token. It is stored only in your browser.';
+  if(!mt) authTab('key');
+}
+function authTab(m){ ['signup','login','key','ws'].forEach(x=>document.getElementById('ap-'+x).classList.toggle('hidden',x!==m)); document.querySelectorAll('.atab').forEach(b=>b.classList.toggle('on',b.dataset.m===m)); document.getElementById('authErr').textContent=''; }
+function authErr(m){ document.getElementById('authErr').textContent=m||''; }
+async function authPost(path,body){ const r=await fetch(API+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const d=await r.json().catch(()=>({})); if(!r.ok) throw new Error((d.detail&&d.detail.message)||('HTTP '+r.status)); return d; }
+function enterWithKey(key){ localStorage.setItem(TKEY,key); hideAuth(); refresh(); }
+async function doSignup(){
+  const email=document.getElementById('suEmail').value.trim(), pass=document.getElementById('suPass').value, ws=document.getElementById('suWs').value.trim()||'My workspace';
+  authErr(''); if(!email||pass.length<8){ authErr('Enter an email and an 8+ character password.'); return; }
+  try{ const d=await authPost('/v1/signup',{email,password:pass,workspaceName:ws});
+    // show the key once, then enter
+    document.getElementById('ap-signup').classList.add('hidden'); document.querySelector('.atab.on')?.classList.remove('on');
+    const p=document.getElementById('ap-ws'); p.classList.remove('hidden');
+    p.innerHTML='<div class="keynote">Workspace <span class="mono">'+esc(d.workspace.name)+'</span> created. Your API key (saved in this browser — copy it somewhere safe):<br><span class="mono">'+esc(d.apiKey)+'</span></div><button class="btn dark" onclick="enterWithKey(\''+jss(d.apiKey)+'\')"><i data-lucide="arrow-right"></i>Open console</button>'; icons();
+  }catch(e){ authErr(e.message); }
+}
+let SESSION=null;
+async function doLogin(){
+  const email=document.getElementById('liEmail').value.trim(), pass=document.getElementById('liPass').value;
+  authErr(''); if(!email||!pass){ authErr('Enter your email and password.'); return; }
+  try{ const d=await authPost('/v1/login',{email,password:pass}); SESSION=d.token; renderWorkspaces(d.workspaces||[]); }
+  catch(e){ authErr(e.message); }
+}
+function renderWorkspaces(wss){
+  ['signup','login','key'].forEach(x=>document.getElementById('ap-'+x).classList.add('hidden'));
+  document.querySelectorAll('.atab').forEach(b=>b.classList.remove('on'));
+  const p=document.getElementById('ap-ws'); p.classList.remove('hidden');
+  p.innerHTML=(wss.length?'<div class="sub" style="margin:0 0 10px">Your workspaces — generate a key to open one:</div>'+wss.map(w=>`<div class="wsrow"><span class="nm">${esc(w.name)}</span><button class="btn" onclick="newKeyFor('${jss(w.id)}','${jss(w.name)}')">Generate key</button></div>`).join(''):'<div class="sub" style="margin:0 0 10px">No workspaces yet.</div>')
+    +`<input id="newWsName" placeholder="New workspace name" aria-label="New workspace name" style="margin-top:6px"/><button class="btn dark" onclick="createWorkspace()"><i data-lucide="plus"></i>New workspace</button>`;
+  icons();
+}
+async function createWorkspace(){
+  const name=document.getElementById('newWsName').value.trim()||'Workspace';
+  try{ const d=await fetch(API+'/v1/workspaces',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION},body:JSON.stringify({name})}).then(r=>r.json());
+    if(d.apiKey){ showKeyThenEnter(d.workspace.name, d.apiKey); } else authErr(d.detail?.message||'Failed'); }
+  catch(e){ authErr(e.message); }
+}
+async function newKeyFor(wsId,wsName){ authErr('Generating…'); try{ const d=await fetch(API+'/v1/workspaces',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION},body:JSON.stringify({name:wsName})}).then(r=>r.json()); if(d.apiKey) showKeyThenEnter(d.workspace.name,d.apiKey); }catch(e){ authErr(e.message); } }
+function showKeyThenEnter(name,key){ const p=document.getElementById('ap-ws'); p.innerHTML='<div class="keynote">Workspace <span class="mono">'+esc(name)+'</span> ready. API key (saved in this browser):<br><span class="mono">'+esc(key)+'</span></div><button class="btn dark" onclick="enterWithKey(\''+jss(key)+'\')"><i data-lucide="arrow-right"></i>Open console</button>'; icons(); }
 function hideAuth(){ document.getElementById('authwrap').style.display='none'; if(lastFocus&&lastFocus.focus){try{lastFocus.focus();}catch(e){}} }
 function saveToken(){ const v=document.getElementById('tokInput').value.trim(); if(!v)return; localStorage.setItem(TKEY,v); hideAuth(); refresh(); }
 function signOut(){ localStorage.removeItem(TKEY); showAuth(); }

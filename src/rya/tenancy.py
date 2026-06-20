@@ -37,11 +37,19 @@ _DATA_TABLES = ["rya_runs", "rya_approvals", "rya_jobs", "rya_memory", "rya_sess
                 "rya_messages", "rya_connections"]
 
 _TENANCY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rya_users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS rya_workspaces (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    owner_user_id TEXT,
     created_at TEXT
 );
+ALTER TABLE rya_workspaces ADD COLUMN IF NOT EXISTS owner_user_id TEXT;
 CREATE TABLE IF NOT EXISTS rya_api_keys (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES rya_workspaces(id) ON DELETE CASCADE,
@@ -152,17 +160,59 @@ class Tenancy:
             )
         return app_dsn(self.admin_dsn, pw)
 
-    def create_workspace(self, name: str) -> dict:
-        ws = {"id": _new_id("ws"), "name": name, "createdAt": now_iso()}
+    def create_workspace(self, name: str, owner_user_id: Optional[str] = None) -> dict:
+        ws = {"id": _new_id("ws"), "name": name, "owner": owner_user_id, "createdAt": now_iso()}
         with self._conn.cursor() as cur:
-            cur.execute("INSERT INTO rya_workspaces (id, name, created_at) VALUES (%s, %s, %s)",
-                        (ws["id"], ws["name"], ws["createdAt"]))
+            cur.execute("INSERT INTO rya_workspaces (id, name, owner_user_id, created_at) VALUES (%s, %s, %s, %s)",
+                        (ws["id"], ws["name"], owner_user_id, ws["createdAt"]))
         return ws
 
     def list_workspaces(self) -> List[dict]:
         with self._conn.cursor() as cur:
             cur.execute("SELECT id, name, created_at FROM rya_workspaces ORDER BY created_at")
             return [{"id": r[0], "name": r[1], "createdAt": r[2]} for r in cur.fetchall()]
+
+    # ---- self-serve accounts (onboarding) ------------------------------
+    def create_user(self, email: str, password: str) -> dict:
+        """Create a user account. Raises E_EMAIL_TAKEN if the email exists."""
+        from .accounts import hash_password
+        from .errors import RyaError
+        email = (email or "").strip().lower()
+        if not email or "@" not in email or len(password or "") < 8:
+            raise RyaError("E_VALIDATION", "A valid email and an 8+ char password are required.")
+        uid = _new_id("usr")
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM rya_users WHERE email=%s", (email,))
+            if cur.fetchone():
+                raise RyaError("E_EMAIL_TAKEN", "An account with that email already exists.",
+                               hint="Log in instead.")
+            cur.execute("INSERT INTO rya_users (id, email, password_hash, created_at) VALUES (%s,%s,%s,%s)",
+                        (uid, email, hash_password(password), now_iso()))
+        return {"id": uid, "email": email}
+
+    def authenticate(self, email: str, password: str) -> Optional[dict]:
+        """Verify credentials → {id, email}, or None."""
+        from .accounts import verify_password
+        email = (email or "").strip().lower()
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id, password_hash FROM rya_users WHERE email=%s", (email,))
+            row = cur.fetchone()
+        if not row or not verify_password(password, row[1]):
+            return None
+        return {"id": row[0], "email": email}
+
+    def list_user_workspaces(self, user_id: str) -> List[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id, name, created_at FROM rya_workspaces WHERE owner_user_id=%s ORDER BY created_at",
+                        (user_id,))
+            return [{"id": r[0], "name": r[1], "createdAt": r[2]} for r in cur.fetchall()]
+
+    def signup(self, email: str, password: str, workspace_name: str = "My workspace") -> dict:
+        """One-step onboarding: create the user + their first workspace + an API key."""
+        user = self.create_user(email, password)
+        ws = self.create_workspace(workspace_name, owner_user_id=user["id"])
+        key = self.create_api_key(ws["id"], label="default")
+        return {"user": user, "workspace": ws, "apiKey": key["key"]}
 
     def create_api_key(self, workspace_id: str, label: str = "") -> dict:
         import secrets

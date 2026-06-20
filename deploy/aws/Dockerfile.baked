@@ -1,0 +1,15 @@
+# Rya control-plane image for ECS Fargate — rya + a baked agent project.
+# Built for linux/arm64 (the task definition runs ARM64 Fargate).
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir '.[api,postgres,llm,mcp]'
+
+# Bake a fresh agent project at /project (rya serve runs against it).
+RUN cd / && rya create project
+
+WORKDIR /project
+EXPOSE 8787
+CMD ["rya", "serve", "--host", "0.0.0.0", "--port", "8787"]

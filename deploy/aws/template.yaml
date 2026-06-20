@@ -30,6 +30,14 @@ Parameters:
     Type: Number
     Default: 2
     Description: Number of Fargate runtime tasks (scale horizontally on CPU).
+  RyaSecretKey:
+    Type: String
+    NoEcho: true
+    Description: Fernet key for encryption-at-rest of connection secrets (RYA_SECRET_KEY).
+  RyaAdminToken:
+    Type: String
+    NoEcho: true
+    Description: Admin token gating self-serve project provisioning (RYA_ADMIN_TOKEN).
 
 Resources:
 
@@ -67,11 +75,8 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "${AWS::StackName}/app"
-      Description: Application secrets (JWT signing, model API keys). Populate after deploy.
-      GenerateSecretString:
-        SecretStringTemplate: '{}'
-        GenerateStringKey: RYA_JWT_SECRET
-        PasswordLength: 48
+      Description: Application secrets — encryption key, admin token (set at deploy).
+      SecretString: !Sub '{"RYA_JWT_SECRET":"jwks-mode-unused","RYA_SECRET_KEY":"${RyaSecretKey}","RYA_ADMIN_TOKEN":"${RyaAdminToken}"}'
 
   # ---- Networking (security groups) --------------------------------------
   AlbSecurityGroup:
@@ -81,8 +86,8 @@ Resources:
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
+          FromPort: 80
+          ToPort: 80
           CidrIp: 0.0.0.0/0
 
   ServiceSecurityGroup:
@@ -107,18 +112,7 @@ Resources:
           ToPort: 5432
           SourceSecurityGroupId: !Ref ServiceSecurityGroup
 
-  CacheSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Rya cache
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 6379
-          ToPort: 6379
-          SourceSecurityGroupId: !Ref ServiceSecurityGroup
-
-  # ---- Data (RDS Postgres + ElastiCache) ---------------------------------
+  # ---- Data (RDS Postgres) -----------------------------------------------
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
@@ -141,20 +135,6 @@ Resources:
       StorageEncrypted: true
       MultiAZ: false
       PubliclyAccessible: false
-
-  CacheSubnetGroup:
-    Type: AWS::ElastiCache::SubnetGroup
-    Properties:
-      Description: Rya cache subnets
-      SubnetIds: !Ref PrivateSubnetIds
-
-  Cache:
-    Type: AWS::ElastiCache::ServerlessCache
-    Properties:
-      ServerlessCacheName: !Sub "${AWS::StackName}-cache"
-      Engine: redis
-      SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [!Ref CacheSecurityGroup]
 
   # ---- Runtime (ECS Fargate behind an ALB) -------------------------------
   Cluster:
@@ -229,6 +209,10 @@ Resources:
           Secrets:
             - Name: RYA_JWT_SECRET
               ValueFrom: !Sub "${AppSecret}:RYA_JWT_SECRET::"
+            - Name: RYA_SECRET_KEY
+              ValueFrom: !Sub "${AppSecret}:RYA_SECRET_KEY::"
+            - Name: RYA_ADMIN_TOKEN
+              ValueFrom: !Sub "${AppSecret}:RYA_ADMIN_TOKEN::"
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -251,6 +235,12 @@ Resources:
       Protocol: HTTP
       TargetType: ip
       HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
 
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -270,8 +260,13 @@ Resources:
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
       TaskDefinition: !Ref TaskDefinition
+      # rya serve runs tenancy.setup() (roles + RLS) against a cold RDS before it
+      # answers /healthz — give it time before the ALB starts failing the task.
+      HealthCheckGracePeriodSeconds: 240
       NetworkConfiguration:
         AwsvpcConfiguration:
+          # Public IP so tasks can pull the ECR image in a VPC without a NAT gateway.
+          AssignPublicIp: ENABLED
           Subnets: !Ref PrivateSubnetIds
           SecurityGroups: [!Ref ServiceSecurityGroup]
       LoadBalancers:

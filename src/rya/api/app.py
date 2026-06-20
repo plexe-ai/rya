@@ -180,8 +180,11 @@ def build_app(root: Path) -> FastAPI:
         tenancy = Tenancy(admin_dsn)
         app_data_dsn = tenancy.setup()  # idempotent: tables + rya_app + RLS
 
-        def engine_for(workspace_id: str) -> Engine:
-            return Engine(manifest, agent, PostgresStore(app_data_dsn, workspace_id), root)
+        def engine_for(workspace_id: str, user_id: Optional[str] = None) -> Engine:
+            # user_id (from a verified per-user JWT) drives the app.user_id GUC, so
+            # Postgres per-user RLS isolates users WITHIN a workspace, not just by
+            # workspace. None = shared/workspace-level (backward compatible).
+            return Engine(manifest, agent, PostgresStore(app_data_dsn, workspace_id, user_id), root)
 
         def authorize(authorization, x_rya_token) -> str:
             key = _bearer(authorization, x_rya_token)
@@ -214,9 +217,20 @@ def build_app(root: Path) -> FastAPI:
             raise HTTPException(status_code=401, detail=e.to_dict()["error"])
 
     async def get_engine(authorization: Optional[str] = Header(None),
-                         x_rya_token: Optional[str] = Header(None)) -> Engine:
+                         x_rya_token: Optional[str] = Header(None),
+                         x_rya_user_token: Optional[str] = Header(None)) -> Engine:
         if mt:
-            return engine_for(authorize(authorization, x_rya_token))
+            ws = authorize(authorization, x_rya_token)
+            # Optional per-user identity: the API key authenticates the WORKSPACE;
+            # an additional verified user JWT (X-Rya-User-Token) authenticates the
+            # USER and turns on per-user RLS for this request.
+            user_id = None
+            if x_rya_user_token and jwt_configured():
+                try:
+                    user_id = verify_jwt(x_rya_user_token).sub
+                except RyaError as e:
+                    raise HTTPException(status_code=401, detail=e.to_dict()["error"])
+            return engine_for(ws, user_id)
         if jwt_configured():
             _identity_from(authorization, x_rya_token, required=True)  # enforce JWT
         else:

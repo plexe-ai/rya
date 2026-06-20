@@ -335,6 +335,40 @@ class Engine:
                 return entry
         return None
 
+    def _execute_action(self, action: dict):
+        """Run a human-approved action through the real seam where one exists:
+        a channel send goes to the real provider (Resend/Slack when configured),
+        an HTTP tool makes a real request (with its scoped credential injected and
+        the Action Guard applied), and only otherwise falls back to the registry."""
+        tool = (action or {}).get("tool")
+        if not tool:
+            return None
+        inp = action.get("input", {})
+        # 1. Channel send (email.send / slack.send / <channel>.send) → real seam.
+        parts = tool.split(".")
+        channel = parts[0]
+        is_channel = len(parts) == 2 and parts[1] == "send" and (
+            channel in ("email", "slack", "webhook")
+            or any(getattr(c, "type", None) == channel for c in self.manifest.channels))
+        if is_channel:
+            from ..providers.channels import send as channel_send
+            from ..sdk.context import load_env
+            return channel_send(channel, inp, load_env(self.project_root))
+        # 2. HTTP tool declared with a url → real request, scoped-credential-injected.
+        decl = next((t for t in self.manifest.tools if t.id == tool), None)
+        url = getattr(decl, "url", None) if decl is not None else None
+        if url:
+            from ..sdk.context import _http_tool
+            secret = None
+            provider = getattr(decl, "provider", None)
+            if provider and hasattr(self.store, "get_connection"):
+                conn = self.store.get_connection(provider)
+                secret = conn.get("secret") if conn else None
+            return _http_tool(url, inp, auth_secret=secret)
+        # 3. Registry fallback (mock in the local slice).
+        spec = self.tools.get(tool)
+        return spec.fn(inp) if spec is not None else None
+
     def approve(self, approval_id: str) -> dict:
         approval = self.store.get_approval(approval_id)
         if approval is None:
@@ -354,13 +388,11 @@ class Engine:
                 f"Run '{run['id']}' is '{run['status']}', not waiting_approval.",
             )
 
-        # Execute the embedded action (a tool call) now that a human approved it.
+        # Execute the embedded action (a tool call) now that a human approved it,
+        # through the REAL seam where one exists (channel send / HTTP tool), not
+        # just the mock registry.
         action = approval.get("action") or {}
-        action_result = None
-        if action.get("tool"):
-            spec = self.tools.get(action["tool"])
-            if spec is not None:
-                action_result = spec.fn(action.get("input", {}))
+        action_result = self._execute_action(action)
 
         approval["status"] = "approved"
         approval["resolvedAt"] = now_iso()

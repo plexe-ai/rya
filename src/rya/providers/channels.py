@@ -70,7 +70,8 @@ def send(channel: str, message: dict, env: Optional[dict] = None) -> dict:
 
     if provider == "slack":
         status, body = _post(env["SLACK_WEBHOOK_URL"], {}, {"text": _text_of(message)})
-        return {"delivered": True, "channel": "slack", "provider": "slack", "status": status}
+        return {"delivered": True, "channel": "slack", "provider": "slack", "status": status,
+                "messageId": "slack_" + str(abs(hash(str(message))) % 1000000)}
 
     if provider == "resend":
         if not message.get("to"):
@@ -84,13 +85,16 @@ def send(channel: str, message: dict, env: Optional[dict] = None) -> dict:
         }
         _, body = _post("https://api.resend.com/emails",
                         {"Authorization": f"Bearer {env['RESEND_API_KEY']}"}, payload)
+        rid = body.get("id") if isinstance(body, dict) else None
         return {"delivered": True, "channel": "email", "provider": "resend",
-                "id": body.get("id") if isinstance(body, dict) else None}
+                "id": rid, "messageId": rid}
 
     if provider == "webhook":
         url = env[f"RYA_CHANNEL_{channel.upper()}_URL"]
         status, _ = _post(url, {}, {"channel": channel, "message": message})
-        return {"delivered": True, "channel": channel, "provider": "webhook", "status": status}
+        return {"delivered": True, "channel": channel, "provider": "webhook", "status": status,
+                "messageId": "wh_" + str(abs(hash(str(message))) % 1000000)}
 
     # mock — record the intent into the trace (offline / default).
-    return {"delivered": True, "channel": channel, "provider": "mock", "message": message}
+    return {"delivered": True, "channel": channel, "provider": "mock",
+            "messageId": "msg_" + str(abs(hash(str(message))) % 1000000), "message": message}

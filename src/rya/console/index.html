@@ -195,7 +195,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <button class="ws" aria-label="Workspace"><div class="ws-logo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name">Acme Inc</div><div class="ws-sub" id="wsSub">Production</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
+    <button class="ws" aria-label="Workspace"><div class="ws-logo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name" id="wsName">—</div><div class="ws-sub" id="wsSub">loading…</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
     <div class="agent-pick"><span class="ai"><i data-lucide="bot"></i></span><div><div class="nm" id="sideAgent">—</div><div class="en" id="sideEnv">loading…</div></div><span class="dot"></span></div>
     <div class="grp">Build</div>
     <nav class="nav" id="nav">
@@ -204,6 +204,7 @@
       <button data-v="manifest"><i data-lucide="file-cog"></i>Manifest</button>
       <button data-v="tools"><i data-lucide="plug"></i>Tools<span class="ct" data-ct="tools"></span></button>
       <button data-v="memory"><i data-lucide="database"></i>Memory<span class="ct" data-ct="memory"></span></button>
+      <button data-v="knowledge"><i data-lucide="book-open-text"></i>Knowledge<span class="ct" data-ct="knowledge"></span></button>
       <button data-v="models"><i data-lucide="layers"></i>Models<span class="ct" data-ct="models"></span></button>
       <button data-v="channels"><i data-lucide="send"></i>Channels<span class="ct" data-ct="channels"></span></button>
       <button data-v="connections"><i data-lucide="key-square"></i>Connections<span class="ct" data-ct="connections"></span></button>
@@ -218,7 +219,7 @@
       <button data-v="jobs"><i data-lucide="clock"></i>Jobs &amp; cron</button>
       <button data-v="secrets"><i data-lucide="key-round"></i>Secrets<span class="ct" data-ct="secrets"></span></button>
     </nav>
-    <div class="side-foot"><div class="ava">VD</div><div><div class="me">Vaibhav Dubey</div><div class="em">vaibhav@acme.inc</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
+    <div class="side-foot"><div class="ava" id="meAva">RY</div><div><div class="me" id="meName">—</div><div class="em" id="meEmail">—</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
   </aside>
 
   <main class="main">
@@ -251,6 +252,7 @@
       <div class="view wrap hidden" id="v-manifest"><div class="h2">Manifest</div><div class="sub">The declarative source of truth, read live from the running agent.</div><div class="window"><div class="win-bar"><div class="win-dots"><i></i><i></i><i></i></div><span class="win-name">rya.agent.yaml</span></div><pre id="manifestPre">…</pre></div></div>
       <div class="view wrap hidden" id="v-tools"><div class="h2">Tool registry</div><div class="sub">Every tool the agent can reach — typed, permissioned, audited. Credentials resolve in the runtime; the agent never sees them.</div><div id="toolsBody"></div></div>
       <div class="view wrap hidden" id="v-memory"><div class="h2">Memory</div><div class="sub">Durable, scoped state — addressable by the agent, isolated per user by row-level security.</div><div id="memBody"></div></div>
+      <div class="view wrap hidden" id="v-knowledge"><div class="h2">Knowledge</div><div class="sub">RAG — ingested documents, chunked + embedded, that the agent retrieves over with <span class="mono">ctx.knowledge.search</span>.</div><div style="display:flex;gap:8px;margin-bottom:16px"><input id="kqInput" placeholder="Search the knowledge base…" style="flex:1;border:1px solid var(--border-2);border-radius:8px;padding:8px 12px;font-size:13px;outline:0" onkeydown="if(event.key==='Enter')searchKnowledge()" /><button class="btn dark sm" onclick="searchKnowledge()"><i data-lucide="search"></i>Search</button></div><div id="kHits"></div><div id="knowledgeBody"></div></div>
       <div class="view wrap hidden" id="v-models"><div class="h2">Model gateway</div><div class="sub">Foundation and custom models, permissioned and versioned. Every call is logged.</div><div id="modelsBody"></div></div>
       <div class="view wrap hidden" id="v-channels"><div class="h2">Channels</div><div class="sub">How events arrive and messages go out — one interface across surfaces.</div><div id="channelsBody"></div></div>
       <div class="view wrap hidden" id="v-connections"><div class="h2">Connected credentials</div><div class="sub">Scoped credentials per provider — <strong>encrypted at rest</strong>, injected into tool calls at runtime, and enforced by the intersection rule (required &sube; connection &cap; user). The secret is redacted from every trace and never returned to the agent.</div><div id="connBody"></div></div>
@@ -282,7 +284,7 @@
 const API = (new URLSearchParams(location.search).get('api') || '').replace(/\/$/,'');
 const TKEY = 'rya_token';
 const getToken = () => localStorage.getItem(TKEY) || '';
-const views = ['overview','infra','manifest','tools','memory','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','secrets'];
+const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','secrets'];
 let STATE = null, wasLive = null, lastFocus = null;
 const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 // JS-string-escape for ids interpolated into inline handlers (defense-in-depth).
@@ -350,6 +352,14 @@ function render(s){
   document.getElementById('sideAgent').textContent=s.agent.name;
   document.getElementById('sideEnv').textContent='v'+s.agent.version+' · '+s.agent.environment;
   document.getElementById('wsSub').textContent=s.agent.environment+' · '+s.runtime.store;
+  // Real viewer identity (no hardcoded placeholders).
+  const v=s.viewer||{}; const ws=(v.workspace&&v.workspace!=='default')?v.workspace:'Default workspace';
+  document.getElementById('wsName').textContent=ws;
+  const who=v.user||(v.mode==='multi-tenant'?'workspace key':'operator');
+  document.getElementById('meName').textContent=who;
+  document.getElementById('meEmail').textContent=v.mode||'';
+  const ini=(v.user&&v.user.includes('@'))?v.user.slice(0,2).toUpperCase():(s.agent.name||'ry').slice(0,2).toUpperCase();
+  document.getElementById('meAva').textContent=ini;
   document.getElementById('agentBadges').innerHTML =
     `<span class="badge run"><span class="d"></span>${esc(s.agent.status)}</span>`+
     `<span class="badge mono">env: ${esc(s.agent.environment)}</span>`+
@@ -361,6 +371,7 @@ function render(s){
   setCt('tools',s.tools.length); setCt('models',s.models.length); setCt('channels',s.channels.length);
   setCt('memory',s.memory.collections.length); setCt('secrets',s.secrets.length);
   setCt('sessions',(s.stats.sessions||0));
+  setCt('knowledge',((s.knowledge&&s.knowledge.documents.length)||0));
   setCt('connections',(s.connections||[]).length);
   setCt('approvals',s.stats.approvalsPending, s.stats.approvalsPending>0);
 
@@ -376,6 +387,7 @@ function render(s){
     prim('fingerprint','Identity','runs','Owner, version & permission graph — bound to every run.',[s.runtime.multiTenant?'per-user RLS':'single-tenant','v'+s.agent.version]),
     prim('box','Runtime','runs','Durable execution — pauses, resumes, retries, times out.',[s.agent.handlers.event?'handler ✓':'no handler', s.runtime.store]),
     prim('database','Memory','memory','Core blocks (always in context) + consolidated long-term facts with vector recall.',[((s.memory.blocks||[]).length)+' blocks',(s.memory.facts||0)+' facts','+'+s.memory.collections.length+' collections']),
+    prim('book-open-text','Knowledge','knowledge','RAG over ingested documents — chunked, embedded, retrieved for grounding.',[((s.knowledge&&s.knowledge.documents.length)||0)+' docs',((s.knowledge&&s.knowledge.chunks)||0)+' chunks']),
     prim('plug','Tools','tools','Typed, permissioned, audited. The agent never sees a credential.',[s.tools.length+' registered',gated+' gated']),
     prim('layers','Model gateway','models','Foundation + custom models — permissioned, versioned, traced.',[s.runtime.llmProvider,...s.models.map(m=>m.id).slice(0,2)]),
     prim('messages-square','Conversations','conversations','Durable sessions & messages — threaded per channel, retrievable for context.',[(st.sessions||0)+' sessions',(st.messages||0)+' messages']),
@@ -419,6 +431,7 @@ function render(s){
     s.channels.map(c=>[`<span class="mono">${esc(c.type)}</span>`,c.path?`<span class="mono dim">${esc(c.path)}</span>`:'<span class="dim">—</span>',
       c.enabled?'<span class="stbadge ok"><span class="d"></span>enabled</span>':'<span class="stbadge"><span class="d"></span><span class="dim">disabled</span></span>']));
   renderInfra(s.infra);
+  renderKnowledge(s);
   renderConnections(s);
   renderRuns(s);
   renderSessions(s);
@@ -551,6 +564,27 @@ async function runEvals(){
     icons();
   }catch(e){ toast('Eval run failed — '+e.message); }
   finally{ btn.disabled=false; }
+}
+function renderKnowledge(s){
+  const k=s.knowledge||{documents:[],chunks:0};
+  const body=document.getElementById('knowledgeBody');
+  body.innerHTML = `<div class="secrow"><span class="l">Documents</span><span class="r">${k.documents.length} docs · ${k.chunks} chunks · vector + lexical recall</span></div>`+
+    (k.documents.length? table(['Source','Chunks','Size','Ingested'],
+      k.documents.map(d=>[`<span class="mono">${esc(d.source||d.id)}</span>`,String(d.chunks||0),`${d.chars||0} ch`,
+        `<span class="dim">${esc((d.createdAt||'').replace('T',' ').replace('Z',''))}</span>`]))
+      : empty('No documents — ingest with ctx.knowledge.add(text, source).'));
+  icons();
+}
+async function searchKnowledge(){
+  const q=document.getElementById('kqInput').value.trim(); const hits=document.getElementById('kHits');
+  if(!q){ hits.innerHTML=''; return; }
+  try{
+    const r=await api('/knowledge/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:q,limit:5})});
+    hits.innerHTML = r.hits.length? `<div class="secrow"><span class="l">Top matches</span><span class="r">${r.hits.length} · query: ${esc(q)}</span></div>`+
+      r.hits.map(h=>`<div class="window" style="padding:11px 15px;margin-bottom:8px"><div style="display:flex;gap:8px;align-items:center"><span class="ptag">${(h._score).toFixed(3)}</span><span class="mono dim" style="font-size:11px">${esc(h.source||h.docId)}</span></div><div style="margin-top:6px;font-size:13px;line-height:1.5">${esc(h.text.slice(0,300))}${h.text.length>300?'…':''}</div></div>`).join('')
+      : empty('No matches for “'+esc(q)+'”.');
+    icons();
+  }catch(e){ toast('Search failed — '+e.message); }
 }
 function renderConnections(s){
   const conns=s.connections||[];

@@ -1,9 +1,25 @@
 # Rya OSS self-host: `cp .env.example .env && docker compose up`
-# Brings up Postgres + the Rya runtime serving the example agent. Point the
-# `rya` service's volume at your own agent project to run yours.
+# Brings up Postgres + the Rya runtime (serve) + a background worker for jobs.
+# Point the volumes at your own agent project (must contain rya.agent.yaml).
+#
+# Production checklist (set these in .env): RYA_TOKEN (auth), RYA_SECRET_KEY
+# (encrypt secrets at rest), RYA_WEBHOOK_SECRET (signed inbound), and — for
+# multi-tenant — RYA_MULTITENANT=1 + RYA_ADMIN_TOKEN + RYA_APP_DB_PASSWORD.
+x-rya-env: &rya-env
+  RYA_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+  RYA_TOKEN: ${RYA_TOKEN:-}
+  RYA_SECRET_KEY: ${RYA_SECRET_KEY:-}
+  RYA_WEBHOOK_SECRET: ${RYA_WEBHOOK_SECRET:-}
+  RYA_MULTITENANT: ${RYA_MULTITENANT:-}
+  RYA_ADMIN_TOKEN: ${RYA_ADMIN_TOKEN:-}
+  RYA_APP_DB_PASSWORD: ${RYA_APP_DB_PASSWORD:-}
+
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rya}
       POSTGRES_DB: rya
@@ -19,21 +35,34 @@ services:
 
   rya:
     build: .
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      # Substrate-agnostic: the same image runs on file storage locally; here it
-      # targets Postgres. Swap this DSN for managed Postgres in the cloud.
-      RYA_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya
-      # Optional: set in .env to use real Claude instead of the mock LLM.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+    environment: *rya-env
     ports:
       - "8787:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz').status==200 else 1)\""]
+      interval: 10s
+      timeout: 4s
+      retries: 6
     volumes:
       # Mount your agent project here (must contain rya.agent.yaml).
       - ./examples/followup_agent:/project
+
+  # Background worker — drains the job queue (delayed jobs, cron, retries).
+  # `rya serve` does NOT process jobs; without this, scheduled work never runs.
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *rya-env
+    volumes:
+      - ./examples/followup_agent:/project
+    command: ["rya", "worker", "--interval", "2"]
 
 volumes:
   rya_pgdata:

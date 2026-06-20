@@ -7,7 +7,8 @@ carry a stable error code + a suggested next action.
 
 Run with::
 
-    rya mcp                 # stdio transport (what agents connect to)
+    rya mcp                 # stdio transport (local agents)
+    rya mcp --http          # remote MCP over HTTP (hosted; agents connect by URL)
 
 Requires the [mcp] extra: ``pip install 'rya[mcp]'``.
 """
@@ -26,7 +27,9 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 
-mcp = FastMCP("rya")
+# stateless_http: every request is self-contained (no server-side session
+# affinity), which is what a hosted, multi-client remote MCP needs.
+mcp = FastMCP("rya", stateless_http=True)
 
 
 @mcp.tool()
@@ -209,8 +212,35 @@ def rya_status(project_dir: Optional[str] = None) -> dict:
 
 
 def run() -> None:
-    """Entry point for `rya mcp` — serve over stdio."""
+    """Entry point for `rya mcp` — serve over stdio (local agents)."""
     mcp.run()
+
+
+def run_http(host: str = "127.0.0.1", port: int = 8765) -> None:
+    """Serve the same tools over HTTP (remote MCP). Agents connect to
+    ``http://host:port/mcp``. This is the hosted/cloud transport."""
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.run(transport="streamable-http")
+
+
+def mounted_app():
+    """ASGI app to mount at ``/mcp`` on the control plane, so ``rya serve``
+    exposes the API, the console, AND remote MCP from one origin. The internal
+    path is normalized to root so the external path is exactly ``/mcp``.
+
+    Each call builds a FRESH FastMCP (cloning the registered tools) so it has its
+    OWN session manager — multiple control-plane apps in one process (e.g. a test
+    suite, or a future multi-bind server) never share a single-use session
+    manager. Returns ``(asgi_app, session_manager)``; the caller must run
+    ``session_manager.run()`` inside the host app's lifespan.
+    """
+    fresh = FastMCP("rya", stateless_http=True)
+    fresh.settings.streamable_http_path = "/"
+    for t in mcp._tool_manager.list_tools():
+        fresh.add_tool(t.fn, name=t.name, description=t.description)
+    app = fresh.streamable_http_app()
+    return app, fresh.session_manager
 
 
 if __name__ == "__main__":  # pragma: no cover

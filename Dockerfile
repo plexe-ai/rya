@@ -6,7 +6,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install --no-cache-dir '.[api,postgres,llm]'
+RUN pip install --no-cache-dir '.[api,postgres,llm,mcp]'
 
 # The agent project (rya.agent.yaml + src/agent.py) is mounted at /project.
 WORKDIR /project

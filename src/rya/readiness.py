@@ -81,6 +81,13 @@ def check_readiness(manifest, store, agent, project_root) -> dict:
         warn("W_NO_COST_CAP", "No model pricing/cost tracking configured.",
              "Set RYA_PRICE_<MODEL>_IN / _OUT to track and cap cost.")
 
+    mock_tools = [t.id for t in manifest.tools
+                  if getattr(treg.get(t.id), "mock", False)]
+    if mock_tools:
+        warn("W_MOCK_TOOL", f"Tool(s) {mock_tools} are deterministic mocks, not real IO.",
+             "Replace with a real `@agent.tool`, an HTTP tool (`url:`), or the real "
+             "built-ins (web.fetch / http.request) before going live.")
+
     return {
         "ready": len(blocks) == 0,
         "blocks": blocks,

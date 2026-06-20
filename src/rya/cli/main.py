@@ -47,6 +47,7 @@ skills_app = typer.Typer(no_args_is_help=True, help="Install the Rya coding-agen
 workspaces_app = typer.Typer(no_args_is_help=True, help="Manage tenant workspaces (Postgres/cloud).")
 keys_app = typer.Typer(no_args_is_help=True, help="Manage per-workspace API keys.")
 connections_app = typer.Typer(no_args_is_help=True, help="Scoped connected credentials for tools.")
+cloud_app = typer.Typer(no_args_is_help=True, help="Drive a hosted Rya (after `rya login`).")
 
 app.add_typer(agents_app, name="agents")
 app.add_typer(events_app, name="events")
@@ -62,6 +63,7 @@ app.add_typer(skills_app, name="skills")
 app.add_typer(workspaces_app, name="workspaces")
 app.add_typer(keys_app, name="keys")
 app.add_typer(connections_app, name="connections")
+app.add_typer(cloud_app, name="cloud")
 
 
 def _version_callback(value: bool):
@@ -152,12 +154,62 @@ def _load_manifest_raw(root: Path) -> dict:
 # Top-level commands
 # --------------------------------------------------------------------------
 @app.command()
-def login(json: bool = typer.Option(False, "--json")):
-    """Authenticate. The local runtime needs no auth; hosted login lands in a later milestone."""
+def login(url: Optional[str] = typer.Argument(None, help="Hosted Rya URL, e.g. https://rya.yourco.com. Omit for local."),
+          key: Optional[str] = typer.Option(None, "--key", help="Workspace API key (rya_sk_…) or operator token."),
+          json: bool = typer.Option(False, "--json")):
+    """Point the CLI + your agent at a hosted Rya (or confirm local).
+
+    `rya login https://rya.host --key rya_sk_…` verifies the connection, stores it
+    (~/.rya/config.json, 0600), and prints the `.mcp.json` block to connect a
+    coding agent's remote MCP to the same instance. With no URL, you're on the
+    local runtime (no auth needed).
+    """
     with guard(json):
-        emit(json, {"mode": "local", "authenticated": True,
-                    "message": "Local runtime — no authentication required."},
-             lambda: console.print("[green]✓[/green] Local runtime — no authentication required."))
+        from ..cloud import RemoteClient, save_cloud_config, mcp_config_snippet
+        if not url:
+            emit(json, {"mode": "local", "authenticated": True,
+                        "message": "Local runtime — no authentication required."},
+                 lambda: console.print("[green]✓[/green] Local runtime — no authentication required."))
+            return
+        info = RemoteClient(url, key).info()  # verifies reachability + auth
+        save_cloud_config(url, key)
+        snippet = mcp_config_snippet(url)
+        out = {"ok": True, "mode": "cloud", "cloudUrl": url.rstrip("/"),
+               "agent": info.get("agent"), "remoteMcp": info.get("remoteMcp"),
+               "mcpConfig": snippet}
+
+        def render():
+            console.print(f"[green]✓[/green] Connected to [bold]{url.rstrip('/')}[/bold] "
+                          f"(agent: {info.get('agent')}, v{info.get('version','?')})")
+            console.print(f"  remote MCP: [bold]{info.get('remoteMcp')}[/bold]")
+            console.print("  add this to your agent's [bold].mcp.json[/bold] to drive it from your editor:")
+            console.print(jsonlib.dumps(snippet, indent=2))
+        emit(json, out, render)
+
+
+@app.command()
+def logout(json: bool = typer.Option(False, "--json")):
+    """Forget the hosted connection and go back to the local runtime."""
+    with guard(json):
+        from ..cloud import clear_cloud_config
+        cleared = clear_cloud_config()
+        emit(json, {"ok": True, "cleared": cleared, "mode": "local"},
+             lambda: console.print("[green]✓[/green] " + ("Signed out — using the local runtime." if cleared
+                                   else "No hosted connection was set (already local).")))
+
+
+@app.command()
+def whoami(json: bool = typer.Option(False, "--json")):
+    """Show whether the CLI is pointed at a hosted Rya or the local runtime."""
+    with guard(json):
+        from ..cloud import load_cloud_config
+        cfg = load_cloud_config()
+        if cfg:
+            emit(json, {"mode": "cloud", "cloudUrl": cfg["cloudUrl"], "hasKey": bool(cfg.get("apiKey"))},
+                 lambda: console.print(f"[bold]cloud[/bold] → {cfg['cloudUrl']} "
+                                       f"({'key set' if cfg.get('apiKey') else 'no key'})"))
+        else:
+            emit(json, {"mode": "local"}, lambda: console.print("[bold]local[/bold] runtime (run `rya login <url>` to use a hosted Rya)"))
 
 
 @app.command()
@@ -314,6 +366,70 @@ def eval_cmd(
         emit(json, rep, render)
         if rep["hasEvals"] and not rep["ok"]:
             raise typer.Exit(5)
+
+
+def _remote():
+    from ..cloud import RemoteClient, load_cloud_config
+    cfg = load_cloud_config()
+    if not cfg:
+        raise RyaError("E_NOT_LOGGED_IN", "Not connected to a hosted Rya.",
+                       hint="Run `rya login <url> --key …` first (or set RYA_REMOTE_URL).")
+    return RemoteClient(cfg["cloudUrl"], cfg.get("apiKey")), cfg["cloudUrl"]
+
+
+@cloud_app.command("info")
+def cloud_info(json: bool = typer.Option(False, "--json")):
+    """Show the hosted instance you're connected to (endpoints, mode)."""
+    with guard(json):
+        client, url = _remote()
+        info = client.info()
+        emit(json, info, lambda: (console.print(f"[bold]{url}[/bold] — {info.get('agent')} v{info.get('version','?')}"),
+                                  console.print(f"  remote MCP: {info.get('remoteMcp')}   multiTenant: {info.get('multiTenant')}")))
+
+
+@cloud_app.command("send")
+def cloud_send(type: str = typer.Option("message.received", "--type"),
+               payload: Optional[str] = typer.Option(None, "--payload"),
+               payload_file: Optional[Path] = typer.Option(None, "--payload-file"),
+               json: bool = typer.Option(False, "--json")):
+    """Trigger a run on the hosted agent."""
+    with guard(json):
+        client, _ = _remote()
+        res = client.send_event(type, _parse_payload(payload, payload_file))
+        emit(json, res, lambda: console.print(f"[green]✓[/green] run {res.get('runId')} → {res.get('status')}"
+                                              + (f" (approval {res.get('pendingApproval')})" if res.get('pendingApproval') else "")))
+
+
+@cloud_app.command("runs")
+def cloud_runs(json: bool = typer.Option(False, "--json")):
+    """List runs on the hosted agent."""
+    with guard(json):
+        client, _ = _remote()
+        res = client.list_runs()
+        runs = res.get("runs", res) if isinstance(res, dict) else res
+        emit(json, {"runs": runs}, lambda: [console.print(f"  {r.get('id')}  {r.get('status')}") for r in (runs or [])]
+             or [console.print("  [dim]no runs[/dim]")])
+
+
+@cloud_app.command("approvals")
+def cloud_approvals(json: bool = typer.Option(False, "--json")):
+    """List pending approvals on the hosted agent."""
+    with guard(json):
+        client, _ = _remote()
+        res = client.list_approvals("pending")
+        apprs = res.get("approvals", []) if isinstance(res, dict) else res
+        emit(json, {"approvals": apprs},
+             lambda: [console.print(f"  {a.get('id')}  {a.get('title','')}") for a in (apprs or [])]
+             or [console.print("  [dim]no pending approvals[/dim]")])
+
+
+@cloud_app.command("approve")
+def cloud_approve(approval_id: str = typer.Argument(...), json: bool = typer.Option(False, "--json")):
+    """Approve a pending approval on the hosted agent (resumes the real run)."""
+    with guard(json):
+        client, _ = _remote()
+        res = client.approve(approval_id)
+        emit(json, res, lambda: console.print(f"[green]✓[/green] approved → run {res.get('runStatus', res.get('status'))}"))
 
 
 @app.command()
@@ -887,17 +1003,29 @@ def jobs_run(job_id: Optional[str] = typer.Argument(None),
 
 
 @app.command()
-def mcp(json: bool = typer.Option(False, "--json")):
-    """Run the Rya MCP server (stdio) so MCP-native coding agents can drive Rya."""
+def mcp(http: bool = typer.Option(False, "--http", help="Serve remote MCP over HTTP instead of stdio."),
+        host: str = typer.Option("127.0.0.1", "--host"),
+        port: int = typer.Option(8765, "--port"),
+        json: bool = typer.Option(False, "--json")):
+    """Run the Rya MCP server so MCP-native coding agents can drive Rya.
+
+    Default is stdio (a local agent spawns the process). `--http` serves *remote*
+    MCP — agents in any editor connect to `http://host:port/mcp` over the network,
+    no local install. `rya serve` also mounts this at `/mcp` on the control plane.
+    """
     with guard(json):
         try:
-            from ..mcp.server import run as run_server
+            from ..mcp.server import run as run_server, run_http
         except ImportError:
             raise RyaError("E_RUNTIME", "MCP extra not installed.",
                            hint="Install with: pip install 'rya[mcp]'")
-        # stdio transport blocks; logs/banner go to stderr to keep stdout clean.
-        err_console.print("[green]✓[/green] Rya MCP server starting (stdio)…")
-        run_server()
+        if http:
+            err_console.print(f"[green]✓[/green] Rya remote MCP on [bold]http://{host}:{port}/mcp[/bold]")
+            run_http(host, port)
+        else:
+            # stdio transport blocks; logs/banner go to stderr to keep stdout clean.
+            err_console.print("[green]✓[/green] Rya MCP server starting (stdio)…")
+            run_server()
 
 
 @skills_app.command("install")
@@ -1048,11 +1176,13 @@ def serve(host: str = typer.Option("127.0.0.1", "--host"), port: int = typer.Opt
                 "webhook": f"http://{host}:{port}/inbound"}
         info["console"] = f"http://{host}:{port}/"
         info["websocket"] = f"ws://{host}:{port}/ws"
+        info["remoteMcp"] = f"http://{host}:{port}/mcp"
         if json:
             typer.echo(jsonlib.dumps(info))
         else:
             console.print(f"[green]✓[/green] serving control plane on http://{host}:{port}")
             console.print(f"  console: [bold]http://{host}:{port}/[/bold]")
+            console.print(f"  remote MCP: [bold]http://{host}:{port}/mcp[/bold] (connect any editor's agent)")
             console.print(f"  websocket: [bold]ws://{host}:{port}/ws[/bold] (real-time agent channel)")
             console.print(f"  webhook: POST http://{host}:{port}/inbound")
             console.print(f"  auth: {'[green]token required[/green]' if auth_on else '[yellow]OPEN (set RYA_TOKEN to require a token)[/yellow]'}")

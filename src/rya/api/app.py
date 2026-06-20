@@ -223,7 +223,24 @@ def build_app(root: Path) -> FastAPI:
             _check_token(authorization, x_rya_token)
         return base_engine
 
-    api = FastAPI(title="Rya Control Plane", version=manifest.version)
+    # Remote MCP: mount the same MCP tools at /mcp so `rya serve` is a single
+    # hosted origin for API + console + MCP. Optional (needs the [mcp] extra).
+    mcp_asgi = None
+    mcp_lifespan = None
+    try:
+        from ..mcp.server import mounted_app
+        from contextlib import asynccontextmanager
+        mcp_asgi, _mcp_sm = mounted_app()
+
+        @asynccontextmanager
+        async def mcp_lifespan(_app):
+            async with _mcp_sm.run():
+                yield
+    except Exception:  # pragma: no cover - mcp extra absent / import issue
+        mcp_asgi = None
+        mcp_lifespan = None
+
+    api = FastAPI(title="Rya Control Plane", version=manifest.version, lifespan=mcp_lifespan)
 
     # CORS: the console is served SAME-ORIGIN by `rya serve`, so no CORS is needed
     # by default. Cross-origin callers (a dev console on another port) must be
@@ -239,6 +256,19 @@ def build_app(root: Path) -> FastAPI:
 
     @api.middleware("http")
     async def _security_headers(request: Request, call_next):
+        # Remote MCP is privileged (it drives the whole control plane), so when an
+        # operator token is configured it is REQUIRED on /mcp.
+        p = request.url.path
+        if p == "/mcp" or p.startswith("/mcp/"):
+            need = os.environ.get("RYA_TOKEN")
+            if need:
+                authz = request.headers.get("authorization", "")
+                tok = authz[7:] if authz.lower().startswith("bearer ") else request.headers.get("x-rya-token")
+                if not tok or not hmac.compare_digest(tok, need):
+                    from starlette.responses import JSONResponse
+                    return JSONResponse(status_code=401, content={"error": {
+                        "code": "E_UNAUTHORIZED",
+                        "message": "Remote MCP requires the operator token (Authorization: Bearer $RYA_TOKEN)."}})
         resp = await call_next(request)
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -272,14 +302,17 @@ def build_app(root: Path) -> FastAPI:
 
     @api.get("/console")
     def console_state(engine: Engine = Depends(get_engine)):
-        # Rich aggregate for the web console — auth-gated like the control routes
-        # (the Depends(get_engine) enforces the operator token / JWT when set).
+        # Rich aggregate for the web console — auth-gated like the control routes.
+        # Works in BOTH modes: the dependency-injected engine is workspace-scoped
+        # in multi-tenant mode, so the console shows only the caller's data.
         from ..snapshot import build_console
-        if mt:
-            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
-                                "message": "Console aggregate is single-tenant only."})
-        return {**build_console(manifest, base_store, agent, root),
-                "infra": build_infra(manifest, base_store)}
+        store = engine.store
+        ws_id = getattr(store, "workspace_id", "default")
+        viewer = {"workspace": ws_id,
+                  "mode": "multi-tenant" if mt else "single-tenant",
+                  "user": (manifest.owner if not mt else None)}
+        return {**build_console(manifest, store, agent, root),
+                "infra": build_infra(manifest, store), "viewer": viewer}
 
     @api.websocket("/ws")
     async def agent_ws(websocket: WebSocket):
@@ -527,6 +560,35 @@ def build_app(root: Path) -> FastAPI:
         # Metadata only — the store never returns secret values.
         return {"connections": engine.store.list_connections()}
 
+    @api.get("/knowledge")
+    def knowledge(engine: Engine = Depends(get_engine)):
+        km = engine.store.load_memory("knowledge")
+        return {"documents": km.get("documents", []),
+                "chunks": len(km.get("collections", {}).get("chunks", []))}
+
+    @api.post("/knowledge/search")
+    async def knowledge_search(request: Request, engine: Engine = Depends(get_engine)):
+        from ..providers.embeddings import cosine, embed
+        import re
+        body = await request.json()
+        query = (body or {}).get("query", "")
+        km = engine.store.load_memory("knowledge")
+        chunks = km.get("collections", {}).get("chunks", [])
+        env = os.environ
+        qv = embed(query, env)
+        qtokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+        scored = []
+        for c in chunks:
+            vec = cosine(qv, c.get("_embedding")) if c.get("_embedding") else 0.0
+            ctok = set(re.findall(r"[a-z0-9]+", c.get("text", "").lower()))
+            lex = (len(qtokens & ctok) / len(qtokens)) if qtokens else 0.0
+            score = vec + 0.5 * lex
+            if score > 0:
+                scored.append({"text": c["text"], "source": c.get("source"),
+                               "docId": c.get("docId"), "_score": round(score, 4)})
+        scored.sort(key=lambda r: r["_score"], reverse=True)
+        return {"query": query, "hits": scored[:int((body or {}).get("limit", 5))]}
+
     @api.get("/sessions")
     def list_sessions(engine: Engine = Depends(get_engine)):
         return {"sessions": engine.store.list_sessions(manifest.name)}
@@ -569,5 +631,54 @@ def build_app(root: Path) -> FastAPI:
     @api.get("/channels")
     def channels(engine: Engine = Depends(get_engine)):
         return {"channels": [c.model_dump() for c in manifest.channels]}
+
+    @api.get("/v1/info")
+    def cloud_info(request: Request):
+        # Discovery: how an agent connects to this (possibly hosted) instance.
+        base = str(request.base_url).rstrip("/")
+        return {
+            "service": "rya", "version": RYA_VERSION, "agent": manifest.name,
+            "multiTenant": mt, "authRequired": auth_enabled(),
+            "remoteMcp": f"{base}/mcp" if mcp_asgi is not None else None,
+            "api": base, "console": f"{base}/",
+            "webhook": f"{base}/inbound", "websocket": base.replace("http", "ws", 1) + "/ws",
+            "provisionProjects": mt,  # self-serve project creation available in multi-tenant mode
+        }
+
+    @api.post("/v1/projects")
+    async def create_project(request: Request, authorization: Optional[str] = Header(None),
+                             x_rya_token: Optional[str] = Header(None)):
+        # Self-serve project provisioning (the `npx login`/create-project equivalent):
+        # mint a new workspace + API key against a hosted instance. Multi-tenant only,
+        # and gated by RYA_ADMIN_TOKEN so signup isn't open to the world.
+        if not mt:
+            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
+                "message": "Project provisioning requires multi-tenant mode (RYA_MULTITENANT=1 + Postgres)."})
+        admin = os.environ.get("RYA_ADMIN_TOKEN")
+        if not admin:
+            # Fail CLOSED: never allow open self-serve provisioning by accident.
+            raise HTTPException(status_code=403, detail={"code": "E_PROVISIONING_DISABLED",
+                "message": "Self-serve project provisioning is disabled.",
+                "hint": "Set RYA_ADMIN_TOKEN to enable it, then send it as a bearer token."})
+        provided = _bearer(authorization, x_rya_token)
+        if not provided or not hmac.compare_digest(provided, admin):
+            raise HTTPException(status_code=401, detail={"code": "E_UNAUTHORIZED",
+                "message": "Project provisioning requires the admin token (RYA_ADMIN_TOKEN)."})
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        name = (body or {}).get("name") or "project"
+        ws = tenancy.create_workspace(name)
+        key = tenancy.create_api_key(ws["id"], label=(body or {}).get("label", "default"))
+        base = str(request.base_url).rstrip("/")
+        return {"ok": True, "workspaceId": ws["id"], "name": ws["name"],
+                "apiKey": key["key"],  # shown ONCE — only the hash is stored
+                "remoteMcp": f"{base}/mcp" if mcp_asgi is not None else None, "api": base}
+
+    # Mount remote MCP last so its catch-all under /mcp doesn't shadow API routes.
+    if mcp_asgi is not None:
+        api.mount("/mcp", mcp_asgi)
 
     return api

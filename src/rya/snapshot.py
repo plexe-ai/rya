@@ -139,6 +139,7 @@ def build_console(manifest, store, agent, project_root) -> dict:
 
     pending = store.list_approvals("pending")
     mem = store.load_memory("agent")
+    kmem = store.load_memory("knowledge")
     sessions = store.list_sessions(manifest.name) if hasattr(store, "list_sessions") else []
     connections = store.list_connections() if hasattr(store, "list_connections") else []
 
@@ -185,6 +186,8 @@ def build_console(manifest, store, agent, project_root) -> dict:
                    "blocks": [{"name": n, "chars": len(b.get("value", "")), "limit": b.get("limit"),
                                "updatedAt": b.get("updatedAt")} for n, b in mem.get("blocks", {}).items()],
                    "facts": len(mem.get("collections", {}).get("facts", []))},
+        "knowledge": {"documents": kmem.get("documents", []),
+                      "chunks": len(kmem.get("collections", {}).get("chunks", []))},
         "triggers": [t.model_dump() for t in manifest.triggers],
         "approvals": [{"id": a["id"], "title": a["title"], "body": a.get("body"),
                        "action": a.get("action"), "runId": a["runId"]} for a in pending],

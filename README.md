@@ -22,10 +22,15 @@ What's real today: durable runs on **Postgres** (survive restarts), **per-user
 row-level-security** multi-tenancy, real **Anthropic/OpenAI** + channel seams, a
 signed-webhook HTTP server **and a real-time WebSocket** with token/JWT auth, a
 built-in **web console**, an **Action Guard** egress firewall, conversation
-**sessions**, and a **production-readiness gate**. What's still mocked: the
-default tool/model implementations (the interfaces are real; the IO is
-deterministic for reproducibility). What's not built yet: a *managed* cloud
-deploy (`rya deploy` emits self-host artifacts today).
+**sessions**, **remote MCP** over HTTP, self-serve project provisioning, a
+first-class **LLM layer** (real models, structured output, a governed agent
+loop), real general-purpose **built-in tools** (`web.fetch`, `http.request`), and
+a **production-readiness gate**. What's still mocked: the default *domain* tool +
+model stubs (`crm.lookup`, `churn-risk-v1` — deterministic for reproducibility;
+the real seams and real built-ins are live). What's not built yet: a *managed*
+hosting platform — the hosted
+instance *is* `rya serve` (deploy it via `docker compose` / `rya deploy`
+artifacts); there's no one-click cloud yet.
 
 **For the full picture, read [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md).**
 
@@ -175,6 +180,39 @@ permissions, the model gateway, runs with **forensic traces**, a working
 [src/rya/console/index.html](src/rya/console/index.html), served by
 [api/app.py](src/rya/api/app.py).
 
+## LLM layer: real models, structured output, governed agent loop
+
+The model is first-class, not an afterthought. `ctx.llm` is a real multi-provider
+gateway (Anthropic/OpenAI over stdlib HTTP — real when a key is present, a
+deterministic mock otherwise) with the two things agent-building actually needs:
+
+```python
+# 1. Structured output — pass a JSON Schema, get a validated object back.
+res = await ctx.llm.respond(system="classify", input={"text": msg},
+                            schema={"type": "object", "required": ["sentiment", "score"], …})
+res.json["sentiment"]            # parsed + validated, not string-parsing
+
+# 2. Governed agent loop — the model reasons and CALLS TOOLS until it answers.
+out = await ctx.llm.run(input={"q": "look up Ada and summarize"}, tools=["crm.lookup"])
+out["toolCalls"]                 # what the model actually ran
+```
+
+The agent loop is the differentiator: **every tool the model calls goes through
+`ctx.tools.call`** — so the same permissions, **scoped + encrypted credentials**,
+**Action Guard egress firewall**, and audit trail apply to what the *model*
+decides to do. Approval-gated tools are never exposed to the loop, so a model can
+autonomously use safe/read tools but a side-effectful action still requires an
+explicit `ctx.approvals.request` (human gate). An LLM that can act, sandboxed by
+the same governance as the rest of the runtime. See
+[src/rya/providers/llm.py](src/rya/providers/llm.py).
+
+Two **real, general-purpose built-in tools** ship so the loop does actual work
+out of the box: `web.fetch` (GET a URL → readable text) and `http.request`
+(any method) — both routed through the Action Guard before a byte leaves the
+process. Declare them in the manifest like any tool; everything else an agent
+integrates with is HTTP on top of these. See
+[src/rya/tools/builtins.py](src/rya/tools/builtins.py).
+
 ## Memory (core blocks + consolidated long-term recall)
 
 `ctx.memory` is more than a vector store — it's the two-tier memory production
@@ -320,11 +358,12 @@ Connections are per-user/workspace under the same RLS as runs. CLI + the
 
 ## Coding-agent surfaces
 
-Three ways a coding agent drives Rya, all over the same operations:
+Four ways a coding agent drives Rya, all over the same operations:
 
 ```bash
 rya <cmd> --json        # 1. CLI — every command emits machine-readable JSON
-rya mcp                 # 2. MCP server (stdio) — 25 rya_* tools  [pip install 'rya[mcp]']
+rya mcp                 # 2a. MCP server (stdio) — 25 rya_* tools  [pip install 'rya[mcp]']
+rya mcp --http          # 2b. REMOTE MCP over HTTP — agents connect by URL, no local install
 rya skills install      # 3. Skills — teach the workflow so agents don't guess
 rya context --json      #    one-call orient: state + readiness + the rules to respect
 rya provision --json    #    stand up the full base infra inventory (rya_provision tool)
@@ -332,6 +371,38 @@ rya provision --json    #    stand up the full base infra inventory (rya_provisi
 
 See [docs/mcp.md](docs/mcp.md) for the tool list and how to register the MCP
 server with Claude Code.
+
+## Remote MCP & hosted instances
+
+`rya serve` is a **single hosted origin** for everything — the control plane, the
+console, the real-time WebSocket, **and remote MCP at `/mcp`**. An agent in any
+editor connects to the URL with no local Rya install:
+
+```jsonc
+// .mcp.json (Claude Code / Cursor)
+{ "mcpServers": { "rya": {
+  "type": "http", "url": "https://your-rya-host/mcp",
+  "headers": { "Authorization": "Bearer ${RYA_TOKEN}" } } } }
+```
+
+Point the CLI and your agent at a hosted instance in one command:
+
+```bash
+rya login https://rya.yourco.com --key rya_sk_…   # verifies, stores creds, prints .mcp.json
+rya whoami                                          # cloud → https://rya.yourco.com
+rya cloud send --type message.received --payload '{"email":"a@b.co"}'   # drive the hosted agent
+rya cloud approvals && rya cloud approve <id>       # resume a hosted run
+rya logout                                          # back to the local runtime
+```
+
+`GET /v1/info` advertises the endpoints (remote MCP, API, console, WebSocket).
+In **multi-tenant** mode (`RYA_MULTITENANT=1` + Postgres), `POST /v1/projects`
+self-provisions a project — a workspace + a one-time `rya_sk_…` API key — the
+hosted "create a project" flow (gate signup with `RYA_ADMIN_TOKEN`). Remote MCP
+is auth-gated: when `RYA_TOKEN` is set, `/mcp` requires it. Nothing phones home —
+the cloud is strictly opt-in (`rya login` / `RYA_REMOTE_URL`). Deploy the same
+runtime to your own host via `docker compose` / `rya deploy` artifacts — there is
+no separate cloud build; the hosted instance *is* `rya serve`.
 
 See [docs/primitives.md](docs/primitives.md), [docs/devex.md](docs/devex.md), and
 [docs/mcp.md](docs/mcp.md).

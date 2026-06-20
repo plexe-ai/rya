@@ -56,11 +56,25 @@ def hash_key(plaintext: str) -> str:
     return hashlib.sha256(plaintext.encode()).hexdigest()
 
 
+def app_db_password() -> str:
+    """Password for the non-superuser rya_app data-plane role. Strong and
+    consistent in production (explicit RYA_APP_DB_PASSWORD, else derived from the
+    RYA_SECRET_KEY so role-create and connect agree); a clearly-labelled weak
+    default only for local dev when neither is set."""
+    pw = os.environ.get("RYA_APP_DB_PASSWORD")
+    if pw:
+        return pw
+    key = os.environ.get("RYA_SECRET_KEY")
+    if key:
+        return "rya_" + hashlib.sha256(key.encode()).hexdigest()[:40]
+    return "rya_app_pw"  # local-dev only — set RYA_APP_DB_PASSWORD in production
+
+
 def app_dsn(admin_dsn: str, password: Optional[str] = None) -> str:
     """Derive the non-superuser data-plane DSN (rya_app role) from the admin DSN."""
     params = conninfo_to_dict(admin_dsn)
     params["user"] = "rya_app"
-    params["password"] = password or os.environ.get("RYA_APP_DB_PASSWORD", "rya_app_pw")
+    params["password"] = password or app_db_password()
     return make_conninfo(**params)
 
 
@@ -77,7 +91,7 @@ class Tenancy:
     def setup(self, app_password: Optional[str] = None) -> str:
         """Idempotently install data tables, tenancy tables, the rya_app role, and
         RLS policies. Returns the data-plane (rya_app) DSN."""
-        pw = app_password or os.environ.get("RYA_APP_DB_PASSWORD", "rya_app_pw")
+        pw = app_password or app_db_password()
         with self._conn.cursor() as cur:
             cur.execute(_DATA_SCHEMA)
             cur.execute(_TENANCY_SCHEMA)

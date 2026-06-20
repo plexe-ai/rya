@@ -22,6 +22,7 @@ class ToolSpec:
     required_secrets: List[str] = field(default_factory=list)
     input_schema: Optional[dict] = None
     output_schema: Optional[dict] = None
+    mock: bool = False   # deterministic placeholder — not real IO (flagged by readiness)
 
     def public(self, permission: str) -> dict:
         return {
@@ -69,6 +70,7 @@ def default_registry() -> "ToolRegistry":
         fn=_crm_lookup,
         external_side_effects=False,
         required_secrets=["CRM_API_KEY"],
+        mock=True,
     ))
     reg.register(ToolSpec(
         id="calendar.read",
@@ -76,6 +78,7 @@ def default_registry() -> "ToolRegistry":
         description="Read calendar availability (read only).",
         fn=_calendar_read,
         external_side_effects=False,
+        mock=True,
     ))
     reg.register(ToolSpec(
         id="email.send",
@@ -84,6 +87,29 @@ def default_registry() -> "ToolRegistry":
         fn=_email_send,
         external_side_effects=True,
         required_secrets=["EMAIL_API_KEY"],
+        mock=True,
+    ))
+    # --- real, general-purpose built-ins (actual IO, Action-Guard governed) ---
+    from .builtins import http_request, web_fetch
+    reg.register(ToolSpec(
+        id="web.fetch",
+        name="Web Fetch",
+        description="Fetch a URL and return its readable text content (HTML stripped).",
+        fn=web_fetch,
+        external_side_effects=False,  # read-only GET
+        input_schema={"type": "object", "required": ["url"], "properties": {
+            "url": {"type": "string", "description": "The URL to fetch."},
+            "maxChars": {"type": "integer", "description": "Max characters of text to return."}}},
+    ))
+    reg.register(ToolSpec(
+        id="http.request",
+        name="HTTP Request",
+        description="Make an HTTP request (GET/POST/...). May have side effects — gate writes behind approval.",
+        fn=http_request,
+        external_side_effects=True,  # can POST/mutate; an agent should gate or scope it
+        input_schema={"type": "object", "required": ["url"], "properties": {
+            "url": {"type": "string"}, "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
+            "headers": {"type": "object"}, "body": {}}},
     ))
     return reg
 

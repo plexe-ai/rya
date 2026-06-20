@@ -72,6 +72,8 @@ class Event:
 class LLMResponse:
     text: str
     model: str
+    json: Optional[dict] = None      # parsed + validated object when a schema was given
+    provider: Optional[str] = None
 
 
 def load_env(root: Path) -> Dict[str, str]:
@@ -149,6 +151,7 @@ class RuntimeContext:
         self.llm = _LLM(self)
         self.models = _Models(self)
         self.memory = _Memory(self)
+        self.knowledge = _Knowledge(self)
         self.tools = _Tools(self)
         self.channels = _Channels(self)
         self.jobs = _Jobs(self)
@@ -320,7 +323,10 @@ class _LLM:
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
 
-    async def respond(self, *, system: str, input: dict) -> LLMResponse:
+    async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None) -> LLMResponse:
+        """Call the model. Pass ``schema`` (a JSON Schema) for first-class
+        **structured output** — the result's ``.json`` is the parsed, validated
+        object."""
         from ..providers import respond as provider_respond
 
         mb = self._ctx.manifest.model
@@ -329,22 +335,70 @@ class _LLM:
             # Provider chosen by manifest model.provider (auto/mock/anthropic/openai).
             try:
                 return provider_respond(
-                    system=system, input=input, model_default=mb.default,
-                    provider=mb.provider, temperature=mb.temperature, max_tokens=mb.max_tokens,
+                    system=system, input=input, model_default=mb.default, provider=mb.provider,
+                    temperature=mb.temperature, max_tokens=mb.max_tokens, schema=schema,
                 )
             except RyaError:
                 # Fall back to the manifest's fallback model on provider failure.
                 if mb.fallback:
                     out = provider_respond(
-                        system=system, input=input, model_default=mb.fallback,
-                        provider=mb.provider, temperature=mb.temperature, max_tokens=mb.max_tokens,
+                        system=system, input=input, model_default=mb.fallback, provider=mb.provider,
+                        temperature=mb.temperature, max_tokens=mb.max_tokens, schema=schema,
                     )
                     out["fellBackFrom"] = mb.default
                     return out
                 raise
 
         res = self._ctx._step("llm.respond", mb.default, run, {"system": system})
-        return LLMResponse(text=res["text"], model=res["model"])
+        return LLMResponse(text=res["text"], model=res["model"], json=res.get("json"),
+                           provider=res.get("provider"))
+
+    async def run(self, *, input, system: str = "", tools: Optional[List[str]] = None,
+                  max_steps: int = 6) -> dict:
+        """Governed **agent loop**: the model reasons and calls tools until it has
+        an answer. Every tool call goes through ``ctx.tools.call`` — so the same
+        permissions, scoped credentials, Action Guard, and audit apply to what the
+        model decides to do. Approval-gated tools are NOT exposed to the loop;
+        side-effectful actions still require an explicit ``ctx.approvals.request``.
+
+        Returns ``{text, steps, toolCalls}`` where ``toolCalls`` lists what ran.
+        """
+        from ..providers import chat as provider_chat
+
+        mb = self._ctx.manifest.model
+        # Only non-gated tools are autonomous; the model never sees gated actions.
+        allowed = {t.id for t in self._ctx.manifest.tools
+                   if self._ctx.manifest.tool_permission(t.id) in (Permission.allowed, Permission.read_only)}
+        want = set(tools) if tools is not None else allowed
+        usable = sorted(allowed & want)
+        def _tool_def(tid):
+            spec = self._ctx._tools.get(tid)
+            desc = (spec.description if spec else None) or next(
+                (d.description for d in self._ctx.manifest.tools if d.id == tid), None) or tid
+            schema = (spec.input_schema if spec else None) or {"type": "object"}
+            return {"name": tid, "description": desc, "input_schema": schema}
+        tool_defs = [_tool_def(tid) for tid in usable]
+
+        messages: List[dict] = [{"role": "user", "content": input}]
+        ran: List[dict] = []
+        for step in range(max_steps):
+            def turn(_msgs=list(messages)):
+                return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
+                                     model_default=mb.default, provider=mb.provider,
+                                     temperature=mb.temperature, max_tokens=mb.max_tokens)
+
+            res = self._ctx._step("llm.chat", f"step {step}", turn, {"system": system})
+            calls = res.get("toolCalls") or []
+            if not calls:
+                return {"text": res.get("text", ""), "steps": step + 1, "toolCalls": ran}
+            messages.append({"role": "assistant", "content": res.get("text", ""), "toolCalls": calls})
+            for c in calls:
+                name = c.get("name")
+                # Governed execution: permission + scoped creds + Action Guard all apply.
+                result = await self._ctx.tools.call(name, c.get("input") or {})
+                ran.append({"tool": name, "input": c.get("input"), "result": result})
+                messages.append({"role": "tool", "name": name, "toolUseId": c.get("id"), "content": result})
+        return {"text": "[max_steps reached]", "steps": max_steps, "toolCalls": ran}
 
 
 class _Models:
@@ -594,6 +648,93 @@ class _Memory:
                     "facts": chosen, "approxTokens": used, "tokenBudget": token_budget}
 
         return self._ctx._step("memory.assemble", s, run, {"query": query})
+
+
+def _chunk_text(text: str, size: int = 800, overlap: int = 100) -> List[str]:
+    """Split text into overlapping chunks, preferring paragraph/sentence breaks."""
+    text = (text or "").strip()
+    if len(text) <= size:
+        return [text] if text else []
+    chunks, i = [], 0
+    while i < len(text):
+        end = min(i + size, len(text))
+        if end < len(text):  # back up to a natural boundary if one is close
+            window = text[i:end]
+            cut = max(window.rfind("\n\n"), window.rfind(". "), window.rfind("\n"))
+            if cut > size * 0.5:
+                end = i + cut + 1
+        chunks.append(text[i:end].strip())
+        if end >= len(text):
+            break
+        i = max(end - overlap, i + 1)
+    return [c for c in chunks if c]
+
+
+class _Knowledge:
+    """RAG: ingest documents → chunk → embed → retrieve. The knowledge base an
+    agent answers over. Built on the same embeddings seam as memory (real OpenAI
+    embeddings when configured, deterministic hashing vectorizer otherwise) and
+    stored on the substrate, so it's durable and per-workspace under RLS."""
+
+    SCOPE = "knowledge"
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self._ctx = ctx
+
+    async def add(self, text: str, source: Optional[str] = None, metadata: Optional[dict] = None,
+                  chunk_size: int = 800, overlap: int = 100) -> dict:
+        """Ingest a document: chunk it, embed each chunk, store it for retrieval."""
+        from ..providers.embeddings import embed
+
+        def run():
+            mem = self._ctx.store.load_memory(self.SCOPE)
+            docs = mem.setdefault("documents", [])
+            chunks = mem.setdefault("collections", {}).setdefault("chunks", [])
+            doc_id = _new_id("doc")
+            pieces = _chunk_text(text, chunk_size, overlap)
+            for i, c in enumerate(pieces):
+                chunks.append({"_id": _new_id("chk"), "docId": doc_id, "i": i, "text": c,
+                               "source": source, "_embedding": embed(c, self._ctx._env),
+                               "_ts": now_iso(), **(metadata or {})})
+            doc = {"id": doc_id, "source": source, "chunks": len(pieces), "chars": len(text or ""),
+                   "createdAt": now_iso(), **(metadata or {})}
+            docs.append(doc)
+            self._ctx.store.save_memory(self.SCOPE, mem)
+            return {"documentId": doc_id, "chunks": len(pieces)}
+
+        return self._ctx._step("knowledge.add", source or "document", run)
+
+    async def search(self, query: str, limit: int = 5, min_score: float = 0.0) -> List[dict]:
+        """Semantic retrieval over ingested chunks (vector + lexical fallback).
+        Returns ``{text, source, docId, _score}`` — the context to feed the model."""
+        from ..providers.embeddings import cosine, embed
+
+        def run():
+            import re
+            chunks = self._ctx.store.load_memory(self.SCOPE).get("collections", {}).get("chunks", [])
+            qv = embed(query, self._ctx._env)
+            qtokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+            scored = []
+            for c in chunks:
+                vec = cosine(qv, c.get("_embedding")) if c.get("_embedding") else 0.0
+                # Blend vector similarity with lexical token overlap — robust recall
+                # regardless of the embedding backend.
+                ctokens = set(re.findall(r"[a-z0-9]+", c.get("text", "").lower()))
+                lex = (len(qtokens & ctokens) / len(qtokens)) if qtokens else 0.0
+                score = vec + 0.5 * lex
+                if score > 0 and score >= min_score:
+                    scored.append({"text": c["text"], "source": c.get("source"),
+                                   "docId": c.get("docId"), "_score": round(score, 4)})
+            scored.sort(key=lambda r: r["_score"], reverse=True)
+            return scored[:limit]
+
+        return self._ctx._step("knowledge.search", query, run, {"query": query})
+
+    async def documents(self) -> List[dict]:
+        def run():
+            return self._ctx.store.load_memory(self.SCOPE).get("documents", [])
+
+        return self._ctx._step("knowledge.documents", "all", run)
 
 
 class _Tools:

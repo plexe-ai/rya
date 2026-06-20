@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rya — Production backend for AI agents</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#ffffff;
+    --bg-sidebar:#fbfbfa;
+    --bg-subtle:#f7f6f3;
+    --bg-hover:#f1f0ee;
+    --text:#32302c;
+    --text-2:#6b6a66;
+    --text-3:#9a9892;
+    --border:#edecea;
+    --border-2:#e4e3e0;
+    --black:#1d1c1a;
+    --accent:#1971c2;          /* used only for tiny links/status, never as fill */
+    --green:#2f9e44;
+    --amber:#e8a317;
+    --code-bg:#1b1b1d;
+    --code-text:#e9e7e2;
+    --code-dim:#86847d;
+    --radius:10px;
+    --radius-sm:7px;
+    --maxw:780px;
+    font-synthesis:none;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    color:var(--text);
+    background:var(--bg);
+    font-size:15.5px;
+    line-height:1.65;
+    letter-spacing:-0.003em;
+  }
+  ::selection{background:#dbeafe}
+
+  /* ---------- layout ---------- */
+  .app{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
+  .sidebar{
+    position:sticky;top:0;height:100vh;
+    background:var(--bg-sidebar);
+    border-right:1px solid var(--border);
+    padding:18px 12px;display:flex;flex-direction:column;gap:2px;
+  }
+  .brand{display:flex;align-items:center;gap:9px;padding:8px 8px 14px;}
+  .brand-mark{
+    width:26px;height:26px;border-radius:7px;background:var(--black);
+    display:grid;place-items:center;flex:none;
+    box-shadow:0 1px 2px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.07);
+  }
+  .brand-mark svg{width:15px;height:15px;color:#fff;stroke-width:2.1}
+  .brand-name{font-weight:600;font-size:15px;letter-spacing:-0.02em;color:var(--black)}
+  .brand-sub{font-size:11.5px;color:var(--text-3);font-weight:450;margin-top:-2px}
+
+  .nav-label{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--text-3);padding:14px 8px 4px}
+  .nav a{
+    display:flex;align-items:center;gap:9px;
+    padding:6px 8px;border-radius:6px;color:var(--text-2);
+    text-decoration:none;font-size:13.5px;font-weight:450;
+    transition:background .12s ease,color .12s ease;
+  }
+  .nav a:hover{background:var(--bg-hover);color:var(--text)}
+  .nav a.active{background:#ebeae8;color:var(--black);font-weight:500}
+  .nav a svg{width:15px;height:15px;stroke-width:1.9;color:var(--text-3);flex:none}
+  .nav a:hover svg,.nav a.active svg{color:var(--text)}
+  .side-foot{margin-top:auto;padding:10px 8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-3);display:flex;align-items:center;gap:7px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(47,158,68,.13)}
+
+  /* ---------- content ---------- */
+  .main{padding:0 64px;display:flex;justify-content:center}
+  .doc{width:100%;max-width:var(--maxw);padding:64px 0 120px}
+
+  .eyebrow{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:500;color:var(--text-2);background:var(--bg-subtle);border:1px solid var(--border-2);padding:5px 11px;border-radius:100px;margin-bottom:26px}
+  .eyebrow svg{width:13px;height:13px;stroke-width:2;color:var(--text-2)}
+
+  h1{font-size:42px;line-height:1.1;letter-spacing:-0.033em;font-weight:600;color:var(--black);margin-bottom:18px}
+  .lede{font-size:18px;line-height:1.6;color:var(--text-2);max-width:660px;font-weight:450}
+  .lede b{color:var(--text);font-weight:550}
+
+  .meta-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:30px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:500;color:var(--text);background:#fff;border:1px solid var(--border-2);padding:6px 12px;border-radius:8px}
+  .chip svg{width:14px;height:14px;stroke-width:1.9;color:var(--text-2)}
+
+  section{margin-top:64px;scroll-margin-top:28px}
+  .kicker{font-size:12px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--text-3);margin-bottom:10px}
+  h2{font-size:25px;line-height:1.25;letter-spacing:-0.022em;font-weight:600;color:var(--black);margin-bottom:12px}
+  .section-lede{font-size:15.5px;color:var(--text-2);max-width:640px;margin-bottom:26px}
+  p{color:var(--text-2)}
+
+  /* callout */
+  .callout{display:flex;gap:13px;background:var(--bg-subtle);border:1px solid var(--border-2);border-radius:var(--radius);padding:17px 18px;margin:24px 0}
+  .callout .ic{width:30px;height:30px;border-radius:8px;background:#fff;border:1px solid var(--border-2);display:grid;place-items:center;flex:none}
+  .callout .ic svg{width:16px;height:16px;stroke-width:1.9;color:var(--black)}
+  .callout p{color:var(--text);font-size:15px}
+  .callout b{color:var(--black);font-weight:600}
+
+  /* primitive grid */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  .cell{background:var(--bg);padding:18px 18px 17px;transition:background .12s ease}
+  .cell:hover{background:#fcfcfb}
+  .cell-head{display:flex;align-items:center;gap:10px;margin-bottom:7px}
+  .cell-ic{width:30px;height:30px;border-radius:8px;background:var(--bg-subtle);display:grid;place-items:center;flex:none}
+  .cell-ic svg{width:16px;height:16px;stroke-width:1.85;color:var(--black)}
+  .cell h3{font-size:14.5px;font-weight:600;color:var(--black);letter-spacing:-0.01em}
+  .cell p{font-size:13.5px;line-height:1.55;color:var(--text-2)}
+
+  /* code window */
+  .window{border:1px solid var(--border-2);border-radius:var(--radius);overflow:hidden;margin:24px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .win-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--bg-sidebar);border-bottom:1px solid var(--border)}
+  .win-dots{display:flex;gap:6px}
+  .win-dots i{width:11px;height:11px;border-radius:50%;background:#e0dfdc;display:block}
+  .win-name{font-size:12.5px;color:var(--text-3);font-family:'JetBrains Mono',monospace;margin-left:4px}
+  pre{font-family:'JetBrains Mono','SF Mono',monospace;font-size:13px;line-height:1.75;padding:18px 20px;overflow-x:auto;background:#fff;color:var(--text)}
+  pre .k{color:#9a3412}        /* yaml key */
+  pre .s{color:#1d4ed8}        /* string */
+  pre .c{color:var(--text-3)}  /* comment */
+  pre .d{color:var(--text-3)}  /* dash */
+
+  /* terminal */
+  .term{background:var(--code-bg);border-radius:var(--radius);overflow:hidden;margin:24px 0;box-shadow:0 8px 30px -12px rgba(0,0,0,.4)}
+  .term .win-bar{background:#232325;border-bottom:1px solid #2c2c2f}
+  .term .win-dots i{background:#3a3a3d}
+  .term .win-name{color:#86847d}
+  .term pre{background:transparent;color:var(--code-text)}
+  .term pre .p{color:#6ea8fe}       /* prompt */
+  .term pre .cmd{color:#fff;font-weight:500}
+  .term pre .out{color:var(--code-dim)}
+  .term pre .ok{color:#69db7c}
+  .term pre .wait{color:#ffd43b}
+
+  /* arch diagram */
+  .arch{border:1px solid var(--border);border-radius:var(--radius);padding:8px;background:var(--bg-sidebar);margin:24px 0;display:flex;flex-direction:column;gap:8px}
+  .plane{background:#fff;border:1px solid var(--border-2);border-radius:8px;padding:15px 16px}
+  .plane-head{display:flex;align-items:center;gap:9px;margin-bottom:11px}
+  .plane-head svg{width:15px;height:15px;stroke-width:1.9;color:var(--black)}
+  .plane-head .t{font-size:13.5px;font-weight:600;color:var(--black)}
+  .plane-head .badge{margin-left:auto;font-size:11px;font-weight:500;color:var(--text-3);font-family:'JetBrains Mono',monospace}
+  .nodes{display:flex;gap:7px;flex-wrap:wrap}
+  .node{font-size:12px;font-weight:500;color:var(--text);background:var(--bg-subtle);border:1px solid var(--border-2);border-radius:6px;padding:5px 10px;font-family:'JetBrains Mono',monospace;letter-spacing:-0.02em}
+  .arch-link{display:flex;align-items:center;justify-content:center;gap:7px;font-size:11.5px;color:var(--text-3);font-weight:500}
+  .arch-link svg{width:13px;height:13px;stroke-width:2}
+  .rls{background:#fbfaf8;border-color:var(--border-2)}
+  .rls .badge{color:var(--green)}
+
+  /* dev surface list */
+  .stack{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  .row{display:flex;align-items:flex-start;gap:13px;padding:16px 18px;border-bottom:1px solid var(--border);transition:background .12s}
+  .row:last-child{border-bottom:0}
+  .row:hover{background:#fcfcfb}
+  .row-ic{width:32px;height:32px;border-radius:8px;background:var(--bg-subtle);display:grid;place-items:center;flex:none}
+  .row-ic svg{width:16px;height:16px;stroke-width:1.85;color:var(--black)}
+  .row .t{font-size:14.5px;font-weight:600;color:var(--black);display:flex;align-items:center;gap:9px}
+  .row .t .tag{font-size:10.5px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;color:var(--text-3);border:1px solid var(--border-2);border-radius:5px;padding:1px 6px}
+  .row p{font-size:13.5px;color:var(--text-2);margin-top:3px}
+  .row code{font-family:'JetBrains Mono',monospace;font-size:12.5px;background:var(--bg-subtle);border:1px solid var(--border);border-radius:5px;padding:1px 5px;color:var(--text)}
+
+  /* trust */
+  .trust{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-top:24px}
+  .trust .t-cell{border:1px solid var(--border);border-radius:var(--radius);padding:17px}
+  .trust .t-ic{width:28px;height:28px;border-radius:7px;background:var(--bg-subtle);display:grid;place-items:center;margin-bottom:11px}
+  .trust .t-ic svg{width:15px;height:15px;stroke-width:1.9;color:var(--black)}
+  .trust h4{font-size:13.5px;font-weight:600;color:var(--black);margin-bottom:4px}
+  .trust p{font-size:12.5px;line-height:1.5;color:var(--text-2)}
+
+  .foot{margin-top:80px;padding-top:24px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;color:var(--text-3);font-size:13px}
+  .foot a{color:var(--text-2);text-decoration:none}
+  .foot a:hover{color:var(--text)}
+
+  @media (max-width:900px){
+    .app{grid-template-columns:1fr}
+    .sidebar{display:none}
+    .main{padding:0 24px}
+    .grid,.trust{grid-template-columns:1fr}
+    h1{font-size:34px}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><i data-lucide="git-commit-vertical"></i></div>
+      <div>
+        <div class="brand-name">Rya</div>
+        <div class="brand-sub">by Plexe</div>
+      </div>
+    </div>
+
+    <div class="nav-label">Concept</div>
+    <nav class="nav">
+      <a href="#overview" class="active"><i data-lucide="book-open"></i>Overview</a>
+      <a href="#primitives"><i data-lucide="blocks"></i>Primitives</a>
+      <a href="#manifest"><i data-lucide="file-text"></i>The manifest</a>
+      <a href="#architecture"><i data-lucide="network"></i>Architecture</a>
+      <a href="#developer"><i data-lucide="terminal"></i>Developer surface</a>
+      <a href="#deploy"><i data-lucide="shield-check"></i>Deploy &amp; trust</a>
+    </nav>
+
+    <div class="side-foot"><span class="dot"></span>Production-grade runtime</div>
+  </aside>
+
+  <!-- content -->
+  <main class="main">
+    <article class="doc">
+
+      <!-- overview -->
+      <section id="overview" style="margin-top:0">
+        <div class="eyebrow"><i data-lucide="circle-dot"></i>Production backend for AI agents</div>
+        <h1>Remember&nbsp;Your&nbsp;Agent.</h1>
+        <p class="lede">Agent demos are easy. Production agents are hard. Rya is the backend layer underneath — <b>identity, runtime, memory, tools, approvals, channels, jobs, models, and observability</b> — so a developer, or a coding agent, can take an agent from prototype to production in a single afternoon.</p>
+
+        <div class="meta-row">
+          <span class="chip"><i data-lucide="feather"></i>Framework-agnostic</span>
+          <span class="chip"><i data-lucide="lock"></i>Single-tenant in your cloud</span>
+          <span class="chip"><i data-lucide="git-pull-request-arrow"></i>Diff-able manifests</span>
+          <span class="chip"><i data-lucide="scan-line"></i>Forensic traces</span>
+        </div>
+
+        <div class="callout">
+          <div class="ic"><i data-lucide="quote"></i></div>
+          <p><b>Stop rebuilding the production backend every time you ship an agent.</b> Every serious AI team builds the same internal platform — identity, approvals, memory, model routing, audit. Rya is that platform, built once.</p>
+        </div>
+      </section>
+
+      <!-- primitives -->
+      <section id="primitives">
+        <div class="kicker">The platform</div>
+        <h2>Ten primitives. Each composable.</h2>
+        <p class="section-lede">Small, sharp building blocks bound to a durable agent identity. None of them is the kind of thing a customer should have to rebuild.</p>
+
+        <div class="grid">
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="fingerprint"></i></div><h3>Identity</h3></div>
+            <p>Who the agent is, who owns it, what it may do — the contract everything else derives from.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="box"></i></div><h3>Runtime</h3></div>
+            <p>Durable execution that pauses, resumes, retries, and times out — and survives restarts.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="database"></i></div><h3>Memory</h3></div>
+            <p>Key-value, collections, and vector retrieval — scoped and addressable, not a context window.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="plug"></i></div><h3>Tools</h3></div>
+            <p>Typed, permissioned tool calls with a full audit trail. The agent never sees a raw credential.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="user-check"></i></div><h3>Approvals</h3></div>
+            <p>Human-in-the-loop as a primitive. A run pauses durably, a human approves, the run resumes.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="zap"></i></div><h3>Events &amp; jobs</h3></div>
+            <p>Webhooks, cron, delayed work, retries with backoff, and a dead-letter queue.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="send"></i></div><h3>Channels</h3></div>
+            <p>Slack, email, and webhooks behind one interface. New channels arrive at the platform.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="layers"></i></div><h3>Model gateway</h3></div>
+            <p>Anthropic, OpenAI, and custom models — permissioned, versioned, and traced per call.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="activity"></i></div><h3>Observability</h3></div>
+            <p>Every run is a forensic trace. Token and cost accounting on every model call.</p>
+          </div>
+          <div class="cell">
+            <div class="cell-head"><div class="cell-ic"><i data-lucide="shield"></i></div><h3>Isolation</h3></div>
+            <p>Postgres row-level security. Tenant and per-user isolation enforced by the database itself.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- manifest -->
+      <section id="manifest">
+        <div class="kicker">The artifact</div>
+        <h2>One declarative file is the contract.</h2>
+        <p class="section-lede">The agent is defined in <code style="font-family:'JetBrains Mono',monospace;font-size:13px;background:var(--bg-subtle);border:1px solid var(--border);border-radius:5px;padding:1px 6px">rya.agent.yaml</code> — validated before any deploy, reviewable in a pull request.</p>
+
+        <div class="window">
+          <div class="win-bar"><div class="win-dots"><i></i><i></i><i></i></div><span class="win-name">rya.agent.yaml</span></div>
+<pre><span class="k">name</span>: support-followup-agent
+<span class="k">runtime</span>: python
+<span class="k">model</span>:
+  <span class="k">provider</span>: <span class="s">anthropic</span>
+  <span class="k">default</span>: <span class="s">claude-haiku-4-5</span>
+<span class="k">tools</span>:
+  <span class="d">-</span> <span class="k">id</span>: <span class="s">crm.lookup</span>
+    <span class="k">permission</span>: <span class="s">allowed</span>
+  <span class="d">-</span> <span class="k">id</span>: <span class="s">email.send</span>
+    <span class="k">permission</span>: <span class="s">approval_required</span>   <span class="c"># gated on a human</span>
+<span class="k">memory</span>:
+  <span class="k">collections</span>: [<span class="s">conversations</span>, <span class="s">customer_context</span>]
+<span class="k">triggers</span>:
+  <span class="d">-</span> <span class="k">id</span>: <span class="s">daily-followups</span>
+    <span class="k">type</span>: <span class="s">cron</span>
+    <span class="k">schedule</span>: <span class="s">"0 9 * * *"</span>
+<span class="k">approvals</span>:
+  <span class="k">default</span>: <span class="s">required_for_external_actions</span></pre>
+        </div>
+      </section>
+
+      <!-- architecture -->
+      <section id="architecture">
+        <div class="kicker">How it runs</div>
+        <h2>Governance and execution, separated.</h2>
+        <p class="section-lede">A control plane owns desired state; a data plane executes. They scale and fail independently. Every read and write is scoped, on the database, to the requesting identity.</p>
+
+        <div class="arch">
+          <div class="plane">
+            <div class="plane-head"><i data-lucide="sliders-horizontal"></i><span class="t">Control plane</span><span class="badge">desired state</span></div>
+            <div class="nodes">
+              <span class="node">agents</span><span class="node">manifests</span><span class="node">permissions</span><span class="node">secrets&nbsp;meta</span><span class="node">schedules</span><span class="node">model&nbsp;registry</span>
+            </div>
+          </div>
+          <div class="arch-link"><i data-lucide="arrow-down-up"></i>converges to</div>
+          <div class="plane">
+            <div class="plane-head"><i data-lucide="cpu"></i><span class="t">Data plane</span><span class="badge">execution</span></div>
+            <div class="nodes">
+              <span class="node">events</span><span class="node">runs</span><span class="node">tool&nbsp;calls</span><span class="node">model&nbsp;calls</span><span class="node">approvals</span><span class="node">traces</span>
+            </div>
+          </div>
+          <div class="plane rls">
+            <div class="plane-head"><i data-lucide="key-round"></i><span class="t">Postgres — row-level security</span><span class="badge">enforced by the database</span></div>
+            <div class="nodes">
+              <span class="node">workspace&nbsp;isolation</span><span class="node">per-user&nbsp;RLS</span><span class="node">non-superuser&nbsp;role</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- developer surface -->
+      <section id="developer">
+        <div class="kicker">Built for coding agents</div>
+        <h2>The coding agent is a first-class developer.</h2>
+        <p class="section-lede">The dashboard exists, but it isn't the primary interface. Claude Code, Codex, and Cursor drive Rya end to end — and never have to guess.</p>
+
+        <div class="stack">
+          <div class="row">
+            <div class="row-ic"><i data-lucide="terminal"></i></div>
+            <div><div class="t">CLI</div><p>Every command speaks <code>--json</code> with stable error codes and semantic exit codes. One binary: <code>create</code>, <code>dev</code>, <code>deploy</code>, <code>runs trace</code>, <code>approvals approve</code>.</p></div>
+          </div>
+          <div class="row">
+            <div class="row-ic"><i data-lucide="puzzle"></i></div>
+            <div><div class="t">MCP server <span class="tag">19 tools</span></div><p>The same surface as Model Context Protocol tools, so an agent can introspect, configure, deploy, and debug in its native idiom.</p></div>
+          </div>
+          <div class="row">
+            <div class="row-ic"><i data-lucide="graduation-cap"></i></div>
+            <div><div class="t">Skills</div><p>Progressive-disclosure knowledge bundles that teach the workflow up front — so agents stop discovering state by trial and error.</p></div>
+          </div>
+          <div class="row">
+            <div class="row-ic"><i data-lucide="braces"></i></div>
+            <div><div class="t">SDK <span class="tag">py · ts</span></div><p>Python <code>define_agent()</code> with a typed runtime context, and a typed TypeScript client. Agent code is business logic; everything around it is the platform.</p></div>
+          </div>
+        </div>
+
+        <div class="term">
+          <div class="win-bar"><div class="win-dots"><i></i><i></i><i></i></div><span class="win-name">zsh — the first five minutes</span></div>
+<pre><span class="p">$</span> <span class="cmd">uvx rya create support-agent</span>
+<span class="out">  ✓ scaffolded · manifest · handler · tests</span>
+<span class="p">$</span> <span class="cmd">rya dev</span>
+<span class="out">  ✓ support-agent ready · 3 tools · event handler</span>
+<span class="p">$</span> <span class="cmd">rya events send --payload '{"email":"ada@acme.com"}'</span>
+<span class="out">  run_8f2a3c · </span><span class="wait">waiting_approval</span>
+<span class="p">$</span> <span class="cmd">rya approvals approve apr_19c4</span>
+<span class="out">  run_8f2a3c · </span><span class="ok">completed</span>
+<span class="p">$</span> <span class="cmd">rya runs trace run_8f2a3c</span>
+<span class="out">  event → memory → crm.lookup → churn-risk → llm → approval → email.send</span></pre>
+        </div>
+      </section>
+
+      <!-- deploy & trust -->
+      <section id="deploy">
+        <div class="kicker">Deployment</div>
+        <h2>Single-tenant. In your cloud. No shared blast radius.</h2>
+        <p class="section-lede">We do not run a multi-tenant SaaS. Each customer gets a dedicated deployment inside their own account — reproducible in CloudFormation, owned end to end.</p>
+
+        <div class="trust">
+          <div class="t-cell">
+            <div class="t-ic"><i data-lucide="server"></i></div>
+            <h4>Your account</h4>
+            <p>Cognito, Fargate, RDS, ElastiCache and Secrets Manager — described as code. You own the stack and can leave with it intact.</p>
+          </div>
+          <div class="t-cell">
+            <div class="t-ic"><i data-lucide="key-round"></i></div>
+            <h4>Identity at the edge</h4>
+            <p>RS256 JWTs verified on every request. Mutating writes re-validate the caller before touching data — the agent holds no privileged credentials.</p>
+          </div>
+          <div class="t-cell">
+            <div class="t-ic"><i data-lucide="user-check"></i></div>
+            <h4>Human in control</h4>
+            <p>Approvals gate external actions by default. Every run leaves a complete, queryable audit trail.</p>
+          </div>
+        </div>
+      </section>
+
+      <div class="foot">
+        <span>Rya — production backend for AI agents.</span>
+        <a href="#overview">Back to top ↑</a>
+      </div>
+
+    </article>
+  </main>
+</div>
+
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script>
+  lucide.createIcons({ attrs: { 'stroke-width': 1.9 } });
+  // active section in sidebar
+  const links = [...document.querySelectorAll('.nav a')];
+  const map = Object.fromEntries(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        map[e.target.id]?.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  document.querySelectorAll('section[id]').forEach(s => obs.observe(s));
+</script>
+</body>
+</html>

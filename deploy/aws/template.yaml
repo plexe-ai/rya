@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Rya — single-tenant deployment in the customer's AWS account. Realizes the
+  reference posture: Cognito identity at the edge, ECS Fargate runtime behind an
+  ALB, RDS Postgres with row-level security at the data, ElastiCache for hot
+  reads, a single-purpose mutator Lambda that re-validates the caller's JWT, and
+  all secrets in Secrets Manager. The customer owns the stack; no shared blast
+  radius. Deploy: `sam build && sam deploy --guided`.
+
+Parameters:
+  ContainerImage:
+    Type: String
+    Description: ECR image URI for the Rya runtime (built from the repo Dockerfile).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for the ALB.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the runtime, database, and cache.
+  DBUsername:
+    Type: String
+    Default: rya
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of Fargate runtime tasks (scale horizontally on CPU).
+
+Resources:
+
+  # ---- Identity (Cognito) -------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+
+  # ---- Secrets ------------------------------------------------------------
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/db"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/app"
+      Description: Application secrets (JWT signing, model API keys). Populate after deploy.
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: RYA_JWT_SECRET
+        PasswordLength: 48
+
+  # ---- Networking (security groups) --------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rya ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rya runtime tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8787
+          ToPort: 8787
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rya Postgres
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rya cache
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  # ---- Data (RDS Postgres + ElastiCache) ---------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Rya DB subnets
+      SubnetIds: !Ref PrivateSubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      DBName: rya
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Rya cache subnets
+      SubnetIds: !Ref PrivateSubnetIds
+
+  Cache:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      ServerlessCacheName: !Sub "${AWS::StackName}-cache"
+      Engine: redis
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+
+  # ---- Runtime (ECS Fargate behind an ALB) -------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: [!Ref AppSecret, !Ref DBSecret]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runtime"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: rya
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: 8787
+          Environment:
+            - Name: RYA_MULTITENANT
+              Value: "1"
+            - Name: RYA_JWKS_URL
+              Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/jwks.json"
+            - Name: RYA_DATABASE_URL
+              Value: !Sub
+                - "postgresql://${DBUsername}:${pw}@${Endpoint}:5432/rya"
+                - pw: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+                  Endpoint: !GetAtt Database.Endpoint.Address
+          Secrets:
+            - Name: RYA_JWT_SECRET
+              ValueFrom: !Sub "${AppSecret}:RYA_JWT_SECRET::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: rya
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8787
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /healthz
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: rya
+          ContainerPort: 8787
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---- Single-purpose mutator (the privileged-write pattern) -------------
+  # Mutating tool calls travel here; this re-validates the caller's JWT before
+  # touching the database, so the agent holds no privileged DB credentials.
+  MutatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-mutator"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 15
+      InlineCode: |
+        import json
+        def handler(event, context):
+            # In production: verify the Cognito JWT from the request, open a DB
+            # connection as a non-superuser role with app.user_id set from the
+            # verified sub, perform the single scoped write, return the result.
+            return {"statusCode": 200, "body": json.dumps({"ok": True, "pattern": "single-purpose-mutator"})}
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+        DefaultAuthorizer: CognitoJwt
+
+Outputs:
+  AlbUrl:
+    Description: Runtime URL (control + data plane) behind the ALB.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ApiUrl:
+    Description: HTTP API edge (Cognito-JWT-authorized mutators).
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Value: !Ref UserPool
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address

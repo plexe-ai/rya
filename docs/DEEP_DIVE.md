@@ -1,0 +1,389 @@
+# Rya — Deep Dive
+
+The detailed reference for Rya: the production backend/runtime for AI agents.
+For the front-door summary see the [README](../README.md); for the
+vision-vs-built gap see [VISION_GAP.md](VISION_GAP.md); for the OSS/cloud
+architecture see [architecture.md](architecture.md).
+
+---
+
+## 1. What Rya is
+
+Agent demos are easy; production agents are hard. The hard 90% — identity,
+durable execution, memory, permissioned tools, human approvals, channels, jobs,
+model routing, secrets, traces, cost — is the same internal platform every
+serious AI team eventually rebuilds. Rya is that platform, exposed as clean
+primitives.
+
+Two design commitments shape everything:
+
+1. **Coding-agent-first.** The primary user is a coding agent (Claude Code,
+   Codex, Cursor), not a human clicking a dashboard. Every surface is
+   machine-readable (`--json`), self-correcting (stable error codes + a fix),
+   idempotent, and resumable.
+2. **Production is a checklist, not expertise.** A model can write a handler; it
+   can't *know* production. So Rya encodes "what production requires" as a
+   green checklist (`rya deploy --check`) the agent satisfies — and as hard
+   guards (Action Guard, approval gates, secret enforcement) that make unsafe
+   agents un-shippable.
+
+---
+
+## 2. The agent's journey
+
+```
+orient → scaffold → author → prove → check → deploy → verify → operate
+  │         │          │        │       │        │        │         │
+rya       rya        SDK +   triggers  rya     rya      synthetic  runs,
+context   create     manifest + traces  deploy  deploy   event +    traces,
+                                        --check          trace      replay
+```
+
+- **orient** — `rya context --json` returns the whole state *and* the
+  production-readiness verdict *and* the invariants to respect, in one call.
+- **scaffold** — `rya create` lays down a runnable, safe-by-default project.
+- **author** — write `src/agent.py` (the handler) + `rya.agent.yaml` (the
+  contract). Validation errors carry the exact fix.
+- **prove** — trigger synthetic events, read the deterministic trace, assert.
+- **check** — `rya deploy --check` until green.
+- **deploy** — gated on readiness; emits a self-contained image + plan.
+- **verify** — hit the deployed runtime, read the trace.
+- **operate** — runs, approvals, traces; fix → redeploy.
+
+---
+
+## 3. The manifest — `rya.agent.yaml`
+
+The declarative contract, validated before any run or deploy
+([manifest/schema.py](../src/rya/manifest/schema.py)).
+
+```yaml
+name: support-followup-agent
+runtime: python                 # python (node reserved)
+entrypoint: src/agent.py
+version: 0.1.0
+environment: local
+timeout_seconds: 300            # per-run-segment execution timeout
+model:
+  provider: auto                # auto | mock | anthropic | openai
+  default: claude-haiku-4-5     # model name
+  fallback: gpt-4.1-mini        # used on provider failure
+  temperature: 0.2
+memory:
+  collections: [conversations, customer_context]
+tools:
+  - id: crm.lookup
+    permission: allowed         # read_only | allowed | approval_required | disabled
+  - id: email.send
+    permission: approval_required
+  - id: remote.score
+    url: https://scorer.example.com/score   # HTTP tool
+models:
+  - { id: churn-risk-v1, type: custom, permission: allowed }
+channels:
+  - { type: webhook, path: /inbound }
+  - { type: slack, enabled: false }
+triggers:
+  - { id: daily, type: cron, schedule: "0 9 * * *", handler: daily_followup }
+approvals:
+  default: required_for_external_actions
+observability: { traces: true, export: langfuse }
+```
+
+A companion `rya.guard.yaml` holds the egress policy (§11).
+
+---
+
+## 4. The SDK and the `ctx` surface
+
+Agent code is business logic; everything around it is the platform.
+
+```python
+from rya import define_agent
+agent = define_agent()
+
+@agent.on_event
+async def handle_event(ctx, event):
+    await ctx.memory.append("conversations", {"event": event.model_dump()})
+    customer = await ctx.tools.call("crm.lookup", {"email": event.payload["email"]})
+    risk = await ctx.models.call("churn-risk-v1", {"customer_id": customer["id"]})
+    if risk["score"] > 0.8:
+        msg = await ctx.llm.respond(system="Draft a follow-up.", input={"customer": customer})
+        result = await ctx.approvals.request(            # PAUSES the run
+            title="Send follow-up", body=msg.text,
+            action={"tool": "email.send", "input": {"to": customer["email"], "body": msg.text}})
+        await ctx.channels.send("email", {"messageId": result["actionResult"]["messageId"]})
+
+@agent.tool("remote.score")                              # a real async tool
+async def score(input): ...
+
+@agent.job("daily_followup")
+async def daily_followup(ctx, job): ...
+```
+
+`ctx` exposes: `llm · models · memory · tools · channels · jobs · cron ·
+approvals · logs · traces · secrets · events · identity`.
+
+---
+
+## 5. The runtime — durable execution
+
+[runtime/engine.py](../src/rya/runtime/engine.py). Events create **runs**; runs
+are durable and journaled to the store.
+
+- **Pause/resume via journal replay.** Every side-effecting `ctx` op is journaled
+  by sequence number. `ctx.approvals.request()` unwinds the coroutine
+  (`PausedForApproval`); a *separate* approve invocation resolves it and replays
+  the handler — prior steps return memoized results, so only post-approval code
+  runs for real. The constraint is the standard one: issue `ctx` ops in a
+  deterministic order. This survives process restarts on Postgres.
+- **Nested event loops.** The engine runs handlers safely whether called from
+  sync (CLI) or inside an event loop (MCP/API) via `_run_coro` (worker-thread
+  fallback).
+- **Timeouts.** `manifest.timeout_seconds` wraps the handler in
+  `asyncio.wait_for` → `E_TIMEOUT` on overrun.
+- **Jobs** carry `attempts/maxAttempts`; failures retry with exponential backoff
+  (`min(30, 2^(n-1))s`) until exhausted → the dead-letter queue. `rya worker`
+  drains due jobs (atomic claim via Postgres `FOR UPDATE SKIP LOCKED` — run many
+  concurrently).
+
+---
+
+## 6. The ten primitives
+
+| Primitive | What it is | Where |
+|-----------|-----------|-------|
+| **Identity** | owner, version, permission levels; per-run identity from a verified JWT | manifest, auth.py |
+| **Runtime** | durable runs: pause/resume, retries, timeouts, cron | runtime/engine.py |
+| **Memory** | key-value, collections, **vector recall** (embeddings + cosine) | sdk/context.py, providers/embeddings.py |
+| **Tools** | typed, permissioned (`read_only/allowed/approval_required/disabled`), audited; `@agent.tool`, HTTP tools, or registry | tools/, sdk/context.py |
+| **Models** | registry + gateway; real Anthropic/OpenAI, fallback, per-call usage | providers/llm.py, models/ |
+| **Approvals** | durable human-in-the-loop pause/resume | approvals/, runtime |
+| **Events & jobs** | webhooks, cron, delayed jobs, retries/backoff, DLQ | runtime, api |
+| **Channels** | webhook + real Slack/email (Resend) + mock, one interface | providers/channels.py |
+| **Observability** | forensic per-run trace, token/cost, Langfuse/webhook export | observability/ |
+| **Secrets** | `ctx.secrets.get`, names-only listing, redacted from traces | sdk/context.py |
+
+Tool permission rules are enforced: an `approval_required` tool **cannot** be
+called via `ctx.tools.call` — it must flow through `ctx.approvals.request`.
+Secret values read via `ctx.secrets.get` are added to a redaction vault and
+scrubbed from every trace/log.
+
+---
+
+## 7. Persistence and multi-tenancy
+
+`open_store(root)` picks the backend with no code change
+([store.py](../src/rya/store.py)):
+
+| Env | Backend | Use |
+|-----|---------|-----|
+| (none) | `FileStore` (`.rya/` JSON) | local dev, CI, tests — offline & reproducible |
+| `RYA_DATABASE_URL` | `PostgresStore` (JSONB) | self-host + cloud, durable |
+
+**Multi-tenancy** ([tenancy.py](../src/rya/tenancy.py), `RYA_MULTITENANT=1`):
+workspaces + SHA-256-hashed API keys, with two isolation layers — app-layer
+`workspace_id` filtering **and** Postgres **row-level security** (FORCE policies
++ a non-superuser `rya_app` role + `app.workspace_id`/`app.user_id` GUCs). Proven
+that an unfiltered `SELECT *` returns only the caller's rows, and that **per-user
+RLS** keeps one user from seeing another user's runs within a workspace.
+
+---
+
+## 8. Auth
+
+Single deployed agent, modes by env (all enforced server-side):
+
+| Configured | Mode | Who |
+|------------|------|-----|
+| nothing | open (local dev) | — |
+| `RYA_TOKEN` | operator token | one operator |
+| `RYA_JWT_SECRET` / `RYA_JWKS_URL` | per-user JWT (HS256 / RS256-JWKS) | end users |
+| `RYA_MULTITENANT=1` + Postgres | API keys → workspace, RLS | tenants |
+
+Inbound webhooks add `RYA_WEBHOOK_SECRET` (HMAC) and `RYA_SLACK_SIGNING_SECRET`
+(Slack signature) — independent of operator auth, since third-party senders hold
+the signing secret, not the token.
+
+---
+
+## 9. Coding-agent surfaces
+
+The same operations over three surfaces; see [mcp.md](mcp.md), [devex.md](devex.md).
+
+- **CLI** — every command takes `--json`/`--non-interactive`; failures return
+  `{ok:false, error:{code, message, hint, exit_code}}`. Exit codes are semantic
+  (§16) so an agent branches without parsing prose.
+- **MCP** — `rya mcp` (stdio), **20 `rya_*` tools** including `rya_context`
+  (orient) and `rya_check_readiness` (the gate). Register with `{"command":"rya","args":["mcp"]}`.
+- **Skills** — `rya skills install` writes two progressive-disclosure modules:
+  `rya` (authoring) and `rya-ops` (operating).
+- **`rya context`** — the one-call orient: full state + readiness verdict + the
+  invariants to respect, so the agent never discovers by trial and error.
+
+---
+
+## 10. Production-readiness gate
+
+[readiness.py](../src/rya/readiness.py). `rya deploy --check --json` returns
+`{ready, blocks, warnings}`; each item has a stable `code` + an exact `fix`.
+
+**Blocks** (deploy-stopping): `E_NO_EVENT_HANDLER`, `E_RUNTIME_UNSUPPORTED`,
+`E_TOOL_NO_IMPL`, `E_UNGATED_SIDE_EFFECT` (a side-effecting tool with permission
+`allowed` while the approval policy is `required_for_external_actions`),
+`E_SECRET_UNSET`.
+**Warnings** (advisory): `W_LLM_MOCK`, `W_STORE_FILE`, `W_NO_TRACE_EXPORT`,
+`W_NO_EVALS`, `W_NO_COST_CAP`.
+
+`rya deploy --check` exits `7` if any block remains. A plain `rya deploy` runs
+the check as a **hard gate** → `E_NOT_PRODUCTION_READY` unless `--force`. The
+verdict also ships inside `rya context`.
+
+---
+
+## 11. Action Guard — egress firewall
+
+[guard.py](../src/rya/guard.py). Every outbound request the runtime makes — HTTP
+tools, model calls, channel sends, embeddings — is evaluated **before the bytes
+leave the process**:
+
+```
+SSRF blocklist  →  deny rules  →  allow rules  →  default (deny | allow)
+```
+
+- Policy in `rya.guard.yaml`, hot-reloaded by mtime per request; **no-op if
+  absent** (opt-in, backward-compatible).
+- Rule kinds: `prefix` (startswith), `glob` (fnmatch), `exact`; optional method
+  scoping; `deny` always beats `allow`.
+- **SSRF**: blocks loopback/private/link-local/reserved IP literals and
+  `localhost`, `*.internal`, `169.254.169.254`, metadata hosts.
+- A blocked request raises `E_EGRESS_BLOCKED` and never goes out.
+- `POST /guard/test` runs a benign+attack probe suite and scores the policy
+  (attacks blocked, benign false-blocks, decision accuracy) — surfaced in the
+  console's **Action Guard** page, editable live (`GET`/`PUT /guard`).
+
+> Note: the LLM policy *judge* (evaluate-with-a-model when no static rule
+> matches) is scaffolded in the UI but not yet wired to a real model; `default`
+> handles the no-match case today.
+
+---
+
+## 12. Observability
+
+- **Traces** — every run is a forensic record: events, tool/model/memory/approval
+  /channel/job steps, retries, final status, with timings. `rya runs trace`,
+  `GET /runs/:id/trace`.
+- **Usage & cost** — token usage is summed from the trace (replay-safe);
+  cost is computed only when `RYA_PRICE_<MODEL>_IN/_OUT` is configured (no
+  hard-coded prices). [observability/usage.py](../src/rya/observability/usage.py).
+- **Export** — on a terminal run, traces are pushed to **Langfuse**
+  (`LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`) or a generic `RYA_TRACE_WEBHOOK`;
+  best-effort, never fails a run. [observability/export.py](../src/rya/observability/export.py).
+- **Secret redaction** — secret values are scrubbed from traces/logs.
+
+---
+
+## 13. The web console
+
+`rya serve` serves a built-in console at `/`
+([console/index.html](../src/rya/console/index.html)). It's a data-driven
+frontend over `GET /console` (auth-gated), with views: **Overview** (stats +
+primitive grid + `rya context` terminal), **Infrastructure** (compute, data
+substrate, auth/RLS, observability — live from the process), **Manifest**,
+**Tools/Memory/Models/Channels**, **Runs & traces** (clickable forensic trace),
+**Approvals** (working approve/reject), **Action Guard** (editable policy + test
+suite), **Jobs & cron**, **Secrets**. Same-origin by default; a Connect dialog
+prompts for the token when auth is on.
+
+---
+
+## 14. Deployment
+
+- **Self-host (OSS):** `docker compose up` (Postgres + `rya serve`), or
+  `rya deploy --target docker|fly|render` generates a self-contained image
+  (agent baked in; state external via `RYA_DATABASE_URL`) + the exact command.
+  [deploy_templates.py](../src/rya/cli/deploy_templates.py).
+- **AWS reference:** [deploy/aws/template.yaml](../deploy/aws/template.yaml) — a
+  single-tenant SAM/CloudFormation stack (Cognito, ECS Fargate + ALB, RDS
+  Postgres, ElastiCache, Secrets Manager, mutator Lambda), cfn-lint clean.
+  `sam deploy` is an operator step (real, billable).
+- **Distribution:** `uv build` → wheel/sdist; `uvx rya serve` ships the console.
+  Not yet published to PyPI.
+
+---
+
+## 15. Testing
+
+`pytest` — **72 pass, 7 Postgres-gated** (run those with
+`RYA_TEST_DATABASE_URL=…`). Coverage includes: manifest validation, the durable
+pause/resume slice (file + Postgres, cross-process), per-user RLS, JWT, real
+tool/channel HTTP delivery, the signed-webhook + auth flows, the
+production-readiness gate, the console aggregate, and the **Action Guard**
+enforcement (a blocked request provably never reaches its destination).
+External IO (default tools/models/LLM) is deterministic so runs are reproducible
+and assertable.
+
+---
+
+## 16. Reference
+
+### CLI
+
+```
+login init create dev deploy(--check/--target/--force) status context logs
+agents(list/inspect) events(send) runs(list/trace) approvals(list/approve/reject)
+tools(list/register) models(list/register) channels(list/connect)
+secrets(set/list) schedules(list/create/run) jobs(list/run/dlq/retry)
+skills(install/path) workspaces(create/list) keys(create) token mcp serve worker
+```
+
+### HTTP API (single-tenant)
+
+```
+GET  /                      console page          GET  /console        live aggregate
+GET  /healthz                                     GET  /guard          egress policy
+POST /inbound               signed webhook        PUT  /guard          save policy
+POST /slack/events          Slack adapter         POST /guard/test     score policy
+POST /agents/:id/events     trigger a run         GET  /agents/:id     manifest
+GET  /agents/:id/runs       GET /runs/:id         GET  /runs/:id/trace
+GET  /approvals             POST /approvals/:id/approve  /reject
+GET  /tools /models /channels
+```
+
+### Error / exit codes
+
+| Exit | Codes |
+|------|-------|
+| 1 generic | `E_RUNTIME`, `E_TIMEOUT` |
+| 3 manifest | `E_MANIFEST_*`, `E_ENTRYPOINT_NOT_FOUND`, `E_AGENT_NOT_DEFINED` |
+| 4 not-found | `E_*_NOT_FOUND` (run/approval/tool/model/job/handler) |
+| 5 permission | `E_TOOL_PERMISSION_DENIED`, `E_UNAUTHORIZED`, `E_BAD_SIGNATURE`, `E_EGRESS_BLOCKED` |
+| 6 state | `E_APPROVAL_NOT_PENDING`, `E_RUN_NOT_PAUSED` |
+| 7 validation | `E_VALIDATION`, `E_NOT_PRODUCTION_READY` |
+
+### Key environment variables
+
+| Group | Vars |
+|-------|------|
+| Persistence | `RYA_DATABASE_URL` / `DATABASE_URL`, `RYA_APP_DB_PASSWORD` |
+| Auth | `RYA_TOKEN`, `RYA_JWT_SECRET`, `RYA_JWKS_URL`, `RYA_MULTITENANT` |
+| Webhooks | `RYA_WEBHOOK_SECRET`, `RYA_SLACK_SIGNING_SECRET` |
+| Models | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RYA_LLM_MODEL`, `RYA_OPENAI_MODEL`, `RYA_LLM_PROVIDER` |
+| Channels | `SLACK_WEBHOOK_URL`, `RESEND_API_KEY`, `RYA_EMAIL_FROM`, `RYA_CHANNEL_<TYPE>_URL` |
+| Cost/obs | `RYA_PRICE_<MODEL>_IN/_OUT`, `LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`, `RYA_TRACE_WEBHOOK` |
+| Guard | `RYA_GUARD_PATH` |
+
+---
+
+## 17. Honest status
+
+- **Real & verified:** durable runs on Postgres (cross-process pause/resume),
+  per-user RLS multi-tenancy, real Anthropic/OpenAI + Slack/email seams (wiring
+  proven; live success needs your keys), signed webhooks + token/JWT auth, the
+  web console, the production-readiness gate, the Action Guard (network-level
+  enforcement), job retry/DLQ, the TS client, deploy artifacts, and `uvx`.
+- **Mocked:** the default tool/model implementations (deterministic IO; the
+  registries/permissions/traces around them are real).
+- **Not built:** a *managed* cloud deploy (`rya deploy` emits self-host artifacts
+  — `sam deploy` is manual), the Action Guard LLM judge, remote MCP + OAuth, a
+  PyPI publish, and per-tenant code sandboxing.

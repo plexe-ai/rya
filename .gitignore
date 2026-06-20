@@ -1,0 +1,19 @@
+.rya/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+.preview/
+
+# secrets / local env — never commit (use .env.example for the template)
+.env
+*.key
+*.pem
+secret.key
+
+# os / editor
+.DS_Store

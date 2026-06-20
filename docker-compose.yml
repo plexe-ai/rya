@@ -1,0 +1,39 @@
+# Rya OSS self-host: `cp .env.example .env && docker compose up`
+# Brings up Postgres + the Rya runtime serving the example agent. Point the
+# `rya` service's volume at your own agent project to run yours.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rya}
+      POSTGRES_DB: rya
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - rya_pgdata:/var/lib/postgresql/data
+
+  rya:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Substrate-agnostic: the same image runs on file storage locally; here it
+      # targets Postgres. Swap this DSN for managed Postgres in the cloud.
+      RYA_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya
+      # Optional: set in .env to use real Claude instead of the mock LLM.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+    ports:
+      - "8787:8787"
+    volumes:
+      # Mount your agent project here (must contain rya.agent.yaml).
+      - ./examples/followup_agent:/project
+
+volumes:
+  rya_pgdata:

@@ -1,0 +1,52 @@
+name: support-followup-agent
+runtime: python
+entrypoint: src/agent.py
+version: 0.1.0
+environment: local
+owner: you@example.com
+instructions: >
+  Receive a customer event, score churn risk, draft a retention follow-up, and
+  request human approval before sending. Demonstrates the full vertical slice.
+
+model:
+  default: mock-llm
+  fallback: mock-llm-mini
+
+memory:
+  type: managed
+  collections:
+    - conversations
+    - customer_context
+
+tools:
+  - id: crm.lookup
+    permission: allowed
+  - id: calendar.read
+    permission: read_only
+  - id: email.send
+    permission: approval_required
+
+models:
+  - id: churn-risk-v1
+    type: custom
+    permission: allowed
+
+channels:
+  - type: webhook
+    path: /inbound
+  - type: slack
+    enabled: false
+
+triggers:
+  - id: daily-followups
+    type: cron
+    schedule: "0 9 * * *"
+    handler: daily_followup
+
+approvals:
+  default: required_for_external_actions
+
+observability:
+  logs: true
+  traces: true
+  audit: true

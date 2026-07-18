@@ -413,9 +413,15 @@ def build_app(root: Path) -> FastAPI:
                     futs.append(asyncio.run_coroutine_threadsafe(
                         websocket.send_json({"type": "trace", "event": ev}), loop))
 
+                # Token-level LLM streaming: each text chunk lands as a
+                # {"type":"token"} frame the moment the model emits it.
+                def on_token(chunk):
+                    futs.append(asyncio.run_coroutine_threadsafe(
+                        websocket.send_json({"type": "token", "text": chunk}), loop))
+
                 try:
                     run = await asyncio.to_thread(
-                        engine.run_event, event_type, payload, "websocket", None, on_trace)
+                        engine.run_event, event_type, payload, "websocket", None, on_trace, on_token)
                 except RyaError as e:
                     await websocket.send_json({"type": "error", **e.to_dict()["error"]})
                     continue
@@ -440,6 +446,83 @@ def build_app(root: Path) -> FastAPI:
                 continue
 
             await websocket.send_json({"type": "error", "message": f"unknown type '{mtype}'"})
+
+    @api.post("/agents/{agent_id}/events/stream")
+    async def post_event_stream(agent_id: str, request: Request,
+                                engine: Engine = Depends(get_engine),
+                                authorization: Optional[str] = Header(None),
+                                x_rya_token: Optional[str] = Header(None)):
+        """Trigger a run and stream it back as Server-Sent Events.
+
+        The default client transport (plain HTTP - works through ALBs, proxies,
+        and `fetch` with no connection upgrade). Frames, in order of arrival:
+
+          event: token    {"text": ...}          - each streamed LLM chunk
+          event: trace    {trace event}          - each journaled step
+          event: message  {assistant message}    - session replies (chat agents)
+          event: run      {run summary}          - ALWAYS the terminal frame
+          event: error    {code, message}        - fatal error (then closes)
+
+        Clients wait for `run` and never have to guess whether more is coming.
+        """
+        import asyncio
+        import queue as _q
+
+        from fastapi.responses import StreamingResponse
+
+        body = await request.json()
+        event_type = body.get("type", "message.received")
+        payload = body.get("payload", {})
+        identity = _identity_from(authorization, x_rya_token, required=False)
+
+        frames: _q.Queue = _q.Queue()
+        _DONE = object()
+
+        def emit(kind: str, data: dict) -> None:
+            frames.put((kind, data))
+
+        def produce() -> None:
+            try:
+                run = engine.run_event(event_type, payload, "sse", identity=identity,
+                                       on_trace=lambda ev: emit("trace", ev),
+                                       on_token=lambda chunk: emit("token", {"text": chunk}))
+                # Chat agents: surface assistant messages this run wrote, BEFORE
+                # the terminal summary (same contract as the WebSocket).
+                if hasattr(engine.store, "find_session") and isinstance(payload, dict) \
+                        and payload.get("channel") and payload.get("externalId"):
+                    sess = engine.store.find_session(manifest.name, payload["channel"],
+                                                     payload["externalId"])
+                    if sess:
+                        for m in engine.store.list_messages(sess["id"]):
+                            if m.get("runId") == run["id"] and m.get("role") in ("assistant", "agent"):
+                                emit("message", m)
+                emit("run", _run_summary(run))
+            except RyaError as e:
+                emit("error", e.to_dict()["error"])
+            except Exception as e:  # never leave the stream hanging
+                emit("error", {"code": "E_RUNTIME", "message": str(e)})
+            finally:
+                frames.put(_DONE)
+
+        async def sse():
+            producer = asyncio.get_running_loop().run_in_executor(None, produce)
+            try:
+                while True:
+                    try:
+                        item = await asyncio.to_thread(frames.get, True, 15.0)
+                    except _q.Empty:
+                        yield ": keep-alive\n\n"  # comment frame; defeats idle timeouts
+                        continue
+                    if item is _DONE:
+                        break
+                    kind, data = item
+                    yield f"event: {kind}\ndata: {json.dumps(data, default=str)}\n\n"
+            finally:
+                await producer
+
+        return StreamingResponse(sse(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
 
     @api.get("/guard")
     def get_guard(engine: Engine = Depends(get_engine)):
@@ -634,9 +717,173 @@ def build_app(root: Path) -> FastAPI:
             raise HTTPException(status_code=409, detail=e.to_dict()["error"])
         return {"approvalId": approval_id, "runStatus": run["status"]}
 
+    # ---- queue: durable jobs for external workers (Sim et al.) -----------
+    from .. import queue as q
+
+    _Q_HTTP = {"E_JOB_NOT_FOUND": 404, "E_QUEUE_CONFLICT": 409, "E_VALIDATION": 400}
+
+    def _q_err(e: RyaError) -> HTTPException:
+        return HTTPException(status_code=_Q_HTTP.get(e.code, 400), detail=e.to_dict()["error"])
+
+    @api.post("/queue/jobs")
+    async def queue_enqueue(request: Request, engine: Engine = Depends(get_engine)):
+        body = await request.json()
+        try:
+            job = q.enqueue(
+                engine.store, body.get("type"), body.get("payload"),
+                job_id=body.get("jobId"), max_attempts=body.get("maxAttempts", 1),
+                delay_seconds=body.get("delaySeconds", 0), priority=body.get("priority", 0),
+                tags=body.get("tags"), metadata=body.get("metadata"),
+                concurrency_key=body.get("concurrencyKey"),
+                concurrency_limit=body.get("concurrencyLimit"),
+                retry_delay_seconds=body.get("retryDelaySeconds"))
+        except RyaError as e:
+            raise _q_err(e)
+        return {"job": job}
+
+    @api.post("/queue/jobs/batch")
+    async def queue_enqueue_batch(request: Request, engine: Engine = Depends(get_engine)):
+        body = await request.json()
+        try:
+            jobs = q.enqueue_batch(engine.store, body.get("type"), body.get("items") or [])
+        except RyaError as e:
+            raise _q_err(e)
+        return {"jobs": jobs, "ids": [j["id"] for j in jobs]}
+
+    @api.post("/queue/claim")
+    async def queue_claim(request: Request, engine: Engine = Depends(get_engine)):
+        """Claim due jobs for an external worker. Optional short long-poll via
+        waitSeconds (capped) so idle workers don't hammer the API."""
+        import asyncio
+        body = await request.json()
+        worker_id = body.get("workerId")
+        wait = min(float(body.get("waitSeconds") or 0), 25.0)
+        deadline = time.monotonic() + wait
+
+        def _claim():
+            return q.claim(engine.store, worker_id, types=body.get("types"),
+                           limit=body.get("limit", 1),
+                           lease_seconds=body.get("leaseSeconds", q.DEFAULT_LEASE_SECONDS))
+        try:
+            jobs = await asyncio.to_thread(_claim)
+            while not jobs and time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                jobs = await asyncio.to_thread(_claim)
+        except RyaError as e:
+            raise _q_err(e)
+        return {"jobs": jobs}
+
+    @api.get("/queue/jobs/{job_id}")
+    def queue_get_job(job_id: str, engine: Engine = Depends(get_engine)):
+        job = engine.store.queue_get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail={"code": "E_JOB_NOT_FOUND"})
+        return {"job": job}
+
+    @api.get("/queue/jobs")
+    def queue_list_jobs(status: Optional[str] = None, type: Optional[str] = None,
+                        engine: Engine = Depends(get_engine)):
+        return {"jobs": engine.store.queue_list(status, type)}
+
+    @api.post("/queue/jobs/{job_id}/heartbeat")
+    async def queue_heartbeat(job_id: str, request: Request, engine: Engine = Depends(get_engine)):
+        body = await request.json()
+        try:
+            return q.heartbeat(engine.store, job_id, body.get("workerId"),
+                               body.get("extendSeconds", q.DEFAULT_LEASE_SECONDS))
+        except RyaError as e:
+            raise _q_err(e)
+
+    @api.post("/queue/jobs/{job_id}/complete")
+    async def queue_complete(job_id: str, request: Request, engine: Engine = Depends(get_engine)):
+        body = await request.json()
+        try:
+            return {"job": q.complete(engine.store, job_id, body.get("workerId"),
+                                      body.get("output"))}
+        except RyaError as e:
+            raise _q_err(e)
+
+    @api.post("/queue/jobs/{job_id}/fail")
+    async def queue_fail(job_id: str, request: Request, engine: Engine = Depends(get_engine)):
+        body = await request.json()
+        try:
+            return {"job": q.fail(engine.store, job_id, body.get("workerId"),
+                                  body.get("error") or "unknown error")}
+        except RyaError as e:
+            raise _q_err(e)
+
+    @api.post("/queue/jobs/{job_id}/cancel")
+    async def queue_cancel(job_id: str, request: Request, engine: Engine = Depends(get_engine)):
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        return q.cancel(engine.store, job_id, force=bool((body or {}).get("force")))
+
+    @api.post("/queue/jobs/{job_id}/retry")
+    def queue_retry(job_id: str, engine: Engine = Depends(get_engine)):
+        try:
+            return {"job": q.retry(engine.store, job_id)}
+        except RyaError as e:
+            raise _q_err(e)
+
+    @api.get("/queue/stats")
+    def queue_stats(engine: Engine = Depends(get_engine)):
+        return q.stats(engine.store)
+
     @api.get("/tools")
     def tools(engine: Engine = Depends(get_engine)):
-        return {"tools": [{"id": t.id, "permission": t.permission.value} for t in manifest.tools]}
+        # Effective permission = manifest, unless a runtime kill switch overrides.
+        rc = engine.store.load_memory("_runtime_config")
+        overrides = rc.get("kv") or {}
+        out = []
+        for t in manifest.tools:
+            ov = overrides.get(f"tool:{t.id}")
+            out.append({
+                "id": t.id,
+                "permission": t.permission.value,
+                "effectivePermission": (ov or {}).get("permission") or t.permission.value,
+                "override": ov,
+            })
+        return {"tools": out}
+
+    @api.put("/tools/{tool_id}/permission")
+    async def set_tool_permission(tool_id: str, request: Request, engine: Engine = Depends(get_engine)):
+        """Runtime kill switch: override a tool's permission NOW, without a
+        redeploy. Versioned + append-only history (the AutoRentals
+        runtime_config pattern). Body: {"permission": "...", "reason": "..."} or
+        {"clear": true} to drop the override and fall back to the manifest."""
+        from ..manifest.schema import Permission as Perm
+        body = await request.json()
+        decl = next((t for t in manifest.tools if t.id == tool_id), None)
+        if decl is None:
+            raise HTTPException(status_code=404, detail={"code": "E_TOOL_NOT_FOUND",
+                                "message": f"Tool '{tool_id}' is not declared in the manifest."})
+        rc = engine.store.load_memory("_runtime_config")
+        kv = rc.setdefault("kv", {})
+        hist = rc.setdefault("collections", {}).setdefault("history", [])
+        prev = (kv.get(f"tool:{tool_id}") or {}).get("permission") or decl.permission.value
+        if body.get("clear"):
+            kv.pop(f"tool:{tool_id}", None)
+            new = decl.permission.value
+        else:
+            perm = body.get("permission")
+            if perm not in {p.value for p in Perm}:
+                raise HTTPException(status_code=400, detail={
+                    "code": "E_VALIDATION",
+                    "message": f"permission must be one of {sorted(p.value for p in Perm)}."})
+            new = perm
+        from ..store import now_iso
+        version = len(hist) + 1
+        ts = now_iso()
+        entry = {"version": version, "tool": tool_id, "permission": new, "previous": prev,
+                 "cleared": bool(body.get("clear")), "reason": body.get("reason"), "ts": ts}
+        if not body.get("clear"):
+            kv[f"tool:{tool_id}"] = {"permission": new, "version": version, "ts": ts}
+        hist.append(entry)
+        engine.store.save_memory("_runtime_config", rc)
+        return {"ok": True, **entry}
 
     @api.get("/models")
     def models(engine: Engine = Depends(get_engine)):

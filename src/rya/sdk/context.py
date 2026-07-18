@@ -124,11 +124,16 @@ class RuntimeContext:
         identity=None,
         agent=None,
         on_trace=None,
+        on_token=None,
     ) -> None:
         self.store = store
         # Optional live trace subscriber — fired on every trace event as it
         # happens (the WebSocket surface streams a run to the client in real time).
         self._on_trace = on_trace
+        # Optional token subscriber — fired with each streamed LLM text chunk.
+        # Tokens are NOT journaled (only the final response is), so a replay
+        # after an approval pause never re-streams.
+        self._on_token = on_token
         self.manifest = manifest
         self.run = run
         self._tools = tools
@@ -163,6 +168,7 @@ class RuntimeContext:
         self.traces = _Traces(self)
         self.secrets = _Secrets(self)
         self.events = _Events(self)
+        self.guard = _Guard(self)
 
     # ---- core journaling ----------------------------------------------
     def _step(self, kind: str, label: str, fn: Callable[[], Any], data: Optional[dict] = None) -> Any:
@@ -305,8 +311,25 @@ class RuntimeContext:
         return secret
 
     # ---- permission resolution ----------------------------------------
+    def _effective_tool_permission(self, tool_id: str) -> Optional[Permission]:
+        """Manifest permission, unless a runtime kill switch overrides it.
+
+        Overrides live in the `_runtime_config` memory scope (versioned,
+        append-only history) so an operator can disable a misbehaving tool
+        NOW, without a redeploy. See PUT /tools/{id}/permission."""
+        try:
+            rc = self.store.load_memory("_runtime_config")
+            ov = (rc.get("kv") or {}).get(f"tool:{tool_id}")
+            if ov and ov.get("permission"):
+                return Permission(ov["permission"])
+        except Exception:
+            # An unreadable runtime config fails CLOSED: safer to refuse tools
+            # than to run one an operator may have just killed.
+            return Permission.disabled
+        return self.manifest.tool_permission(tool_id)
+
     def _resolve_tool_permission(self, tool_id: str) -> Permission:
-        perm = self.manifest.tool_permission(tool_id)
+        perm = self._effective_tool_permission(tool_id)
         if perm is None:
             raise RyaError(
                 "E_TOOL_NOT_FOUND",
@@ -314,6 +337,27 @@ class RuntimeContext:
                 hint="Add it under `tools:` in rya.agent.yaml with an explicit permission.",
             )
         return perm
+
+    # ---- server-side arg pinning ----------------------------------------
+    def _resolve_pin(self, source: str):
+        """Resolve one ToolDecl.pin source to its trusted value.
+
+        Supported: "event.<path>" (dotted path into the triggering event),
+        "memory.<scope>.<key>", "identity.sub", else a literal."""
+        if source.startswith("event."):
+            node = self.run.get("event") or {}
+            for part in source.split(".")[1:]:
+                node = node.get(part) if isinstance(node, dict) else None
+            return node
+        if source.startswith("memory."):
+            parts = source.split(".", 2)
+            if len(parts) == 3:
+                _, scope, key = parts
+                return (self.store.load_memory(scope).get("kv") or {}).get(key)
+            return None
+        if source == "identity.sub":
+            return self.identity.sub if self.identity is not None else None
+        return source
 
 
 # --------------------------------------------------------------------------
@@ -323,38 +367,64 @@ class _LLM:
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
 
-    async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None) -> LLMResponse:
+    def _params(self, route: Optional[str]):
+        """Resolve (model, provider, temperature, max_tokens, label) for a call.
+        ``route`` picks a named per-purpose model from model.routes (compose vs
+        extract vs classify); unset route fields inherit from the model block."""
+        mb = self._ctx.manifest.model
+        if route is None:
+            return mb.default, mb.provider, mb.temperature, mb.max_tokens, mb.default
+        r = (mb.routes or {}).get(route)
+        if r is None:
+            raise RyaError(
+                "E_MODEL_ROUTE_NOT_FOUND",
+                f"Model route '{route}' is not declared (have: {sorted(mb.routes or {})}).",
+                hint="Add it under `model.routes:` in rya.agent.yaml.",
+            )
+        return (r.model, r.provider or mb.provider,
+                r.temperature if r.temperature is not None else mb.temperature,
+                r.max_tokens or mb.max_tokens, f"{route}:{r.model}")
+
+    async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None,
+                      route: Optional[str] = None) -> LLMResponse:
         """Call the model. Pass ``schema`` (a JSON Schema) for first-class
         **structured output** — the result's ``.json`` is the parsed, validated
-        object."""
+        object. Pass ``route`` to use a named per-purpose model from
+        ``model.routes``. When the run has a token subscriber (WebSocket turns),
+        the response is streamed chunk by chunk as it is generated."""
         from ..providers import respond as provider_respond
 
         mb = self._ctx.manifest.model
+        model, provider, temperature, max_tokens, label = self._params(route)
+        on_token = self._ctx._on_token
 
         def run():
             # Provider chosen by manifest model.provider (auto/mock/anthropic/openai).
             try:
                 return provider_respond(
-                    system=system, input=input, model_default=mb.default, provider=mb.provider,
-                    temperature=mb.temperature, max_tokens=mb.max_tokens, schema=schema,
+                    system=system, input=input, model_default=model, provider=provider,
+                    temperature=temperature, max_tokens=max_tokens, schema=schema,
+                    on_token=on_token,
                 )
             except RyaError:
-                # Fall back to the manifest's fallback model on provider failure.
-                if mb.fallback:
+                # Fall back to the manifest's fallback model on provider failure
+                # (default route only — named routes are explicit choices).
+                if route is None and mb.fallback:
                     out = provider_respond(
-                        system=system, input=input, model_default=mb.fallback, provider=mb.provider,
-                        temperature=mb.temperature, max_tokens=mb.max_tokens, schema=schema,
+                        system=system, input=input, model_default=mb.fallback, provider=provider,
+                        temperature=temperature, max_tokens=max_tokens, schema=schema,
+                        on_token=on_token,
                     )
                     out["fellBackFrom"] = mb.default
                     return out
                 raise
 
-        res = self._ctx._step("llm.respond", mb.default, run, {"system": system})
+        res = self._ctx._step("llm.respond", label, run, {"system": system})
         return LLMResponse(text=res["text"], model=res["model"], json=res.get("json"),
                            provider=res.get("provider"))
 
     async def run(self, *, input, system: str = "", tools: Optional[List[str]] = None,
-                  max_steps: int = 6) -> dict:
+                  max_steps: int = 6, route: Optional[str] = None) -> dict:
         """Governed **agent loop**: the model reasons and calls tools until it has
         an answer. Every tool call goes through ``ctx.tools.call`` — so the same
         permissions, scoped credentials, Action Guard, and audit apply to what the
@@ -365,10 +435,12 @@ class _LLM:
         """
         from ..providers import chat as provider_chat
 
-        mb = self._ctx.manifest.model
+        model, provider, temperature, max_tokens, _label = self._params(route)
         # Only non-gated tools are autonomous; the model never sees gated actions.
+        # Effective permission (manifest + runtime kill switches), so a tool an
+        # operator just disabled disappears from the loop immediately.
         allowed = {t.id for t in self._ctx.manifest.tools
-                   if self._ctx.manifest.tool_permission(t.id) in (Permission.allowed, Permission.read_only)}
+                   if self._ctx._effective_tool_permission(t.id) in (Permission.allowed, Permission.read_only)}
         want = set(tools) if tools is not None else allowed
         usable = sorted(allowed & want)
         def _tool_def(tid):
@@ -384,8 +456,8 @@ class _LLM:
         for step in range(max_steps):
             def turn(_msgs=list(messages)):
                 return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
-                                     model_default=mb.default, provider=mb.provider,
-                                     temperature=mb.temperature, max_tokens=mb.max_tokens)
+                                     model_default=model, provider=provider,
+                                     temperature=temperature, max_tokens=max_tokens)
 
             res = self._ctx._step("llm.chat", f"step {step}", turn, {"system": system})
             calls = res.get("toolCalls") or []
@@ -763,6 +835,14 @@ class _Tools:
         provider = getattr(decl, "provider", None) if decl is not None else None
         meta = {"provider": provider, "scopes": getattr(decl, "scopes", []) or []} if provider else {}
 
+        # Server-side arg pinning: pinned fields come from trusted state (event,
+        # memory, identity, literals) and OVERWRITE whatever the caller - human
+        # handler or model - supplied. Never trust the model for scoped ids.
+        pins = getattr(decl, "pin", None) or {}
+        if pins:
+            input = {**(input or {}), **{k: self._ctx._resolve_pin(v) for k, v in pins.items()}}
+            meta["pinnedArgs"] = sorted(pins)
+
         # 1) Real tool defined in the agent via @agent.tool — async leaf handler.
         handler = self._ctx._agent.tool_handler(tool_id) if self._ctx._agent else None
         if handler is not None:
@@ -791,7 +871,31 @@ class _Tools:
         def run():
             return spec.fn(input)
 
-        return self._ctx._step("tool.call", tool_id, run, {"input": input, "permission": perm.value})
+        return self._ctx._step("tool.call", tool_id, run,
+                               {"input": input, "permission": perm.value, **meta})
+
+
+class _Guard:
+    """Serving-path guardrails a handler (or the runtime) can invoke."""
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self._ctx = ctx
+
+    def _tool_outputs(self) -> list:
+        return [e.get("result") for e in self._ctx.run.get("journal", {}).values()
+                if e.get("kind") == "tool.call"]
+
+    def check_grounding(self, text: str) -> dict:
+        """Every money figure in ``text`` must be traceable to a tool output of
+        THIS run (the AutoRentals grounding-gate pattern, as a primitive).
+        Returns {ok, figures, violations}."""
+        from ..guard import grounding_check
+        return grounding_check(text, self._tool_outputs())
+
+    def _grounding_policy(self) -> dict:
+        from ..guard import load_policy, GUARD_FILE
+        policy = load_policy(str(self._ctx.project_root / GUARD_FILE)) or {}
+        return policy.get("grounding") or {}
 
 
 class _Channels:
@@ -800,6 +904,23 @@ class _Channels:
 
     async def send(self, channel: str, message: dict) -> dict:
         from ..providers.channels import send as channel_send
+
+        # Grounding gate (opt-in via rya.guard.yaml `grounding.enabled`): an
+        # outbound message may not contain money figures that no tool output of
+        # this run produced. Fail closed - a blocked send raises, and the trace
+        # records why.
+        gp = self._ctx.guard._grounding_policy()
+        if gp.get("enabled"):
+            text = " ".join(str(v) for v in (message or {}).values() if isinstance(v, (str, int, float)))
+            check = self._ctx.guard.check_grounding(text)
+            if not check["ok"]:
+                self._ctx._trace("guard.grounding_blocked", channel,
+                                 {"violations": check["violations"]})
+                raise RyaError(
+                    "E_GROUNDING_BLOCKED",
+                    f"Outbound message contains ungrounded figures {check['violations']} "
+                    "not present in any tool output of this run.",
+                    hint="Only quote amounts returned by tools, or disable grounding in rya.guard.yaml.")
 
         def run():
             # Real Slack/email/webhook when configured via env, else mock.

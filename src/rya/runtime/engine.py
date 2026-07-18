@@ -165,7 +165,7 @@ class Engine:
 
     # ---- execution -----------------------------------------------------
     def run_event(self, type: str, payload: dict, source: str = "manual", identity=None,
-                  on_trace=None) -> dict:
+                  on_trace=None, on_token=None) -> dict:
         handler = self.agent.event_handler()
         if handler is None:
             raise RyaError(
@@ -177,7 +177,8 @@ class Engine:
         run = self._new_run("event", event)
         if identity is not None:
             run["identity"] = identity.to_dict() if hasattr(identity, "to_dict") else identity
-        return self._execute(run, handler, Event.from_dict(event), identity=identity, on_trace=on_trace)
+        return self._execute(run, handler, Event.from_dict(event), identity=identity,
+                             on_trace=on_trace, on_token=on_token)
 
     def run_job(self, job_id: str) -> dict:
         job = self.store.get_job(job_id)
@@ -264,7 +265,7 @@ class Engine:
         run = self._new_run("cron", event)
         return self._execute(run, handler, Event.from_dict(event))
 
-    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None) -> dict:
+    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None) -> dict:
         ctx = RuntimeContext(
             store=self.store,
             manifest=self.manifest,
@@ -275,6 +276,7 @@ class Engine:
             identity=identity,
             agent=self.agent,
             on_trace=on_trace,
+            on_token=on_token,
         )
 
         async def invoke():
@@ -319,7 +321,7 @@ class Engine:
         self.store.save_run(run)
 
         # Export the finished run to any configured observability backend
-        # (Langfuse / webhook). Best-effort: never let export failure break a run.
+        # (Langfuse / OTLP / webhook). Best-effort: never let export break a run.
         if run["status"] in ("completed", "failed", "rejected"):
             try:
                 from ..observability.export import export_run

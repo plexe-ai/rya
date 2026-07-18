@@ -157,13 +157,115 @@ def _openai(name, system, content, temperature, max_tokens) -> dict:
             "usage": {"input": u.get("prompt_tokens"), "output": u.get("completion_tokens")} if u else None}
 
 
+# ---- token streaming --------------------------------------------------------
+def _sse_events(resp):
+    """Yield parsed JSON payloads from an SSE byte stream (``data: {...}`` lines)."""
+    for raw in resp:
+        line = raw.decode(errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            yield json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+
+def _http_stream(url: str, headers: dict, payload: dict, timeout: int = 120):
+    from ..guard import check_egress
+    check_egress(url, "POST")
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        raise RyaError("E_RUNTIME", f"LLM provider HTTP {e.code}: {body}",
+                       hint="Check the API key, model name, and quota.")
+    except urllib.error.URLError as e:
+        raise RyaError("E_RUNTIME", f"LLM request failed: {e.reason}",
+                       hint="Check network egress to the provider.")
+
+
+def _anthropic_stream(name, system, content, temperature, max_tokens, on_token) -> dict:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RyaError("E_VALIDATION", "model.provider is 'anthropic' but ANTHROPIC_API_KEY is not set.",
+                       hint="Set ANTHROPIC_API_KEY, or use model.provider: mock for offline dev.")
+    model = name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_LLM_MODEL", _DEFAULT_ANTHROPIC)
+    payload = {"model": model, "max_tokens": max_tokens or 1024, "system": system,
+               "messages": [{"role": "user", "content": content}], "stream": True}
+    if temperature is not None:
+        payload["temperature"] = temperature
+    resp = _http_stream("https://api.anthropic.com/v1/messages",
+                        {"x-api-key": key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json", "accept": "text/event-stream"}, payload)
+    parts, usage_in, usage_out = [], None, None
+    with resp:
+        for ev in _sse_events(resp):
+            t = ev.get("type")
+            if t == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
+                chunk = ev["delta"].get("text", "")
+                if chunk:
+                    parts.append(chunk)
+                    on_token(chunk)
+            elif t == "message_start":
+                usage_in = (ev.get("message", {}).get("usage") or {}).get("input_tokens")
+            elif t == "message_delta":
+                usage_out = (ev.get("usage") or {}).get("output_tokens")
+    return {"text": "".join(parts), "model": model, "provider": "anthropic",
+            "usage": {"input": usage_in, "output": usage_out} if usage_in or usage_out else None}
+
+
+def _openai_stream(name, system, content, temperature, max_tokens, on_token) -> dict:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RyaError("E_VALIDATION", "model.provider is 'openai' but OPENAI_API_KEY is not set.",
+                       hint="Set OPENAI_API_KEY, or use model.provider: mock for offline dev.")
+    model = name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_OPENAI_MODEL", _DEFAULT_OPENAI)
+    payload = {"model": model, "stream": True, "stream_options": {"include_usage": True},
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": content}]}
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    resp = _http_stream("https://api.openai.com/v1/chat/completions",
+                        {"Authorization": f"Bearer {key}", "content-type": "application/json",
+                         "accept": "text/event-stream"}, payload)
+    parts, usage = [], None
+    with resp:
+        for ev in _sse_events(resp):
+            choices = ev.get("choices") or []
+            if choices:
+                chunk = (choices[0].get("delta") or {}).get("content") or ""
+                if chunk:
+                    parts.append(chunk)
+                    on_token(chunk)
+            if ev.get("usage"):
+                usage = {"input": ev["usage"].get("prompt_tokens"),
+                         "output": ev["usage"].get("completion_tokens")}
+    return {"text": "".join(parts), "model": model, "provider": "openai", "usage": usage}
+
+
+def _mock_stream(system: str, input: dict, on_token) -> str:
+    text = _mock_text(system, input)
+    for i, word in enumerate(text.split(" ")):
+        on_token(word if i == 0 else " " + word)
+    return text
+
+
 def respond(*, system: str, input: dict, model_default: str = "mock-llm", provider: str = "auto",
             temperature: Optional[float] = None, max_tokens: Optional[int] = None,
-            schema: Optional[dict] = None) -> dict:
+            schema: Optional[dict] = None, on_token=None) -> dict:
     """Return ``{text, model, provider, usage[, json]}``. Mock path never raises.
 
     When ``schema`` (a JSON Schema) is given, the model is asked for JSON and the
-    result is parsed + validated into ``json`` — first-class structured output."""
+    result is parsed + validated into ``json`` — first-class structured output.
+    When ``on_token`` is given, the response is generated via the provider's
+    streaming API and each text chunk is delivered to the callback as it
+    arrives; the returned dict is identical to the non-streaming shape."""
     effective = resolve_provider(provider)
     sys = system
     if schema is not None and effective != "mock":
@@ -171,11 +273,17 @@ def respond(*, system: str, input: dict, model_default: str = "mock-llm", provid
                "(no prose, no code fences):\n" + json.dumps(schema))
     content = _stringify(input)
     if effective == "anthropic":
-        out = _anthropic(model_default, sys, content, temperature, max_tokens or (1024 if schema else None))
+        out = (_anthropic_stream(model_default, sys, content, temperature,
+                                 max_tokens or (1024 if schema else None), on_token)
+               if on_token else
+               _anthropic(model_default, sys, content, temperature, max_tokens or (1024 if schema else None)))
     elif effective == "openai":
-        out = _openai(model_default, sys, content, temperature, max_tokens)
+        out = (_openai_stream(model_default, sys, content, temperature, max_tokens, on_token)
+               if on_token else
+               _openai(model_default, sys, content, temperature, max_tokens))
     else:
-        out = {"text": _mock_text(system, input), "model": model_default, "provider": "mock", "usage": None}
+        text = _mock_stream(system, input, on_token) if on_token else _mock_text(system, input)
+        out = {"text": text, "model": model_default, "provider": "mock", "usage": None}
         if schema is not None:
             out["json"] = _mock_structured(schema)
         return out

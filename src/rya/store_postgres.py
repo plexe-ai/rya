@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS rya_jobs (
     run_at TEXT,
     data JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rya_queue (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    type TEXT,
+    status TEXT,
+    run_at TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    concurrency_key TEXT,
+    lease_expires_at TEXT,
+    data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_queue_claim ON rya_queue (workspace_id, status, run_at);
 CREATE TABLE IF NOT EXISTS rya_memory (
     workspace_id TEXT NOT NULL DEFAULT 'default',
     scope TEXT NOT NULL,
@@ -255,6 +267,111 @@ class PostgresStore:
             )
             row = cur.fetchone()
             return row[0] if row else None
+
+    # ---- queue: durable jobs for EXTERNAL workers ------------------------
+    # Same duck-typed surface as FileStore. Claiming is truly atomic here:
+    # FOR UPDATE SKIP LOCKED means N concurrent workers never grab the same job.
+    def queue_save(self, job: dict) -> None:
+        job["updatedAt"] = now_iso()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_queue
+                       (id, workspace_id, type, status, run_at, priority, concurrency_key,
+                        lease_expires_at, data)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET type=EXCLUDED.type, status=EXCLUDED.status,
+                       run_at=EXCLUDED.run_at, priority=EXCLUDED.priority,
+                       concurrency_key=EXCLUDED.concurrency_key,
+                       lease_expires_at=EXCLUDED.lease_expires_at, data=EXCLUDED.data
+                   WHERE rya_queue.workspace_id = EXCLUDED.workspace_id""",
+                (job["id"], self._ws, job.get("type"), job.get("status"), job.get("runAt"),
+                 int(job.get("priority") or 0), job.get("concurrencyKey"),
+                 job.get("leaseExpiresAt"), Json(job)),
+            )
+
+    def queue_get(self, job_id: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_queue WHERE id=%s AND workspace_id=%s",
+                        (job_id, self._ws))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def queue_list(self, status: Optional[str] = None, type: Optional[str] = None) -> List[dict]:
+        q = "SELECT data FROM rya_queue WHERE workspace_id=%s"
+        args: list = [self._ws]
+        if status is not None:
+            q += " AND status=%s"
+            args.append(status)
+        if type is not None:
+            q += " AND type=%s"
+            args.append(type)
+        q += " ORDER BY priority DESC, run_at ASC, (data->>'seq') ASC"
+        with self._conn.cursor() as cur:
+            cur.execute(q, tuple(args))
+            return [r[0] for r in cur.fetchall()]
+
+    def queue_reap(self, now: str) -> None:
+        """Expired-lease running jobs: retryable ones go back to pending, exhausted
+        ones dead-letter. Two conditional UPDATEs, each atomic."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """UPDATE rya_queue SET status='pending', run_at=%s, lease_expires_at=NULL,
+                       data = data || jsonb_build_object(
+                           'status','pending','workerId',NULL,'leaseExpiresAt',NULL,
+                           'runAt',%s::text,'lastError','lease expired')
+                   WHERE workspace_id=%s AND status='running' AND lease_expires_at <= %s
+                     AND COALESCE((data->>'attempts')::int, 0)
+                         < COALESCE((data->>'maxAttempts')::int, 1)""",
+                (now, now, self._ws, now),
+            )
+            cur.execute(
+                """UPDATE rya_queue SET status='failed', lease_expires_at=NULL,
+                       data = data || jsonb_build_object(
+                           'status','failed','workerId',NULL,'leaseExpiresAt',NULL,
+                           'deadLetter',true,'completedAt',%s::text,
+                           'error', COALESCE(data->>'error','lease expired'))
+                   WHERE workspace_id=%s AND status='running' AND lease_expires_at <= %s
+                     AND COALESCE((data->>'attempts')::int, 0)
+                         >= COALESCE((data->>'maxAttempts')::int, 1)""",
+                (now, self._ws, now),
+            )
+
+    def queue_claim_one(self, worker_id: str, now: str, lease_expires_at: str,
+                        types: Optional[List[str]] = None) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """WITH running AS (
+                       SELECT concurrency_key AS k, count(*) AS n FROM rya_queue
+                       WHERE workspace_id=%s AND status='running' AND concurrency_key IS NOT NULL
+                       GROUP BY concurrency_key),
+                   cand AS (
+                       SELECT q.id FROM rya_queue q
+                       LEFT JOIN running r ON r.k = q.concurrency_key
+                       WHERE q.workspace_id=%s AND q.status='pending' AND q.run_at <= %s
+                         AND (%s::text[] IS NULL OR q.type = ANY(%s::text[]))
+                         AND (q.concurrency_key IS NULL OR COALESCE(r.n, 0) <
+                              COALESCE(NULLIF((q.data->>'concurrencyLimit')::int, 0), 2147483647))
+                       ORDER BY q.priority DESC, q.run_at ASC, (q.data->>'seq') ASC
+                       FOR UPDATE OF q SKIP LOCKED LIMIT 1)
+                   UPDATE rya_queue q SET status='running', lease_expires_at=%s,
+                       data = q.data || jsonb_build_object(
+                           'status','running','workerId',%s::text,'leaseExpiresAt',%s::text,
+                           'attempts', COALESCE((q.data->>'attempts')::int, 0) + 1,
+                           'startedAt', COALESCE(q.data->>'startedAt', %s::text),
+                           'updatedAt', %s::text)
+                   FROM cand WHERE q.id = cand.id
+                   RETURNING q.data""",
+                (self._ws, self._ws, now, types, types, lease_expires_at, worker_id,
+                 lease_expires_at, now, now),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def queue_counts(self) -> dict:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT status, count(*) FROM rya_queue WHERE workspace_id=%s GROUP BY status",
+                        (self._ws,))
+            return {r[0]: r[1] for r in cur.fetchall()}
 
     # ---- memory --------------------------------------------------------
     def load_memory(self, scope: str) -> Dict[str, Any]:

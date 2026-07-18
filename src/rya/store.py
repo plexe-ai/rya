@@ -11,6 +11,7 @@ Layout::
       runs/<run_id>.json
       approvals/<approval_id>.json
       jobs/<job_id>.json
+      queue/<job_id>.json
       memory/<scope>.json
 """
 
@@ -65,13 +66,14 @@ class FileStore:
         self.runs_dir = self.dir / "runs"
         self.approvals_dir = self.dir / "approvals"
         self.jobs_dir = self.dir / "jobs"
+        self.queue_dir = self.dir / "queue"
         self.memory_dir = self.dir / "memory"
         self.sessions_dir = self.dir / "sessions"
         self.connections_dir = self.dir / "connections"
 
     def ensure(self) -> None:
-        for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.memory_dir,
-                  self.sessions_dir, self.connections_dir):
+        for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.queue_dir,
+                  self.memory_dir, self.sessions_dir, self.connections_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # ---- low level -----------------------------------------------------
@@ -180,6 +182,82 @@ class FileStore:
                 self.save_job(job)
                 return job
         return None
+
+    # ---- queue: durable jobs for EXTERNAL workers ------------------------
+    # Unlike `jobs` (handler-bound, executed by `rya worker` in-process), queue
+    # jobs are claimed and executed by external workers in any language over the
+    # HTTP API. Lifecycle lives in rya.queue; the store owns atomic claiming.
+    def queue_save(self, job: dict) -> None:
+        job["updatedAt"] = now_iso()
+        self._write(self.queue_dir / f"{job['id']}.json", job)
+
+    def queue_get(self, job_id: str) -> Optional[dict]:
+        return self._read(self.queue_dir / f"{job_id}.json")
+
+    def queue_list(self, status: Optional[str] = None, type: Optional[str] = None) -> List[dict]:
+        out = []
+        for p in self.queue_dir.glob("*.json"):
+            data = self._read(p)
+            if data and (status is None or data.get("status") == status) \
+                    and (type is None or data.get("type") == type):
+                out.append(data)
+        out.sort(key=lambda j: (-int(j.get("priority") or 0), j.get("runAt") or "",
+                                int(j.get("seq") or 0)))
+        return out
+
+    def queue_reap(self, now: str) -> None:
+        """Return expired-lease running jobs to the queue, or dead-letter them if
+        their attempts are already exhausted."""
+        for job in self.queue_list("running"):
+            if (job.get("leaseExpiresAt") or "9999") <= now:
+                job["workerId"] = None
+                job["leaseExpiresAt"] = None
+                if int(job.get("attempts") or 0) >= int(job.get("maxAttempts") or 1):
+                    job["status"] = "failed"
+                    job["deadLetter"] = True
+                    job["error"] = job.get("error") or "lease expired"
+                    job["completedAt"] = now
+                else:
+                    job["status"] = "pending"
+                    job["lastError"] = "lease expired"
+                    job["runAt"] = now
+                self.queue_save(job)
+
+    def queue_claim_one(self, worker_id: str, now: str, lease_expires_at: str,
+                        types: Optional[List[str]] = None) -> Optional[dict]:
+        """Claim one due job (best-effort atomicity; the file store is for local
+        single-process dev). Respects per-concurrencyKey running caps."""
+        running = {}
+        for j in self.queue_list("running"):
+            k = j.get("concurrencyKey")
+            if k:
+                running[k] = running.get(k, 0) + 1
+        for job in self.queue_list("pending"):
+            if types and job.get("type") not in types:
+                continue
+            if (job.get("runAt") or "") > now:
+                continue
+            key = job.get("concurrencyKey")
+            if key:
+                limit = int(job.get("concurrencyLimit") or 0) or None
+                if limit is not None and running.get(key, 0) >= limit:
+                    continue
+            job["status"] = "running"
+            job["workerId"] = worker_id
+            job["leaseExpiresAt"] = lease_expires_at
+            job["attempts"] = int(job.get("attempts") or 0) + 1
+            job["startedAt"] = job.get("startedAt") or now
+            self.queue_save(job)
+            return job
+        return None
+
+    def queue_counts(self) -> dict:
+        counts: Dict[str, int] = {}
+        for p in self.queue_dir.glob("*.json"):
+            data = self._read(p)
+            if data:
+                counts[data.get("status", "?")] = counts.get(data.get("status", "?"), 0) + 1
+        return counts
 
     # ---- memory --------------------------------------------------------
     def _memory_path(self, scope: str) -> Path:

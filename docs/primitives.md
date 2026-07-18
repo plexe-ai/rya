@@ -89,3 +89,99 @@ durable journal.
 
 `agent` (default) · `user` · `customer` · `workspace` · `environment`. Pass
 `scope=` to any memory call.
+
+## Model routes
+
+`model.routes` names per-purpose models (compose vs extract vs classify), so
+sidecar LLM calls stop being hand-rolled clients:
+
+```yaml
+model:
+  default: claude-opus-4-8
+  routes:
+    extract:  {model: claude-haiku-4-5, max_tokens: 512}
+    classify: {model: claude-haiku-4-5, temperature: 0}
+```
+
+`ctx.llm.respond(..., route="extract")` (and `ctx.llm.run(..., route=...)`).
+Unset route fields inherit from the model block; traces label calls
+`route:model` so cost per purpose is visible.
+
+## Server-side arg pinning
+
+Never trust the model (or handler input) for scoped identifiers. A tool decl
+may pin arguments to trusted sources, resolved by the runtime at call time and
+overwriting whatever the caller supplied:
+
+```yaml
+tools:
+  - id: crm.lookup
+    permission: allowed
+    pin:
+      email: event.payload.email    # from the triggering event
+      region: ap-south-1            # literal
+      owner: identity.sub           # verified caller
+      account: memory.agent.account # from scoped memory
+```
+
+Pinned fields are recorded in the trace (`pinnedArgs`).
+
+## Runtime kill switches
+
+`PUT /tools/{id}/permission {"permission": "disabled", "reason": ...}` overrides
+a tool's permission NOW, without a redeploy - versioned, append-only history,
+reflected in `GET /tools` as `effectivePermission`, enforced on the next call
+and removed from the `ctx.llm.run` loop immediately. `{"clear": true}` reverts
+to the manifest. Unreadable runtime config fails closed.
+
+## Token streaming
+
+Two transports, same frames:
+
+- **SSE (default for clients)**: `POST /agents/{id}/events/stream` triggers a
+  run and streams it as Server-Sent Events - `token` (LLM chunks), `trace`
+  (journaled steps), `message` (session replies for chat agents), and ALWAYS a
+  terminal `run` (or `error`) frame, so clients never guess whether more is
+  coming. Plain HTTP: works through ALBs, proxies, and `fetch`. The TS client
+  wraps it as `for await (const frame of rya.streamEvent(payload))`.
+- **WebSocket** (`/ws`): the bidirectional surface for the console and
+  long-lived chat sessions; emits the same `token` frames.
+
+Provider streaming is Anthropic/OpenAI SSE (chunked mock offline). Tokens are
+not journaled - only the final response is - so a replay after an approval
+pause never re-streams.
+
+## Grounding gate
+
+`ctx.guard.check_grounding(text)` verifies every money figure in `text` exists
+in a tool output of THIS run. With `grounding: {enabled: true}` in
+`rya.guard.yaml`, `ctx.channels.send` enforces it: an outbound message quoting
+an amount no tool returned is blocked (`E_GROUNDING_BLOCKED`) and traced.
+
+## Queue: durable jobs for external workers
+
+The `jobs` primitive is handler-bound (Python, executed by `rya worker`). The
+**queue** primitive is its polyglot complement: any backend in any language
+enqueues jobs over HTTP and runs its own workers against them - Rya owns
+durability, retries with exponential backoff, dead-lettering, idempotent
+enqueue, per-key concurrency caps, leases, and cancellation signalling.
+Designed against a real consumer: Sim's `JobQueueBackend` maps 1:1 onto it.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /queue/jobs` | Enqueue: `type`, `payload`, `jobId` (idempotency key), `maxAttempts`, `delaySeconds`, `priority`, `tags`, `metadata`, `concurrencyKey` + `concurrencyLimit`, `retryDelaySeconds` |
+| `POST /queue/jobs/batch` | Enqueue many; dispatch preserves input order |
+| `POST /queue/claim` | Worker claims due jobs: `workerId`, `types`, `limit`, `leaseSeconds`, `waitSeconds` (short long-poll) |
+| `POST /queue/jobs/{id}/heartbeat` | Extend the lease; response carries `cancelRequested` |
+| `POST /queue/jobs/{id}/complete` | Report success with `output` |
+| `POST /queue/jobs/{id}/fail` | Failed attempt: retries with backoff until `maxAttempts`, then dead-letters |
+| `POST /queue/jobs/{id}/cancel` | Pending: cancels now. Running: graceful via heartbeat flag, or `force: true` |
+| `POST /queue/jobs/{id}/retry` | Requeue a dead-lettered/cancelled job with a fresh attempt budget |
+| `GET /queue/jobs/{id}`, `GET /queue/jobs`, `GET /queue/stats` | Inspect |
+
+Lifecycle: `pending -> running -> completed | failed (deadLetter) | cancelled`,
+with expired leases automatically reclaimed (or dead-lettered when attempts are
+exhausted). On Postgres, claims use `FOR UPDATE SKIP LOCKED`, so N concurrent
+workers never double-claim; every transition verifies the reporting worker still
+holds the job, so a zombie worker whose lease was reclaimed gets a 409 instead
+of clobbering another worker's run.

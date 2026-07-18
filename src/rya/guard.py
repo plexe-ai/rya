@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -179,3 +180,51 @@ def _example_url(rule: dict) -> str:
         return pat
     url = pat.replace("*", "x")
     return url + ("probe" if url.endswith("/") else "/probe")
+
+
+# ---- grounding gate ---------------------------------------------------------
+# Serving-path check (pattern proven in the AutoRentals concierge): every money
+# figure in an outbound reply must be traceable to a tool output of the same
+# run, so the model can never invent a price. Opt in via `grounding.enabled`
+# in rya.guard.yaml; also callable directly as ctx.guard.check_grounding(text).
+
+# $1,234.56 / USD 999 / 199 USD / EUR-style symbols. Deliberately currency-only:
+# plain numbers (dates, counts) would drown the check in false positives.
+_MONEY_RE = re.compile(
+    r"(?:[$€£₹]\s?\d[\d,]*(?:\.\d+)?)|(?:\b(?:USD|EUR|GBP|INR|AED)\s?\d[\d,]*(?:\.\d+)?)"
+    r"|(?:\b\d[\d,]*(?:\.\d+)?\s?(?:USD|EUR|GBP|INR|AED)\b)",
+    re.IGNORECASE,
+)
+_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _money_values(text: str) -> list:
+    """Numeric values of every money figure in ``text`` (normalized floats)."""
+    out = []
+    for m in _MONEY_RE.findall(text or ""):
+        n = _NUM_RE.search(m)
+        if n:
+            out.append(float(n.group().replace(",", "")))
+    return out
+
+
+def _all_numbers(obj) -> set:
+    """Every numeric value reachable in a tool output (JSON-serialized scan)."""
+    import json as _json
+    blob = _json.dumps(obj, default=str)
+    return {float(n.replace(",", "")) for n in _NUM_RE.findall(blob)}
+
+
+def grounding_check(text: str, tool_outputs: list) -> dict:
+    """Check that every money figure in ``text`` appears in ``tool_outputs``.
+
+    Returns ``{ok, figures, violations}`` where figures are the money values
+    found in the text and violations the subset with no grounding."""
+    figures = _money_values(text)
+    if not figures:
+        return {"ok": True, "figures": [], "violations": []}
+    grounded: set = set()
+    for out in tool_outputs or []:
+        grounded |= _all_numbers(out)
+    violations = [f for f in figures if f not in grounded]
+    return {"ok": not violations, "figures": figures, "violations": violations}

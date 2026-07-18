@@ -20,6 +20,16 @@ class Permission(str, Enum):
     disabled = "disabled"
 
 
+class ModelRoute(BaseModel):
+    """A named per-purpose model choice (e.g. a cheap extractor next to the main
+    composer). Handlers pick one with ``ctx.llm.respond(..., route="extract")``;
+    unset fields inherit from the parent ModelBlock."""
+    model: str
+    provider: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
 class ModelBlock(BaseModel):
     # provider drives ctx.llm. "auto" (default) = real if an API key is present,
     # else mock — keeps zero-config local dev working. "mock" forces the offline
@@ -29,6 +39,9 @@ class ModelBlock(BaseModel):
     fallback: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    # Named routes for per-purpose model selection: compose vs extract vs
+    # classify each get the right model without hand-rolling sidecar clients.
+    routes: dict[str, ModelRoute] = Field(default_factory=dict)
 
     @field_validator("provider")
     @classmethod
@@ -62,6 +75,14 @@ class ToolDecl(BaseModel):
     # into the call — the handler/model never sees the secret.
     provider: Optional[str] = None
     scopes: List[str] = Field(default_factory=list)
+    # Server-side arg pinning: never trust the model (or handler input) for these
+    # arguments. Each entry maps an input field to a trusted source, resolved by
+    # the runtime at call time and overwriting whatever the caller supplied:
+    #   "event.<path>"          - dotted path into the triggering event payload
+    #   "memory.<scope>.<key>"  - a value from scoped memory
+    #   "identity.sub"          - the verified caller identity
+    #   anything else           - a literal value
+    pin: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelDecl(BaseModel):

@@ -1,5 +1,9 @@
 """The eval harness — declarative behavioural checks scored against real runs."""
 
+import os
+
+import pytest
+
 from rya.cli import scaffold
 from rya.evals import load_evals, run_evals
 from rya.manifest import load_manifest
@@ -56,3 +60,39 @@ def test_no_evals_file_is_empty(tmp_path):
     (tmp_path / "rya.evals.yaml").unlink()  # remove after scaffolding
     rep = run_evals(manifest, agent, store, tmp_path)
     assert rep["hasEvals"] is False and rep["total"] == 0 and rep["ok"] is True
+
+
+def test_deepeval_scorer_registered_and_skips_when_absent():
+    """The deepeval scorer is wired in; with deepeval not installed it SKIPS
+    (counts as pass) so evals stay runnable, and a bad metric name is rejected."""
+    import importlib.util
+    from rya.evals import SCORERS, _score_deepeval
+
+    assert "deepeval" in SCORERS
+    run = {"id": "r", "trigger": {"payload": {}},
+           "trace": [{"kind": "llm.respond", "label": "m",
+                      "data": {"result": {"text": "the capital is Paris"}}}]}
+    if importlib.util.find_spec("deepeval") is None:
+        ok, detail = _score_deepeval({"metric": "faithfulness", "threshold": 0.7}, run, {})
+        assert ok is True and "not installed" in detail
+    # unknown metric is a hard fail regardless of install state
+    ok, detail = _score_deepeval({"metric": "nope"}, run, {})
+    assert ok is False and "unknown deepeval metric" in detail
+
+
+@pytest.mark.skipif(not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")),
+                    reason="set ANTHROPIC_API_KEY or OPENAI_API_KEY to run the live DeepEval metric")
+def test_deepeval_faithfulness_discriminates_live():
+    """With a real provider key, the DeepEval scorer computes a genuine metric
+    and tells a faithful answer apart from a hallucinated one."""
+    from rya.evals import _score_deepeval
+    ctx = ["France is a country in Europe. Its capital is Paris."]
+
+    def run_with(ans):
+        return {"trigger": {"payload": {}},
+                "trace": [{"kind": "llm.respond", "label": "m", "data": {"result": {"text": ans}}}]}
+
+    spec = {"metric": "faithfulness", "threshold": 0.7, "context": ctx, "input": "Capital of France?"}
+    ok_good, _ = _score_deepeval(spec, run_with("The capital of France is Paris."), {})
+    ok_bad, _ = _score_deepeval(spec, run_with("The capital of France is Berlin."), {})
+    assert ok_good and not ok_bad

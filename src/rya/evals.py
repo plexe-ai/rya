@@ -121,6 +121,87 @@ def _score_judge(expected, run, env):
         return True, f"judge unavailable ({e})"
 
 
+# DeepEval handles LLM-output-quality metrics (faithfulness, relevancy,
+# hallucination, RAG precision/recall) — a deep, specialized domain Rya delegates
+# rather than reimplements. Behavioural/governance scoring stays native above.
+_DEEPEVAL_METRICS = {
+    "answer_relevancy": "AnswerRelevancyMetric",
+    "relevancy": "AnswerRelevancyMetric",
+    "faithfulness": "FaithfulnessMetric",
+    "hallucination": "HallucinationMetric",
+    "bias": "BiasMetric",
+    "toxicity": "ToxicityMetric",
+    "contextual_relevancy": "ContextualRelevancyMetric",
+    "contextual_precision": "ContextualPrecisionMetric",
+    "contextual_recall": "ContextualRecallMetric",
+}
+
+
+def _last_output_text(run: dict) -> str:
+    outputs = [e.get("data", {}).get("result") for e in run.get("trace", [])
+               if e.get("kind") in ("llm.respond", "model.call")]
+    return next((o.get("text") if isinstance(o, dict) else str(o) for o in reversed(outputs) if o), "")
+
+
+def _deepeval_judge(spec, env):
+    """Pick the LLM that scores the metric. Honor an explicit override, else use
+    whichever provider key is present (so it 'just works' with an Anthropic key,
+    not only OpenAI). Return None → DeepEval's own default (OpenAI GPT)."""
+    import os
+    want = spec.get("model") or env.get("RYA_DEEPEVAL_MODEL") or os.environ.get("RYA_DEEPEVAL_MODEL")
+    has_anthropic = env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    has_openai = env.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    try:
+        from deepeval.models import AnthropicModel, GPTModel
+        if want:
+            return AnthropicModel(model=want) if str(want).lower().startswith("claude") else GPTModel(model=want)
+        if has_anthropic and not has_openai:
+            return AnthropicModel(model="claude-haiku-4-5")  # override via RYA_DEEPEVAL_MODEL
+    except Exception:
+        return None
+    return None
+
+
+def _score_deepeval(expected, run, env):
+    """Score the run's final output with a DeepEval metric (faithfulness, answer
+    relevancy, hallucination, …). Spec: ``{metric, threshold, context?, input?,
+    model?}`` or just a metric name string. Optional dep — ``pip install
+    'rya[deepeval]'`` plus a provider key (OpenAI or Anthropic) for the metric's
+    own judge. SKIPPED (counts as pass) when deepeval isn't installed or can't run
+    offline, so evals stay runnable."""
+    spec = {"metric": expected} if isinstance(expected, str) else dict(expected or {})
+    name = (spec.get("metric") or "answer_relevancy").lower()
+    threshold = float(spec.get("threshold", 0.5))
+    cls = _DEEPEVAL_METRICS.get(name)
+    if cls is None:
+        return False, f"unknown deepeval metric '{name}' (have {sorted(_DEEPEVAL_METRICS)})"
+    try:
+        from deepeval import metrics as M
+        from deepeval.test_case import LLMTestCase
+    except Exception:
+        return True, "deepeval not installed — `pip install 'rya[deepeval]'` to enable"
+    actual = _last_output_text(run)
+    ctx = spec.get("context")
+    if ctx is None:
+        ctx = [str(e.get("data", {}).get("result")) for e in run.get("trace", [])
+               if e.get("kind") == "tool.call"] or None
+    inp = spec.get("input") or json.dumps((run.get("trigger") or {}).get("payload", {}), default=str)
+    try:
+        kwargs = {"input": inp, "actual_output": actual}
+        if ctx:
+            kwargs["retrieval_context"] = ctx
+            kwargs["context"] = ctx
+        tc = LLMTestCase(**kwargs)
+        judge = _deepeval_judge(spec, env)
+        metric = getattr(M, cls)(threshold=threshold, **({"model": judge} if judge else {}))
+        metric.measure(tc)
+        score = getattr(metric, "score", None)
+        ok = getattr(metric, "is_successful", lambda: (score or 0) >= threshold)()
+        return bool(ok), f"{name} score={score} (threshold {threshold})"
+    except Exception as e:  # missing model key / network — skip, never break the harness
+        return True, f"deepeval '{name}' skipped ({type(e).__name__}: {e})"
+
+
 SCORERS = {
     "status": _score_status,
     "tools_called": _score_tools_called,
@@ -133,6 +214,7 @@ SCORERS = {
     "trace_has": _score_trace_has,
     "trace_lacks": _score_trace_lacks,
     "judge": _score_judge,
+    "deepeval": _score_deepeval,
 }
 
 

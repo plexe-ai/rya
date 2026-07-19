@@ -18,21 +18,32 @@ conversation sessions, authentication, guardrails, the real-time **WebSocket**
 channel, background jobs with retry + dead-letter, horizontal scale, and
 observability.
 
-What's real today: durable runs on **Postgres** (survive restarts), **per-user
-row-level-security** multi-tenancy, real **Anthropic/OpenAI** + channel seams, a
-signed-webhook HTTP server **and a real-time WebSocket** with token/JWT auth, a
-built-in **web console**, an **Action Guard** egress firewall, conversation
-**sessions**, **remote MCP** over HTTP, self-serve project provisioning, a
-first-class **LLM layer** (real models, structured output, a governed agent
-loop), real general-purpose **built-in tools** (`web.fetch`, `http.request`), and
-a **production-readiness gate**. What's still mocked: the default *domain* tool +
-model stubs (`crm.lookup`, `churn-risk-v1` — deterministic for reproducibility;
-the real seams and real built-ins are live). What's not built yet: a *managed*
-hosting platform — the hosted
-instance *is* `rya serve` (deploy it via `docker compose` / `rya deploy`
-artifacts); there's no one-click cloud yet.
+What's real today: durable runs on **Postgres** (survive restarts) with
+pause/resume by journal replay; **durable chat turns** (leased, crash-reclaimed,
+resumable token streams with post-approval continuation) and a **durable
+external-worker queue** (any language, retries, dead-letter, concurrency caps);
+**per-user row-level-security** multi-tenancy with **workspaces, invites, and
+API-key management**; real **Anthropic/OpenAI** + channel seams with **token
+streaming** (SSE + WebSocket) and **per-purpose model routes**; a first-class
+**LLM layer** (structured output + a governed agent loop with tool `input_schema`);
+governance enforced by the runtime - **permission tiers, server-side arg pinning,
+runtime kill switches, an Action Guard egress firewall, and a grounding gate**;
+first-class **UI frames** on the turn stream (`ctx.emit_ui`); scoped **encrypted
+credentials**; conversation **sessions** and two-tier **memory**; a built-in
+**web console**; **remote MCP** over HTTP; **run ingest** for external agent
+loops; observability export to **Langfuse / OTLP**; and a
+**production-readiness gate** + declarative **evals**. Real general-purpose
+**built-in tools** (`web.fetch`, `http.request`) ship so agents do real work.
 
-**For the full picture, read [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md).**
+What's honest about maturity: the default scaffold is **mock-free** (real seams
+only); the `demo` template carries deterministic domain mocks for the tutorial.
+The **managed** hosting platform is not built - the hosted instance *is*
+`rya serve` (deploy via the AWS IaC in [`deploy/`](deploy/AGENTS.md) or
+`docker compose`); there's no one-click cloud yet. The durable-execution
+primitives are young: correct and tested, but not yet load-tested at high volume.
+
+**For the full picture, read [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md). For the code
+layout, see the [repository map](#repository-map) and the per-module `AGENTS.md`.**
 
 ## Install
 
@@ -212,6 +223,45 @@ out of the box: `web.fetch` (GET a URL → readable text) and `http.request`
 process. Declare them in the manifest like any tool; everything else an agent
 integrates with is HTTP on top of these. See
 [src/rya/tools/builtins.py](src/rya/tools/builtins.py).
+
+## Durable execution: chat turns + the external-worker queue
+
+A run is durable through the journal; two primitives extend that to whole chat
+turns and to background work in any language.
+
+**Durable chat turns.** A chat turn is a leased job with a resumable stream
+buffer, so an interrupted turn is *retried, not dropped*, and a dropped
+connection *resumes from its last frame*:
+
+```bash
+POST /agents/_/turns              # start a durable turn -> {turnId}
+GET  /agents/_/turns/{id}/stream  # SSE: token / trace / message / ui / run frames,
+                                  # resumable via Last-Event-ID
+```
+
+An approval mid-turn is a *pause*, not the end: approving streams the
+post-approval continuation onto the same buffer, ending with the real terminal
+frame. `rya serve` runs a background sweeper that reclaims any crashed turn, so
+worst case a turn finishes one sweep interval late. TS: `streamTurn(id, -1,
+{untilFinal: true})` tails straight through the pause. See
+[src/rya/turns.py](src/rya/turns.py).
+
+**External-worker queue.** Rya owns durability, retries with backoff,
+dead-lettering, idempotent enqueue, per-key concurrency caps, and cancellation;
+*your* workers (Python or TypeScript, via `createQueueWorker`) execute the jobs.
+This is how a polyglot backend uses Rya as its durable job queue without adopting
+Python:
+
+```bash
+POST /queue/jobs                  # enqueue (jobId = idempotency key)
+POST /queue/claim                 # a worker claims due jobs with a lease
+POST /queue/jobs/{id}/{heartbeat,complete,fail,cancel,retry}
+```
+
+Claims use `FOR UPDATE SKIP LOCKED`, so N workers never double-claim; every
+transition verifies the reporting worker still holds the lease. See
+[src/rya/queue.py](src/rya/queue.py) and
+[clients/typescript/](clients/typescript/AGENTS.md).
 
 ## Memory (core blocks + consolidated long-term recall)
 
@@ -406,3 +456,47 @@ no separate cloud build; the hosted instance *is* `rya serve`.
 
 See [docs/primitives.md](docs/primitives.md), [docs/devex.md](docs/devex.md), and
 [docs/mcp.md](docs/mcp.md).
+
+## Repository map
+
+Every module has an `AGENTS.md` describing what it does, its key files, and its
+gotchas - written so a coding agent can orient without reading the source. Start
+at [`src/rya/AGENTS.md`](src/rya/AGENTS.md) for the package overview and the
+single-file module index.
+
+| Path | What it is |
+| --- | --- |
+| [`src/rya/`](src/rya/AGENTS.md) | The runtime package: overview + `store.py`, `tenancy.py`, `queue.py`, `turns.py`, `guard.py`, `evals.py`, `readiness.py`, `snapshot.py`, ... |
+| [`src/rya/sdk/`](src/rya/sdk/AGENTS.md) | `define_agent()` and the `ctx` runtime surface - the heart of Rya |
+| [`src/rya/runtime/`](src/rya/runtime/AGENTS.md) | The engine: load, execute, pause/resume, retries, cron |
+| [`src/rya/providers/`](src/rya/providers/AGENTS.md) | Real seams: LLM (Anthropic/OpenAI/mock), channels, embeddings |
+| [`src/rya/manifest/`](src/rya/manifest/AGENTS.md) | `rya.agent.yaml` schema + loader |
+| [`src/rya/tools/`](src/rya/tools/AGENTS.md) | Permissioned tool registry + real built-ins |
+| [`src/rya/models/`](src/rya/models/AGENTS.md) | Custom-model registry |
+| [`src/rya/approvals/`](src/rya/approvals/AGENTS.md) | The pause/resume signal |
+| [`src/rya/api/`](src/rya/api/AGENTS.md) | FastAPI control plane: REST, webhook, WebSocket, SSE, console, MCP |
+| [`src/rya/observability/`](src/rya/observability/AGENTS.md) | Logs, token/cost usage, run export |
+| [`src/rya/mcp/`](src/rya/mcp/AGENTS.md) | MCP server + testable ops |
+| [`src/rya/cli/`](src/rya/cli/AGENTS.md) | The `rya` CLI + scaffolding + deploy templates |
+| [`src/rya/console/`](src/rya/console/AGENTS.md) | The built-in web console (single-file SPA) |
+| [`src/rya/skills/`](src/rya/skills/AGENTS.md) | Bundled coding-agent skills |
+| [`clients/typescript/`](clients/typescript/AGENTS.md) | `@plexe/rya` typed TS client + queue worker |
+| [`deploy/`](deploy/AGENTS.md) | AWS IaC (single-tenant Fargate/RDS/Cognito) + deploy recipe |
+| [`examples/`](examples/AGENTS.md) | Runnable reference agents |
+| `tests/` | pytest suite (file + Postgres); run with `pytest -q`, set `RYA_TEST_DATABASE_URL` for the Postgres path |
+
+## Contributing / working in this repo
+
+- **Read the module's `AGENTS.md` first.** It names the load-bearing mechanics
+  (journaling, permission resolution, the store surface) you must not break.
+- **Tests**: `pip install -e '.[api,mcp,postgres,llm,dev]'` then `pytest -q`.
+  Postgres-gated tests need `RYA_TEST_DATABASE_URL` (a throwaway
+  `postgres:16` container works).
+- **Durability rule**: any new side-effecting `ctx.*` operation must route
+  through `RuntimeContext._step`/`_astep` so replay-after-approval memoizes it.
+- **Store parity**: `FileStore` and `PostgresStore` keep an identical method
+  surface. Add a method to both.
+- **Errors** carry a stable `E_*` code from `errors.py`; **UI** follows the
+  standing design system (no emojis, no em dashes, `" - "` instead).
+- Real providers enforce the tool-use protocol the mock does not - integration-
+  test multi-tool loops against a real key.

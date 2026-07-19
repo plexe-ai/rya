@@ -226,6 +226,7 @@
       <button data-v="evals"><i data-lucide="flask-conical"></i>Evals</button>
       <button data-v="guard"><i data-lucide="shield-half"></i>Action Guard</button>
       <button data-v="jobs"><i data-lucide="clock"></i>Jobs &amp; cron</button>
+      <button data-v="queue"><i data-lucide="list-ordered"></i>Queue &amp; turns<span class="ct" data-ct="queue"></span></button>
       <button data-v="secrets"><i data-lucide="key-round"></i>Secrets<span class="ct" data-ct="secrets"></span></button>
     </nav>
     <div class="side-foot"><div class="ava" id="meAva">RY</div><div><div class="me" id="meName">—</div><div class="em" id="meEmail">—</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
@@ -269,6 +270,7 @@
       <div class="view wrap hidden" id="v-conversations"><div class="h2">Conversations</div><div class="sub">Durable sessions &amp; messages — inbound events map to a thread by channel + external id, so replies land in context across restarts. Conversation storage and retrieval, not a chat product.</div><div id="sessBody"></div><div id="threadBody"></div></div>
       <div class="view wrap hidden" id="v-approvals"><div class="h2">Approvals</div><div class="sub">External actions pause here. Approving resumes the real run — durably, from any worker.</div><div id="apprBody"></div></div>
       <div class="view wrap hidden" id="v-jobs"><div class="h2">Jobs &amp; cron</div><div class="sub">Background work the runtime owns — schedules, retries with backoff, and a dead-letter queue.</div><div id="jobsBody"></div></div>
+      <div class="view wrap hidden" id="v-queue"><div class="h2">Queue &amp; durable turns</div><div class="sub">Durable jobs claimed by external workers in any language — leases, retries with backoff, dead-letter, cancellation. Chat turns are queue jobs too: click one to inspect its durable stream.</div><div id="queueStats"></div><div id="queueBody" style="margin-top:16px"><div class="empty">Loading queue…</div></div><div id="turnStreamBody"></div></div>
       <div class="view wrap hidden" id="v-secrets"><div class="h2">Secrets</div><div class="sub">Names only, never values — they never reach the agent.</div><div id="secretsBody"></div></div>
       <div class="view wrap hidden" id="v-evals"><div class="h2">Evals</div><div class="sub">Behavioural checks — each case fires a real event and scores the run. Gate a deploy on it with <span class="mono">rya eval</span>.</div><div style="margin-bottom:16px"><button class="btn dark sm" id="evalRunBtn" onclick="runEvals()"><i data-lucide="play"></i>Run evals</button></div><div id="evalsBody"><div class="empty">Loading cases…</div></div></div>
       <div class="view wrap hidden" id="v-guard"><div class="h2">Action Guard</div><div class="sub">Every outbound request the agent makes is checked against the SSRF blocklist and the rules below, then forwarded or blocked — before it leaves the process. Edits take effect immediately.</div><div id="guardBody"><div class="empty">Loading policy…</div></div></div>
@@ -313,7 +315,7 @@
 const API = (new URLSearchParams(location.search).get('api') || '').replace(/\/$/,'');
 const TKEY = 'rya_token';
 const getToken = () => localStorage.getItem(TKEY) || '';
-const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','secrets'];
+const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','queue','secrets'];
 let STATE = null, wasLive = null, lastFocus = null;
 const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 // JS-string-escape for ids interpolated into inline handlers (defense-in-depth).
@@ -393,7 +395,7 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{ const t=e.target;
   if((e.key==='Enter'||e.key===' ')&&t.classList&&t.classList.contains('clickable')){ e.preventDefault(); t.click(); } });
 
-function show(v){views.forEach(x=>document.getElementById('v-'+x).classList.toggle('hidden',x!==v));document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));document.querySelector('.scroll').scrollTop=0;document.getElementById('traceBody').innerHTML='';document.getElementById('threadBody').innerHTML='';document.querySelector('.side').classList.remove('open');if(v==='guard')loadGuard();if(v==='evals')loadEvals();}
+function show(v){views.forEach(x=>document.getElementById('v-'+x).classList.toggle('hidden',x!==v));document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));document.querySelector('.scroll').scrollTop=0;document.getElementById('traceBody').innerHTML='';document.getElementById('threadBody').innerHTML='';document.getElementById('turnStreamBody').innerHTML='';document.querySelector('.side').classList.remove('open');if(v==='guard')loadGuard();if(v==='evals')loadEvals();if(v==='queue')loadQueue();if(v==='tools')loadToolSwitches();}
 document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.v)));
 function toggleNav(){ document.querySelector('.side').classList.toggle('open'); }
 
@@ -411,6 +413,12 @@ async function refresh(){
   setLive(true); wasLive=true; STATE=s;
   try{ render(s); }
   catch(e){ console.error(e); toast('Render error — '+e.message); }  // a render bug is NOT "offline"
+  refreshQueueCt();  // fire-and-forget sidebar count
+}
+async function refreshQueueCt(){
+  try{ const st=await api('/queue/stats'); const c=st.counts||{}; const active=(c.pending||0)+(c.running||0);
+    document.querySelectorAll('[data-ct="queue"]').forEach(e=>{e.textContent=active;e.classList.toggle('amber',(c.failed||0)>0);});
+  }catch(e){}
 }
 function showRuntimeDown(msg){
   // Only paint the down-state card if we have no data yet (don't clobber a live view).
@@ -469,6 +477,7 @@ function render(s){
     prim('messages-square','Conversations','conversations','Durable sessions & messages — threaded per channel, retrievable for context.',[(st.sessions||0)+' sessions',(st.messages||0)+' messages']),
     prim('user-check','Approvals','approvals','Human-in-the-loop gates. Runs pause durably and resume.',[st.approvalsPending+' pending'],st.approvalsPending>0),
     prim('zap','Events & jobs','jobs','Webhooks, cron, delayed work, retries, dead-letter.',['cron ×'+s.triggers.filter(t=>t.type==='cron').length, st.jobsPending+' queued']),
+    prim('list-ordered','Queue & turns','queue','Durable jobs for external workers in any language - leases, retries, dead-letter. Chat turns included.',['polyglot workers','durable streams']),
     prim('send','Channels','channels','Webhook, Slack, email behind one interface.',s.channels.map(c=>c.type+(c.enabled?'':' (off)'))),
     prim('key-square','Connected credentials','connections','Scoped, vaulted creds — injected at call time, enforced by the intersection rule. The agent never sees a secret.',[((s.connections||[]).length)+' connections',(s.tools.filter(t=>t.provider).length)+' scoped tools']),
     prim('activity','Observability','runs','Every run is a forensic trace. Token & cost accounting.',['traces on']),
@@ -487,11 +496,7 @@ function render(s){
 
   // detail views
   document.getElementById('manifestPre').textContent = s.manifestYaml || '(manifest unavailable)';
-  document.getElementById('toolsBody').innerHTML = table(['Tool','Permission','Side effects','Secret','Calls'],
-    s.tools.map(t=>[`<span class="mono">${esc(t.id)}</span>`,`<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
-      t.externalSideEffects?'external':'<span class="dim">none</span>',
-      (t.requiredSecrets&&t.requiredSecrets.length)?`<span class="mono dim">${esc(t.requiredSecrets.join(', '))}</span>`:'<span class="dim">—</span>',
-      String(t.calls)]));
+  renderTools();
   const blocks=(s.memory.blocks||[]);
   let memHtml='';
   memHtml += `<div class="secrow"><span class="l">Core memory blocks</span><span class="r">always in context · self-editable · ${blocks.length}</span></div>`;
@@ -713,6 +718,124 @@ async function resolve(id,act){
   const row=document.getElementById('ap-'+id); if(row) row.querySelectorAll('button').forEach(b=>b.disabled=true);
   try{ const r=await api('/approvals/'+id+'/'+act,{method:'POST'}); toast(`${act==='approve'?'Approved':'Rejected'} → run ${r.runStatus}`); await refresh(); show('approvals'); }
   catch(e){ toast('Error — '+e.message); if(row) row.querySelectorAll('button').forEach(b=>b.disabled=false); }
+}
+// ---- Queue & durable turns -------------------------------------------------
+const QSTB={pending:'wait',running:'ok',completed:'ok',failed:'fail',cancelled:'fail'};
+async function loadQueue(){
+  const stats=document.getElementById('queueStats'), body=document.getElementById('queueBody');
+  try{
+    const [st,jobs]=await Promise.all([api('/queue/stats'),api('/queue/jobs')]);
+    const c=st.counts||{}, list=jobs.jobs||[];
+    stats.innerHTML='<div class="stats">'+[
+      tile('inbox','Pending',c.pending||0,'awaiting a worker',(c.pending||0)>0),
+      tile('loader','Running',c.running||0,'leased to workers'),
+      tile('check-circle-2','Completed',c.completed||0,'done'),
+      tile('alert-triangle','Dead-letter',c.failed||0,'attempts exhausted',(c.failed||0)>0),
+    ].join('')+'</div>';
+    body.innerHTML = list.length? `<table class="tbl"><thead><tr><th>Job</th><th>Type</th><th>Status</th><th>Attempts</th><th>Worker</th><th>Error</th><th></th></tr></thead><tbody>${
+      list.map(j=>{
+        const turn=j.type==='chat-turn';
+        const acts=[];
+        if(j.status==='failed'||j.status==='cancelled') acts.push(`<button class="btn sm" onclick="event.stopPropagation();queueAction('${jss(j.id)}','retry')">Retry</button>`);
+        if(j.status==='pending'||j.status==='running') acts.push(`<button class="btn sm" onclick="event.stopPropagation();queueAction('${jss(j.id)}','cancel')">Cancel</button>`);
+        return `<tr class="${turn?'clickable':''}" ${turn?`tabindex="0" role="button" aria-label="Inspect turn stream ${esc(j.id)}" onclick="openTurnStream('${jss(j.id)}')"`:''}>`+
+          `<td><span class="mono">${esc(j.id)}</span>${j.deadLetter?' <span class="pb dis">DLQ</span>':''}</td>`+
+          `<td><span class="mono">${esc(j.type)}</span>${turn?' <span class="ptag">turn</span>':''}</td>`+
+          `<td><span class="stbadge ${QSTB[j.status]||''}"><span class="d"></span>${esc(j.status)}</span></td>`+
+          `<td>${j.attempts||0}/${j.maxAttempts||1}</td>`+
+          `<td class="dim"><span class="mono">${esc(j.workerId||'—')}</span></td>`+
+          `<td class="dim" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(j.error||j.lastError||'')}">${esc(j.error||j.lastError||'—')}</td>`+
+          `<td style="white-space:nowrap">${acts.join(' ')}</td></tr>`;
+      }).join('')
+    }</tbody></table>` : empty('Queue is empty — enqueue with POST /queue/jobs or start a durable turn.');
+    icons();
+  }catch(e){ body.innerHTML=empty(e.message==='unauthorized'?'Connect to load the queue.':'Queue unavailable — '+e.message); }
+}
+async function queueAction(id,act){
+  try{ await api('/queue/jobs/'+encodeURIComponent(id)+'/'+act,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+    toast(act==='retry'?'Requeued '+id:'Cancel requested for '+id); loadQueue(); }
+  catch(e){ toast('Error — '+e.message); }
+}
+async function openTurnStream(id){
+  const body=document.getElementById('turnStreamBody');
+  body.innerHTML=`<div class="secrow"><span class="l">Turn stream · ${esc(id)}</span><span class="r mono">tailing…</span></div><div class="empty">Reading durable buffer…</div>`;
+  const frames=[]; const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),6000);  // finished turns flush instantly; live ones tail briefly
+  try{
+    const t=getToken();
+    const r=await fetch(API+`/agents/_/turns/${encodeURIComponent(id)}/stream`,{headers:t?{'Authorization':'Bearer '+t}:{},signal:ctrl.signal});
+    const rd=r.body.getReader(); const dec=new TextDecoder(); let buf='',ev=null,dat=[];
+    for(;;){ const {done,value}=await rd.read(); if(done)break; buf+=dec.decode(value,{stream:true});
+      let nl; while((nl=buf.indexOf('\n'))>=0){ const line=buf.slice(0,nl).replace(/\r$/,''); buf=buf.slice(nl+1);
+        if(line.startsWith(':'))continue;
+        if(line.startsWith('event:'))ev=line.slice(6).trim();
+        else if(line.startsWith('data:'))dat.push(line.slice(5).trim());
+        else if(line===''&&ev){ let d=null; try{d=dat.length?JSON.parse(dat.join('\n')):null;}catch(e){}
+          frames.push({ev,d}); const fin=ev==='error'||(ev==='run'&&d&&['completed','failed','rejected'].includes(d.status));
+          ev=null;dat=[]; if(fin){ctrl.abort();} }
+      } if(ctrl.signal.aborted)break; }
+  }catch(e){ /* abort = done reading */ }
+  clearTimeout(timer);
+  if(!frames.length){ body.innerHTML=`<div class="secrow"><span class="l">Turn stream · ${esc(id)}</span></div>`+empty('No frames yet — the turn has not executed.'); return; }
+  const KIND={'run.started':'play','tool.call':'plug','llm.respond':'sparkles','approval.requested':'shield-alert','approval.approved':'check','approval.rejected':'x-circle','channel.send':'send','run.completed':'check-circle-2','run.failed':'x-circle','log':'file-text'};
+  let html='',tokbuf='';
+  const flushTok=()=>{ if(tokbuf){ html+=`<div class="msg out" style="max-width:100%"><div class="mrole">streamed text</div><div class="mbody">${esc(tokbuf)}</div></div>`; tokbuf=''; } };
+  frames.forEach(f=>{
+    if(f.ev==='token'){ tokbuf+=(f.d&&f.d.text)||''; return; }
+    flushTok();
+    if(f.ev==='trace'){ const k=(f.d&&f.d.kind)||'trace'; const amber=String(k).startsWith('approval');
+      html+=`<div class="tev"><span class="tdot ${amber?'amber':''}"><i data-lucide="${KIND[k]||'dot'}"></i></span><div><div class="tk">${esc(k)}</div><div class="tm">${esc((f.d&&f.d.label)||'')}</div></div></div>`; }
+    else if(f.ev==='message'){ html+=`<div class="msg out" style="max-width:100%"><div class="mrole">${esc((f.d&&f.d.role)||'assistant')}</div><div class="mbody">${esc((f.d&&f.d.content)||'')}</div></div>`; }
+    else if(f.ev==='restart'){ html+=`<div class="msg sys" style="max-width:100%"><div class="mbody">stream restarted — reclaimed after a crash (attempt ${esc(String((f.d&&f.d.attempt)||'?'))})</div></div>`; }
+    else if(f.ev==='run'){ const st=(f.d&&f.d.status)||'?'; html+=`<div class="tev"><span class="tdot ${st==='waiting_approval'?'amber':''}"><i data-lucide="${st==='completed'?'check-circle-2':(st==='waiting_approval'?'shield-alert':'flag')}"></i></span><div><div class="tk">run · ${esc(st)}</div><div class="tm mono">${esc((f.d&&f.d.id)||'')} · ${(f.d&&f.d.tokens)||0} tokens</div></div></div>`; }
+    else if(f.ev==='error'){ html+=`<div class="tev"><span class="tdot"><i data-lucide="x-circle"></i></span><div><div class="tk">error</div><div class="tm">${esc((f.d&&f.d.message)||'')}</div></div></div>`; }
+  });
+  flushTok();
+  body.innerHTML=`<div class="secrow"><span class="l">Turn stream · ${esc(id)}</span><span class="r mono">${frames.length} frames · durable buffer</span></div><div class="window" style="padding:10px 16px"><div class="trace">${html}</div></div>`;
+  icons();
+  body.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+// ---- Tools: runtime kill switches ------------------------------------------
+// TOOL_EFF caches GET /tools (effective permissions + overrides); renderTools
+// is the ONE renderer for the tools table, so the 6s refresh poll can't
+// clobber the kill-switch columns once they've loaded.
+let TOOL_EFF=null;
+function renderTools(){
+  const src=(STATE&&STATE.tools)||[];
+  const body=document.getElementById('toolsBody');
+  if(!TOOL_EFF){
+    body.innerHTML = table(['Tool','Permission','Side effects','Secret','Calls'],
+      src.map(t=>[`<span class="mono">${esc(t.id)}</span>`,`<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
+        t.externalSideEffects?'external':'<span class="dim">none</span>',
+        (t.requiredSecrets&&t.requiredSecrets.length)?`<span class="mono dim">${esc(t.requiredSecrets.join(', '))}</span>`:'<span class="dim">—</span>',
+        String(t.calls)]));
+    return;
+  }
+  body.innerHTML = table(['Tool','Manifest','Effective','Side effects','Calls','Kill switch'],
+    src.map(t=>{
+      const e=TOOL_EFF[t.id]||{}; const ep=e.effectivePermission||t.permission; const overridden=!!e.override;
+      const btn = ep!=='disabled'
+        ? `<button class="btn sm" onclick="toolSwitch('${jss(t.id)}','disabled')"><i data-lucide="power-off"></i>Disable</button>`
+        : `<button class="btn sm" onclick="toolSwitch('${jss(t.id)}','clear')"><i data-lucide="power"></i>Restore</button>`;
+      return [`<span class="mono">${esc(t.id)}</span>`,
+        `<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
+        `<span class="pb ${PB[ep]}">${esc(ep)}</span>${overridden?' <span class="ptag" title="runtime override active">override v'+esc(String(e.override.version))+'</span>':''}`,
+        t.externalSideEffects?'external':'<span class="dim">none</span>',
+        String(t.calls), btn];
+    }));
+  icons();
+}
+async function loadToolSwitches(){
+  try{
+    const d=await api('/tools'); const eff={}; (d.tools||[]).forEach(t=>eff[t.id]=t);
+    TOOL_EFF=eff; renderTools();
+  }catch(e){ /* leave the snapshot-rendered table in place */ }
+}
+async function toolSwitch(id,mode){
+  const payload = mode==='clear' ? {clear:true} : {permission:mode,reason:'console kill switch'};
+  try{ const r=await api('/tools/'+encodeURIComponent(id)+'/permission',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    toast((mode==='clear'?'Restored ':'Disabled ')+id+' · v'+r.version+' — effective immediately'); loadToolSwitches(); }
+  catch(e){ toast('Error — '+e.message); }
 }
 async function sendEvent(){
   const b=document.getElementById('evtBtn'); b.disabled=true;

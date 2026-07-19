@@ -887,7 +887,7 @@ class _Guard:
 
     def check_grounding(self, text: str) -> dict:
         """Every money figure in ``text`` must be traceable to a tool output of
-        THIS run (the AutoRentals grounding-gate pattern, as a primitive).
+        THIS run - the grounding gate, as a primitive.
         Returns {ok, figures, violations}."""
         from ..guard import grounding_check
         return grounding_check(text, self._tool_outputs())

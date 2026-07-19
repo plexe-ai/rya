@@ -851,9 +851,9 @@ def build_app(root: Path) -> FastAPI:
     @api.put("/tools/{tool_id}/permission")
     async def set_tool_permission(tool_id: str, request: Request, engine: Engine = Depends(get_engine)):
         """Runtime kill switch: override a tool's permission NOW, without a
-        redeploy. Versioned + append-only history (the AutoRentals
-        runtime_config pattern). Body: {"permission": "...", "reason": "..."} or
-        {"clear": true} to drop the override and fall back to the manifest."""
+        redeploy. Versioned + append-only history. Body:
+        {"permission": "...", "reason": "..."} or {"clear": true} to drop the
+        override and fall back to the manifest."""
         from ..manifest.schema import Permission as Perm
         body = await request.json()
         decl = next((t for t in manifest.tools if t.id == tool_id), None)

@@ -183,9 +183,9 @@ def _example_url(rule: dict) -> str:
 
 
 # ---- grounding gate ---------------------------------------------------------
-# Serving-path check (pattern proven in the AutoRentals concierge): every money
-# figure in an outbound reply must be traceable to a tool output of the same
-# run, so the model can never invent a price. Opt in via `grounding.enabled`
+# Serving-path check (a pattern proven in production concierge agents): every
+# money figure in an outbound reply must be traceable to a tool output of the
+# same run, so the model can never invent a price. Opt in via `grounding.enabled`
 # in rya.guard.yaml; also callable directly as ctx.guard.check_grounding(text).
 
 # $1,234.56 / USD 999 / 199 USD / EUR-style symbols. Deliberately currency-only:

@@ -1,6 +1,6 @@
-"""The five platform gaps surfaced by real agent workloads (ChatStudyAbroad,
-AutoRentals concierge): per-purpose model routes, server-side arg pinning,
-runtime kill switches, token streaming, and the grounding gate."""
+"""The five platform gaps surfaced by real production agent workloads:
+per-purpose model routes, server-side arg pinning, runtime kill switches,
+token streaming, and the grounding gate."""
 
 import asyncio
 

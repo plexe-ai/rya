@@ -627,6 +627,15 @@ def build_app(root: Path) -> FastAPI:
 
         last_id = request.headers.get("last-event-id")
         start = int(last_id) if (last_id and last_id.lstrip("-").isdigit()) else after
+        idle_limit = max(1, int(float(os.environ.get("RYA_TURN_STREAM_IDLE_SECONDS", "60")) / 0.3))
+
+        def _is_terminal(f: dict) -> bool:
+            # A run frame with waiting_approval is a PAUSE marker - the approval
+            # resolution appends the continuation + the real terminal frame to
+            # this same buffer, so the tail must not end there.
+            from ..turns import TERMINAL_RUN_STATUSES
+            return f["kind"] == "error" or (
+                f["kind"] == "run" and (f.get("data") or {}).get("status") in TERMINAL_RUN_STATUSES)
 
         async def sse():
             cursor = start
@@ -641,11 +650,11 @@ def build_app(root: Path) -> FastAPI:
                         cursor = f["seq"]
                         yield (f"id: {f['seq']}\nevent: {f['kind']}\n"
                                f"data: {json.dumps(f['data'], default=str)}\n\n")
-                        if f["kind"] in ("run", "error"):
+                        if _is_terminal(f):
                             return
                 else:
                     idle += 1
-                    if idle >= 200:  # ~60s with no new frame; client reconnects w/ Last-Event-ID
+                    if idle >= idle_limit:  # no new frame; client reconnects w/ Last-Event-ID
                         yield ": idle-timeout\n\n"
                         return
                     if idle % 15 == 0:
@@ -842,19 +851,24 @@ def build_app(root: Path) -> FastAPI:
 
     @api.post("/approvals/{approval_id}/approve")
     def approve(approval_id: str, engine: Engine = Depends(get_engine)):
+        # Turn-bound runs stream their post-approval continuation onto the
+        # original turn's durable buffer (resolve_on_stream); plain runs approve
+        # exactly as before.
         try:
-            run = engine.approve(approval_id)
+            run = _turns.resolve_on_stream(engine, approval_id, approve=True)
         except RyaError as e:
             raise HTTPException(status_code=409, detail=e.to_dict()["error"])
-        return {"approvalId": approval_id, "runStatus": run["status"]}
+        return {"approvalId": approval_id, "runStatus": run["status"],
+                "turnId": run.get("turnId")}
 
     @api.post("/approvals/{approval_id}/reject")
     def reject(approval_id: str, engine: Engine = Depends(get_engine)):
         try:
-            run = engine.reject(approval_id)
+            run = _turns.resolve_on_stream(engine, approval_id, approve=False)
         except RyaError as e:
             raise HTTPException(status_code=409, detail=e.to_dict()["error"])
-        return {"approvalId": approval_id, "runStatus": run["status"]}
+        return {"approvalId": approval_id, "runStatus": run["status"],
+                "turnId": run.get("turnId")}
 
     # ---- queue: durable jobs for external workers (Sim et al.) -----------
     from .. import queue as q

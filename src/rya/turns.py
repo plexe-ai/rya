@@ -65,14 +65,12 @@ def _run_turn(engine, job: dict, worker_id: str) -> None:
     try:
         run = engine.run_event(ev.get("type", "message.received"), ev.get("payload", {}),
                                source="turn", on_trace=on_trace, on_token=on_token)
-        # Chat agents: surface assistant session replies before the terminal frame.
-        p = ev.get("payload") or {}
-        if hasattr(store, "find_session") and p.get("channel") and p.get("externalId"):
-            sess = store.find_session(engine.manifest.name, p["channel"], p["externalId"])
-            if sess:
-                for m in store.list_messages(sess["id"]):
-                    if m.get("runId") == run["id"] and m.get("role") in ("assistant", "agent"):
-                        store.stream_append(turn_id, [{"kind": "message", "data": m}])
+        if run["status"] == "waiting_approval":
+            # Tag the paused run with its turn so the approval resolution can
+            # stream the continuation onto this same buffer (resolve_on_stream).
+            run["turnId"] = turn_id
+            store.save_run(run)
+        _append_session_replies(engine, turn_id, ev.get("payload") or {}, run)
         store.stream_append(turn_id, [{"kind": "run", "data": _summary(run)}])
         q.complete(store, turn_id, worker_id, {"runId": run["id"], "status": run["status"]})
     except RyaError as e:
@@ -96,13 +94,63 @@ def execute_pending(engine, worker_id: str = "turn-worker", limit: int = 10,
     return [j["id"] for j in claimed]
 
 
+def _append_session_replies(engine, turn_id: str, payload: dict, run: dict) -> None:
+    """Chat agents: surface assistant session replies before the run frame."""
+    store = engine.store
+    if hasattr(store, "find_session") and payload.get("channel") and payload.get("externalId"):
+        sess = store.find_session(engine.manifest.name, payload["channel"], payload["externalId"])
+        if sess:
+            for m in store.list_messages(sess["id"]):
+                if m.get("runId") == run["id"] and m.get("role") in ("assistant", "agent"):
+                    store.stream_append(turn_id, [{"kind": "message", "data": m}])
+
+
+def resolve_on_stream(engine, approval_id: str, approve: bool = True) -> dict:
+    """Approve/reject an approval; if its run belongs to a turn, stream the
+    POST-approval continuation onto that turn's buffer, ending with a NEW
+    terminal run frame. Memoized pre-approval steps don't re-stream. Falls back
+    to a plain approve/reject when the run isn't turn-bound."""
+    store = engine.store
+    approval = store.get_approval(approval_id)
+    run = store.get_run(approval["runId"]) if approval else None
+    turn_id = (run or {}).get("turnId")
+
+    if not turn_id:
+        return engine.approve(approval_id) if approve else engine.reject(approval_id)
+
+    store.stream_append(turn_id, [{
+        "kind": "trace",
+        "data": {"kind": "approval.approved" if approve else "approval.rejected",
+                 "label": (approval or {}).get("title"), "data": {"approvalId": approval_id}},
+    }])
+    if approve:
+        resumed = engine.approve(
+            approval_id,
+            on_trace=lambda ev: store.stream_append(turn_id, [{"kind": "trace", "data": ev}]),
+            on_token=lambda ch: store.stream_append(turn_id, [{"kind": "token", "data": {"text": ch}}]),
+        )
+        ev = resumed.get("event") or {}
+        _append_session_replies(engine, turn_id, ev.get("payload") or {}, resumed)
+    else:
+        resumed = engine.reject(approval_id)
+    store.stream_append(turn_id, [{"kind": "run", "data": _summary(resumed)}])
+    return resumed
+
+
 def read_stream(engine, turn_id: str, after_seq: int = -1) -> List[dict]:
     return engine.store.stream_read(turn_id, after_seq)
 
 
+TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected")
+
+
 def is_terminal(frames: List[dict]) -> Optional[dict]:
-    """The terminal frame (run|error) in a batch, if present."""
+    """The FINAL terminal frame in a batch: an error, or a run frame whose
+    status is terminal (a run frame with waiting_approval is a pause marker -
+    the approval resolution appends the real terminal frame later)."""
     for f in frames:
-        if f.get("kind") in ("run", "error"):
+        if f.get("kind") == "error":
+            return f
+        if f.get("kind") == "run" and (f.get("data") or {}).get("status") in TERMINAL_RUN_STATUSES:
             return f
     return None

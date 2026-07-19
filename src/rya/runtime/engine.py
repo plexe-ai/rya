@@ -371,7 +371,7 @@ class Engine:
         spec = self.tools.get(tool)
         return spec.fn(inp) if spec is not None else None
 
-    def approve(self, approval_id: str) -> dict:
+    def approve(self, approval_id: str, on_trace=None, on_token=None) -> dict:
         approval = self.store.get_approval(approval_id)
         if approval is None:
             raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
@@ -419,6 +419,8 @@ class Engine:
 
         # Resume by replaying the handler against the now-resolved journal,
         # restoring the run's identity so per-user scoping holds on resume.
+        # Memoized (pre-approval) steps neither re-trace nor re-stream, so the
+        # relays only carry the POST-approval continuation.
         handler = self.agent.event_handler()
         arg = Event.from_dict(run["event"]) if run.get("event") else None
         identity = None
@@ -426,7 +428,8 @@ class Engine:
             from ..auth import Identity
             ident = run["identity"]
             identity = Identity(sub=ident["sub"], claims=ident)
-        return self._execute(run, handler, arg, identity=identity)
+        return self._execute(run, handler, arg, identity=identity,
+                             on_trace=on_trace, on_token=on_token)
 
     def reject(self, approval_id: str) -> dict:
         approval = self.store.get_approval(approval_id)

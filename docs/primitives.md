@@ -157,10 +157,17 @@ any queue job); an approval PAUSE inside a turn is durable via journal replay.
 TS client: `startTurn()` + `streamTurn(turnId, afterSeq)` (auto-reconnects from
 the last seq on a dropped connection).
 
-Known follow-ups: post-approval continuation is not yet streamed on the original
-turn (fetch the final run, or start a follow-up turn); the reclaim sweeper is
-per-workspace via the endpoint - a global background loop across workspaces is
-not wired into `rya serve` yet.
+**Approvals inside turns**: a `run` frame with status `waiting_approval` is a
+pause marker, not the end. Approving (or rejecting) streams the POST-approval
+continuation onto the same turn buffer - an `approval.approved` trace frame,
+the continuation's trace/token frames (memoized pre-approval steps never
+re-stream or re-bill), session replies, then the REAL terminal `run` frame.
+TS: `streamTurn(id, -1, {untilFinal: true})` tails through the pause to the
+final frame.
+
+**Built-in sweeper**: `rya serve` runs a background reclaim loop
+(`RYA_TURN_SWEEP_SECONDS`, default 30, 0 disables) across ALL workspaces, so
+crashed/stranded turns always finish with no external cron.
 
 ## Token streaming
 

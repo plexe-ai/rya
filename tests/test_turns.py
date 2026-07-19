@@ -42,7 +42,7 @@ def engine(request, tmp_path):
     s = PostgresStore(PG)
     s.ensure()
     with s._conn.cursor() as cur:
-        cur.execute("TRUNCATE rya_stream, rya_queue, rya_runs")
+        cur.execute("TRUNCATE rya_stream, rya_queue, rya_runs, rya_approvals")
     return _engine(tmp_path, s)
 
 
@@ -129,7 +129,10 @@ def test_reexecution_appends_restart_marker(engine):
 
 # ---- HTTP surface -----------------------------------------------------------
 
-def test_turn_http_roundtrip(tmp_path):
+def test_turn_http_roundtrip(tmp_path, monkeypatch):
+    # The scaffold turn pauses at an approval; a pause is non-terminal for the
+    # tail, so keep the idle window short for the test.
+    monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
     scaffold.write_project(tmp_path, "turn-http-agent")
     client = TestClient(build_app(tmp_path))
 
@@ -153,6 +156,74 @@ def test_turn_http_roundtrip(tmp_path):
     assert "token" in events
     assert events[-1] == "run"
     assert ids == sorted(ids)  # monotonic id: fields for Last-Event-ID resume
+
+
+# ---- post-approval continuation streams on the original turn -----------------
+
+def test_approval_continuation_streams_on_turn(engine):
+    tid = turns.create_turn(engine, "message.received", {"email": "ada@x.com"})["turnId"]
+    turns.execute_pending(engine)
+
+    frames = turns.read_stream(engine, tid)
+    pause = frames[-1]
+    assert pause["kind"] == "run" and pause["data"]["status"] == "waiting_approval"
+    assert turns.is_terminal(frames) is None  # a pause is NOT terminal
+    tokens_before = sum(1 for f in frames if f["kind"] == "token")
+
+    approval = engine.store.list_approvals("pending")[0]
+    resumed = turns.resolve_on_stream(engine, approval["id"], approve=True)
+    assert resumed["status"] == "completed"
+
+    # The continuation landed on the SAME buffer, after the pause frame.
+    cont = turns.read_stream(engine, tid, after_seq=pause["seq"])
+    kinds = [f["kind"] for f in cont]
+    assert kinds[0] == "trace" and cont[0]["data"]["kind"] == "approval.approved"
+    assert "trace" in kinds[1:]                      # post-approval steps streamed
+    assert kinds[-1] == "run"
+    assert cont[-1]["data"]["status"] == "completed"  # the REAL terminal frame
+    assert turns.is_terminal(cont)["data"]["status"] == "completed"
+
+    # Memoized pre-approval LLM steps did not re-stream: no new token frames
+    # (the scaffold's only llm call happens before the approval).
+    tokens_after = sum(1 for f in turns.read_stream(engine, tid) if f["kind"] == "token")
+    assert tokens_after == tokens_before
+
+
+def test_rejection_streams_terminal_on_turn(engine):
+    tid = turns.create_turn(engine, "message.received", {"email": "ada@x.com"})["turnId"]
+    turns.execute_pending(engine)
+    pause_seq = turns.read_stream(engine, tid)[-1]["seq"]
+
+    approval = engine.store.list_approvals("pending")[0]
+    turns.resolve_on_stream(engine, approval["id"], approve=False)
+
+    cont = turns.read_stream(engine, tid, after_seq=pause_seq)
+    assert cont[0]["data"]["kind"] == "approval.rejected"
+    assert cont[-1]["kind"] == "run" and cont[-1]["data"]["status"] == "rejected"
+
+
+def test_approval_continuation_over_http(tmp_path, monkeypatch):
+    monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
+    scaffold.write_project(tmp_path, "turn-apr-agent")
+    client = TestClient(build_app(tmp_path))
+
+    tid = client.post("/agents/_/turns", json={"type": "message.received",
+                                               "payload": {"email": "ada@x.com"}}).json()["turnId"]
+    with client.stream("GET", f"/agents/_/turns/{tid}/stream") as s:
+        body = "".join(s.iter_text())
+    assert '"status": "waiting_approval"' in body or "waiting_approval" in body
+
+    apr = client.get("/approvals?status=pending").json()["approvals"][0]
+    r = client.post(f"/approvals/{apr['id']}/approve").json()
+    assert r["runStatus"] == "completed"
+    assert r["turnId"] == tid  # the approval knew its turn
+
+    # Re-tail from the pause: the continuation + real terminal frame are there.
+    with client.stream("GET", f"/agents/_/turns/{tid}/stream") as s:
+        body2 = "".join(s.iter_text())
+    assert body2.count("event: run") >= 1
+    assert "approval.approved" in body2
+    assert '"completed"' in body2
 
 
 def test_background_sweeper_recovers_stranded_turn(tmp_path, monkeypatch):
@@ -184,7 +255,8 @@ def test_background_sweeper_recovers_stranded_turn(tmp_path, monkeypatch):
     assert eng.store.queue_get(tid)["status"] == "completed"
 
 
-def test_reclaim_endpoint(tmp_path):
+def test_reclaim_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
     scaffold.write_project(tmp_path, "turn-reclaim-agent")
     app = build_app(tmp_path)
     client = TestClient(app)

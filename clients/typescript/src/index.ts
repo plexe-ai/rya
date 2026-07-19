@@ -229,15 +229,25 @@ export class RyaClient {
    * Stream a durable turn, resuming across dropped connections: yields frames
    * from `afterSeq`, and on a network drop it reconnects from the last seq it
    * saw (the durable buffer means nothing is lost). Ends on `run`/`error`.
+   *
+   * With `untilFinal: true`, a `run` frame with status `waiting_approval` is a
+   * pause marker, not the end: the stream keeps tailing (reconnecting through
+   * idle timeouts) until the approval resolves and the continuation's frames +
+   * the real terminal frame (completed/failed/rejected) arrive.
    */
   async *streamTurn(
     turnId: string,
     afterSeq = -1,
-    opts?: { maxReconnects?: number }
+    opts?: { maxReconnects?: number; untilFinal?: boolean }
   ): AsyncGenerator<StreamFrame> {
     let cursor = afterSeq;
     let reconnects = 0;
-    const maxReconnects = opts?.maxReconnects ?? 20;
+    const untilFinal = opts?.untilFinal ?? false;
+    const maxReconnects = opts?.maxReconnects ?? (untilFinal ? Number.POSITIVE_INFINITY : 20);
+    const isFinal = (event: string, data: any) =>
+      event === "error" ||
+      (event === "run" &&
+        (!untilFinal || ["completed", "failed", "rejected"].includes(data?.status)));
     while (true) {
       const headers: Record<string, string> = { accept: "text/event-stream" };
       if (this.token) headers["authorization"] = `Bearer ${this.token}`;
@@ -278,8 +288,9 @@ export class RyaClient {
             else if (line.startsWith("data:")) data.push(line.slice(5).trim());
             else if (line === "" && event) {
               if (id !== null) cursor = id;
-              yield { event, data: data.length ? JSON.parse(data.join("\n")) : null };
-              if (event === "run" || event === "error") {
+              const parsed = data.length ? JSON.parse(data.join("\n")) : null;
+              yield { event, data: parsed };
+              if (isFinal(event, parsed)) {
                 terminated = true;
                 break;
               }

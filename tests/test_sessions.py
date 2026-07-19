@@ -39,7 +39,7 @@ def test_filestore_sessions_roundtrip(tmp_path):
 
 
 def _ctx(tmp_path):
-    scaffold.write_project(tmp_path, "convo")
+    scaffold.write_project(tmp_path, "convo", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     store = Store(tmp_path)
     store.ensure()
@@ -75,7 +75,7 @@ def test_ctx_sessions_get_or_create_and_history(tmp_path):
 def test_console_and_api_expose_sessions(tmp_path, monkeypatch):
     for k in ("RYA_TOKEN", "RYA_MULTITENANT", "RYA_DATABASE_URL", "RYA_JWT_SECRET"):
         monkeypatch.delenv(k, raising=False)
-    scaffold.write_project(tmp_path, "convo")
+    scaffold.write_project(tmp_path, "convo", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
     store = Store(tmp_path)

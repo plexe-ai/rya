@@ -176,6 +176,11 @@ def build_console(manifest, store, agent, project_root) -> dict:
                    "externalSideEffects": getattr(treg.get(t.id), "external_side_effects", None),
                    "requiredSecrets": getattr(treg.get(t.id), "required_secrets", []),
                    "provider": getattr(t, "provider", None), "scopes": getattr(t, "scopes", []) or [],
+                   # A tool is a mock ONLY if it resolves to a registry mock: a
+                   # project @agent.tool handler or a url: decl is real code.
+                   "mockImpl": bool(getattr(treg.get(t.id), "mock", False)
+                                    and not getattr(t, "url", None)
+                                    and not (agent is not None and agent.tool_handler(t.id))),
                    "calls": tool_calls.get(t.id, 0)} for t in manifest.tools],
         "models": [{"id": m.id, "type": m.type, "permission": m.permission.value,
                     "version": getattr(mreg.get(m.id), "version", None),

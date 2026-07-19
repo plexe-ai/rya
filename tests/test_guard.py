@@ -152,7 +152,7 @@ def test_no_policy_is_noop(monkeypatch, tmp_path):
 def test_guard_api(tmp_path, monkeypatch):
     for k in ("RYA_TOKEN", "RYA_MULTITENANT", "RYA_DATABASE_URL", "RYA_GUARD_PATH"):
         monkeypatch.delenv(k, raising=False)
-    scaffold.write_project(tmp_path, "guard-agent")  # writes a default rya.guard.yaml
+    scaffold.write_project(tmp_path, "guard-agent", template="demo")  # writes a default rya.guard.yaml
     c = TestClient(build_app(tmp_path))
 
     g = c.get("/guard").json()

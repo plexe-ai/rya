@@ -21,7 +21,7 @@ def test_chunker_overlaps_and_respects_size():
 
 
 def _ctx(tmp_path):
-    scaffold.write_project(tmp_path, "rag")
+    scaffold.write_project(tmp_path, "rag", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     store = Store(tmp_path); store.ensure()
     run = {"id": "run_rag", "journal": {}, "trace": []}

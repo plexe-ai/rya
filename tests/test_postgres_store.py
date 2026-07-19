@@ -36,7 +36,7 @@ def _engine(project, store):
 
 
 def test_pause_resume_survives_restart(tmp_path):
-    scaffold.write_project(tmp_path, "pg-agent")
+    scaffold.write_project(tmp_path, "pg-agent", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
 
@@ -62,7 +62,7 @@ def test_pause_resume_survives_restart(tmp_path):
 
 
 def test_memory_persists_in_postgres(tmp_path):
-    scaffold.write_project(tmp_path, "pg-mem")
+    scaffold.write_project(tmp_path, "pg-mem", template="demo")
     store = _fresh_store()
     store.save_memory("agent", {"kv": {"k": "v"}, "collections": {"c": [{"x": 1}]}})
 

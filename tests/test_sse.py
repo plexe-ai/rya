@@ -29,7 +29,7 @@ def _parse_sse(text: str) -> list:
 
 
 def test_event_stream_tokens_then_terminal_run(tmp_path):
-    scaffold.write_project(tmp_path, "sse-agent")
+    scaffold.write_project(tmp_path, "sse-agent", template="demo")
     client = TestClient(build_app(tmp_path))
 
     with client.stream("POST", "/agents/_/events/stream",
@@ -55,7 +55,7 @@ def test_event_stream_tokens_then_terminal_run(tmp_path):
 
 
 def test_event_stream_chat_message_frames(tmp_path):
-    scaffold.write_project(tmp_path, "sse-chat-agent")
+    scaffold.write_project(tmp_path, "sse-chat-agent", template="demo")
     client = TestClient(build_app(tmp_path))
 
     with client.stream("POST", "/agents/_/events/stream",
@@ -74,7 +74,7 @@ def test_event_stream_chat_message_frames(tmp_path):
 
 
 def test_event_stream_survives_unknown_event_type(tmp_path):
-    scaffold.write_project(tmp_path, "sse-any-agent")
+    scaffold.write_project(tmp_path, "sse-any-agent", template="demo")
     client = TestClient(build_app(tmp_path))
     with client.stream("POST", "/agents/_/events/stream",
                        json={"type": "totally.unknown", "payload": {}}) as r:

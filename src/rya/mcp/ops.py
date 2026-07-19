@@ -63,11 +63,11 @@ def _engine(project_dir) -> Engine:
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
-def create_agent(name: str, project_dir: Optional[str] = None) -> dict:
+def create_agent(name: str, project_dir: Optional[str] = None, template: str = "minimal") -> dict:
     try:
         base = Path(project_dir).expanduser().resolve() if project_dir else Path.cwd()
         target = base / name
-        files = scaffold.write_project(target, name)
+        files = scaffold.write_project(target, name, template=template)
         return {
             "ok": True,
             "name": name,

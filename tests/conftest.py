@@ -14,7 +14,7 @@ from rya.store import Store  # noqa: E402
 @pytest.fixture
 def project(tmp_path) -> Path:
     """A scaffolded, ready-to-run project in a temp dir."""
-    scaffold.write_project(tmp_path, "test-agent")
+    scaffold.write_project(tmp_path, "test-agent", template="demo")
     return tmp_path
 
 

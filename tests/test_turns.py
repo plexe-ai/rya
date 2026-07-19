@@ -23,7 +23,7 @@ PG = os.environ.get("RYA_TEST_DATABASE_URL")
 
 
 def _engine(tmp_path, store):
-    scaffold.write_project(tmp_path, "turn-agent")
+    scaffold.write_project(tmp_path, "turn-agent", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
     return Engine(manifest, agent, store, tmp_path)
@@ -133,7 +133,7 @@ def test_turn_http_roundtrip(tmp_path, monkeypatch):
     # The scaffold turn pauses at an approval; a pause is non-terminal for the
     # tail, so keep the idle window short for the test.
     monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
-    scaffold.write_project(tmp_path, "turn-http-agent")
+    scaffold.write_project(tmp_path, "turn-http-agent", template="demo")
     client = TestClient(build_app(tmp_path))
 
     # POST kicks inline execution via BackgroundTasks (runs after the response
@@ -204,7 +204,7 @@ def test_rejection_streams_terminal_on_turn(engine):
 
 def test_approval_continuation_over_http(tmp_path, monkeypatch):
     monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
-    scaffold.write_project(tmp_path, "turn-apr-agent")
+    scaffold.write_project(tmp_path, "turn-apr-agent", template="demo")
     client = TestClient(build_app(tmp_path))
 
     tid = client.post("/agents/_/turns", json={"type": "message.received",
@@ -232,7 +232,7 @@ def test_background_sweeper_recovers_stranded_turn(tmp_path, monkeypatch):
     import time
 
     monkeypatch.setenv("RYA_TURN_SWEEP_SECONDS", "0.2")
-    scaffold.write_project(tmp_path, "turn-sweep-agent")
+    scaffold.write_project(tmp_path, "turn-sweep-agent", template="demo")
 
     from rya.store import open_store
     from rya.manifest import load_manifest as _lm
@@ -257,7 +257,7 @@ def test_background_sweeper_recovers_stranded_turn(tmp_path, monkeypatch):
 
 def test_reclaim_endpoint(tmp_path, monkeypatch):
     monkeypatch.setenv("RYA_TURN_STREAM_IDLE_SECONDS", "1")
-    scaffold.write_project(tmp_path, "turn-reclaim-agent")
+    scaffold.write_project(tmp_path, "turn-reclaim-agent", template="demo")
     app = build_app(tmp_path)
     client = TestClient(app)
 

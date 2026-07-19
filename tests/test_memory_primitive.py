@@ -12,7 +12,7 @@ from rya.tools.registry import default_registry as tools_registry
 
 
 def _ctx(tmp_path):
-    scaffold.write_project(tmp_path, "mem")
+    scaffold.write_project(tmp_path, "mem", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     store = Store(tmp_path); store.ensure()
     run = {"id": "run_mem", "journal": {}, "trace": []}

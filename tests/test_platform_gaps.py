@@ -19,7 +19,7 @@ from rya.store import Store
 
 
 def make_engine(tmp_path, mutate=None) -> Engine:
-    scaffold.write_project(tmp_path, "gap-agent")
+    scaffold.write_project(tmp_path, "gap-agent", template="demo")
     if mutate:
         p = tmp_path / "rya.agent.yaml"
         doc = yaml.safe_load(p.read_text())
@@ -166,7 +166,7 @@ def test_llm_respond_streams_tokens(tmp_path):
 
 
 def test_websocket_emits_token_frames(tmp_path):
-    scaffold.write_project(tmp_path, "ws-agent")
+    scaffold.write_project(tmp_path, "ws-agent", template="demo")
     client = TestClient(build_app(tmp_path))
     with client.websocket_connect("/ws") as ws:
         assert ws.receive_json()["type"] == "ready"

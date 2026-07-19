@@ -62,7 +62,7 @@ def test_login_and_drive_hosted_agent_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("RYA_HOME", str(tmp_path / "home"))
 
     project = tmp_path / "agent"
-    scaffold.write_project(project, "hosted")
+    scaffold.write_project(project, "hosted", template="demo")
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(build_app(project), host="127.0.0.1",
                                            port=port, log_level="warning", lifespan="on"))

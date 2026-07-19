@@ -155,7 +155,7 @@ def test_multi_tenant_http_isolation(tmp_path, monkeypatch):
     key_a = t.create_api_key(a)["key"]
     key_b = t.create_api_key(b)["key"]
 
-    scaffold.write_project(tmp_path, "mt-agent")
+    scaffold.write_project(tmp_path, "mt-agent", template="demo")
     c = TestClient(build_app(tmp_path))
 
     # No key -> 401.

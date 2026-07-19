@@ -18,7 +18,7 @@ def _app(tmp_path, monkeypatch, token=None):
         monkeypatch.delenv(k, raising=False)
     if token:
         monkeypatch.setenv("RYA_TOKEN", token)
-    scaffold.write_project(tmp_path, "mcp-remote")
+    scaffold.write_project(tmp_path, "mcp-remote", template="demo")
     return build_app(tmp_path)
 
 

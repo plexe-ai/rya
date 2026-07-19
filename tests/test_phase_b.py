@@ -121,7 +121,7 @@ def test_server_requires_jwt_when_configured(tmp_path, monkeypatch):
     monkeypatch.delenv("RYA_TOKEN", raising=False)
     monkeypatch.delenv("RYA_MULTITENANT", raising=False)
     monkeypatch.setenv("RYA_JWT_SECRET", "serversecret")
-    scaffold.write_project(tmp_path, "jwt-agent")
+    scaffold.write_project(tmp_path, "jwt-agent", template="demo")
     c = TestClient(build_app(tmp_path))
 
     assert c.post("/agents/x/events", json={"payload": {"email": "a@b.com"}}).status_code == 401

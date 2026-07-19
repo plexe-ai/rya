@@ -79,7 +79,7 @@ def test_slack_inbound_adapter(tmp_path, monkeypatch):
     monkeypatch.delenv("RYA_TOKEN", raising=False)
     monkeypatch.delenv("RYA_MULTITENANT", raising=False)
     monkeypatch.setenv("RYA_SLACK_SIGNING_SECRET", "shhh")
-    scaffold.write_project(tmp_path, "slackbot")
+    scaffold.write_project(tmp_path, "slackbot", template="demo")
     c = TestClient(build_app(tmp_path))
 
     # url_verification handshake (signed).

@@ -5,7 +5,7 @@ from rya.mcp import ops
 
 def test_mcp_full_flow(tmp_path):
     # create -> validate -> trigger -> approve, all via the MCP ops.
-    created = ops.create_agent("mcp-agent", str(tmp_path))
+    created = ops.create_agent("mcp-agent", str(tmp_path), template="demo")
     assert created["ok"] is True
     proj = created["path"]
 
@@ -30,7 +30,7 @@ def test_mcp_full_flow(tmp_path):
 
 
 def test_mcp_provision(tmp_path):
-    created = ops.create_agent("mcp-prov", str(tmp_path))
+    created = ops.create_agent("mcp-prov", str(tmp_path), template="demo")
     rep = ops.provision(created["path"], target="local")
     assert rep["ok"] is True
     keys = {c["key"] for c in rep["components"]}
@@ -39,7 +39,7 @@ def test_mcp_provision(tmp_path):
 
 
 def test_mcp_connect_vaults_secret(tmp_path):
-    created = ops.create_agent("mcp-conn", str(tmp_path))
+    created = ops.create_agent("mcp-conn", str(tmp_path), template="demo")
     proj = created["path"]
     r = ops.connect("github", scopes=["issues:write"], token="ghtok_secret_xyz", project_dir=proj)
     assert r["ok"] and "secret" not in r["connection"] and r["connection"]["secretSet"] is True
@@ -52,7 +52,7 @@ def test_mcp_connect_vaults_secret(tmp_path):
 
 
 def test_mcp_returns_structured_error(tmp_path):
-    created = ops.create_agent("err-agent", str(tmp_path))
+    created = ops.create_agent("err-agent", str(tmp_path), template="demo")
     res = ops.get_run_trace("run_nope", created["path"])
     assert res["ok"] is False
     assert res["error"]["code"] == "E_RUN_NOT_FOUND"
@@ -60,7 +60,7 @@ def test_mcp_returns_structured_error(tmp_path):
 
 
 def test_mcp_register_tool_rejects_duplicate(tmp_path):
-    created = ops.create_agent("dup-agent", str(tmp_path))
+    created = ops.create_agent("dup-agent", str(tmp_path), template="demo")
     proj = created["path"]
     ok = ops.register_tool("billing.refund", "approval_required", proj)
     assert ok["ok"] and ok["registered"] == "billing.refund"
@@ -78,7 +78,7 @@ def test_skill_modules_split():
 
 
 def test_mcp_context_snapshot(tmp_path):
-    created = ops.create_agent("ctx-agent", str(tmp_path))
+    created = ops.create_agent("ctx-agent", str(tmp_path), template="demo")
     proj = created["path"]
     ops.trigger_event("message.received", {"email": "ada@example.com"}, project_dir=proj)
     snap = ops.context(proj)

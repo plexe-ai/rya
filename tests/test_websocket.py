@@ -11,7 +11,7 @@ def _client(tmp_path, monkeypatch, token=None):
         monkeypatch.delenv(k, raising=False)
     if token:
         monkeypatch.setenv("RYA_TOKEN", token)
-    scaffold.write_project(tmp_path, "ws-agent")
+    scaffold.write_project(tmp_path, "ws-agent", template="demo")
     return TestClient(build_app(tmp_path))
 
 

@@ -8,7 +8,7 @@ from rya.store import Store
 
 
 def _setup(tmp_path):
-    scaffold.write_project(tmp_path, "prov")
+    scaffold.write_project(tmp_path, "prov", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
     store = Store(tmp_path)

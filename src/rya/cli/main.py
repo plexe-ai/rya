@@ -215,26 +215,29 @@ def whoami(json: bool = typer.Option(False, "--json")):
 @app.command()
 def create(
     name: str = typer.Argument(..., help="Project / agent name."),
+    template: str = typer.Option("minimal", "--template",
+                                 help="minimal (default: real seams, no mocked domain data) or demo (full showcase with mocked CRM domain)."),
     json: bool = typer.Option(False, "--json"),
     force: bool = typer.Option(False, "--force", help="Overwrite existing files."),
 ):
     """Scaffold a new agent project in ./<name>."""
     with guard(json):
         target = Path.cwd() / name
-        written = scaffold.write_project(target, name, overwrite=force)
-        emit(json, {"name": name, "path": str(target), "files": written,
-                    "next": [f"cd {name}", "rya dev", "rya events send --type message.received --payload '{\"email\":\"ada@example.com\"}'"]},
-             lambda: (console.print(f"[green]✓[/green] Created project [bold]{name}[/bold] at {target}"),
+        written = scaffold.write_project(target, name, overwrite=force, template=template)
+        emit(json, {"name": name, "path": str(target), "template": template, "files": written,
+                    "next": [f"cd {name}", "rya dev", "rya events send --type message.received --payload '{\"email\":\"ada@example.com\",\"body\":\"hello\"}'"]},
+             lambda: (console.print(f"[green]✓[/green] Created project [bold]{name}[/bold] at {target} ({template} template)"),
                       console.print("  next: [bold]cd " + name + " && rya dev[/bold]")))
 
 
 @app.command()
-def init(json: bool = typer.Option(False, "--json"), force: bool = typer.Option(False, "--force")):
+def init(json: bool = typer.Option(False, "--json"), force: bool = typer.Option(False, "--force"),
+         template: str = typer.Option("minimal", "--template", help="minimal or demo.")):
     """Scaffold a project in the current directory."""
     with guard(json):
         name = Path.cwd().name
-        written = scaffold.write_project(Path.cwd(), name, overwrite=force)
-        emit(json, {"name": name, "files": written},
+        written = scaffold.write_project(Path.cwd(), name, overwrite=force, template=template)
+        emit(json, {"name": name, "template": template, "files": written},
              lambda: console.print(f"[green]✓[/green] Initialized Rya project [bold]{name}[/bold] ({len(written)} files)"))
 
 

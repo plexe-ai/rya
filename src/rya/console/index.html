@@ -805,7 +805,7 @@ function renderTools(){
   const body=document.getElementById('toolsBody');
   if(!TOOL_EFF){
     body.innerHTML = table(['Tool','Permission','Side effects','Secret','Calls'],
-      src.map(t=>[`<span class="mono">${esc(t.id)}</span>`,`<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
+      src.map(t=>[`<span class="mono">${esc(t.id)}</span>${t.mockImpl?' <span class="ptag" style="color:var(--amber)" title="deterministic mock implementation - demo data, not real IO">mock</span>':''}`,`<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
         t.externalSideEffects?'external':'<span class="dim">none</span>',
         (t.requiredSecrets&&t.requiredSecrets.length)?`<span class="mono dim">${esc(t.requiredSecrets.join(', '))}</span>`:'<span class="dim">—</span>',
         String(t.calls)]));
@@ -817,7 +817,7 @@ function renderTools(){
       const btn = ep!=='disabled'
         ? `<button class="btn sm" onclick="toolSwitch('${jss(t.id)}','disabled')"><i data-lucide="power-off"></i>Disable</button>`
         : `<button class="btn sm" onclick="toolSwitch('${jss(t.id)}','clear')"><i data-lucide="power"></i>Restore</button>`;
-      return [`<span class="mono">${esc(t.id)}</span>`,
+      return [`<span class="mono">${esc(t.id)}</span>${t.mockImpl?' <span class="ptag" style="color:var(--amber)" title="deterministic mock implementation - demo data, not real IO">mock</span>':''}`,
         `<span class="pb ${PB[t.permission]}">${esc(t.permission)}</span>`,
         `<span class="pb ${PB[ep]}">${esc(ep)}</span>${overridden?' <span class="ptag" title="runtime override active">override v'+esc(String(e.override.version))+'</span>':''}`,
         t.externalSideEffects?'external':'<span class="dim">none</span>',

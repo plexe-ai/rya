@@ -12,7 +12,7 @@ from rya.store import Store
 
 
 def _project(tmp_path):
-    scaffold.write_project(tmp_path, "ev")
+    scaffold.write_project(tmp_path, "ev", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
     store = Store(tmp_path); store.ensure()
@@ -20,7 +20,7 @@ def _project(tmp_path):
 
 
 def test_scaffold_ships_evals(tmp_path):
-    scaffold.write_project(tmp_path, "ev")
+    scaffold.write_project(tmp_path, "ev", template="demo")
     assert (tmp_path / "rya.evals.yaml").exists()
     cases = load_evals(tmp_path)
     assert {c["id"] for c in cases} >= {"high_risk_pauses_for_approval", "handles_event_without_error"}

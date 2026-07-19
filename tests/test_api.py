@@ -16,7 +16,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.delenv("RYA_TOKEN", raising=False)
     monkeypatch.delenv("RYA_WEBHOOK_SECRET", raising=False)
     monkeypatch.delenv("RYA_DATABASE_URL", raising=False)
-    scaffold.write_project(tmp_path, "api-agent")
+    scaffold.write_project(tmp_path, "api-agent", template="demo")
     return TestClient(build_app(tmp_path)), tmp_path, monkeypatch
 
 

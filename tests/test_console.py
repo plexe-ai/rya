@@ -14,12 +14,12 @@ from rya.store import Store
 def _client(tmp_path, monkeypatch):
     for k in ("RYA_TOKEN", "RYA_MULTITENANT", "RYA_DATABASE_URL", "RYA_JWT_SECRET"):
         monkeypatch.delenv(k, raising=False)
-    scaffold.write_project(tmp_path, "console-agent")
+    scaffold.write_project(tmp_path, "console-agent", template="demo")
     return TestClient(build_app(tmp_path)), tmp_path
 
 
 def test_build_console_shape(tmp_path):
-    scaffold.write_project(tmp_path, "agg")
+    scaffold.write_project(tmp_path, "agg", template="demo")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
     agent = load_agent(manifest, tmp_path)
     engine = Engine(manifest, agent, Store(tmp_path), tmp_path)

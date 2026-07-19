@@ -2,6 +2,16 @@
 
 Generates a project that runs end-to-end immediately: ``rya create x`` then
 ``cd x`` then ``rya dev`` then ``rya events send`` works with no edits.
+
+Two templates:
+
+- ``minimal`` (the default): a clean, production-shaped assistant with NO mocked
+  domain data - real seams only (LLM provider, sessions, memory, the real
+  ``web.fetch`` built-in, and a project-defined tool). What you deploy.
+- ``demo``: the fully-featured showcase (fake CRM lookup, churn model, approval
+  gate, cron) whose domain tools are deterministic mocks. Useful for learning
+  every primitive offline - and it is what the test-suite exercises - but it is
+  a demo, not a starting point for production.
 """
 
 from __future__ import annotations
@@ -263,25 +273,189 @@ evals:
 """
 
 
-def scaffold_files(name: str) -> Dict[str, str]:
-    return {
-        "rya.agent.yaml": MANIFEST_TEMPLATE.format(name=name),
-        "rya.guard.yaml": GUARD_TEMPLATE,
-        "rya.evals.yaml": EVALS_TEMPLATE,
-        "pyproject.toml": PYPROJECT_TEMPLATE.format(name=name),
-        ".env.example": ENV_TEMPLATE,
-        ".env": ENV_TEMPLATE,
-        "README.md": README_TEMPLATE.format(name=name),
-        "src/agent.py": AGENT_TEMPLATE,
-        "src/tools.py": TOOLS_TEMPLATE,
-        "src/models.py": MODELS_TEMPLATE,
-        "tests/test_agent.py": TEST_TEMPLATE,
-    }
+# ---- minimal template (the default): no mocked domain data -------------------
+
+MINIMAL_MANIFEST_TEMPLATE = """\
+name: {name}
+runtime: python
+entrypoint: src/agent.py
+version: 0.1.0
+environment: local
+owner: you@example.com
+instructions: >
+  A minimal, production-shaped assistant. Real seams only: the LLM provider
+  (offline mock without a key, real Claude/GPT with one), durable sessions,
+  scoped memory, the real web.fetch built-in, and a tool implemented in this
+  project. No mocked domain data.
+
+model:
+  default: mock-llm        # placeholder name: resolves to a real model when a provider key is set
+  fallback: mock-llm-mini
+
+memory:
+  type: managed
+  collections:
+    - conversations
+
+tools:
+  - id: web.fetch          # REAL built-in: guarded HTTP fetch (Action Guard applies)
+    permission: read_only
+  - id: notes.save         # implemented in src/agent.py via @agent.tool - your code, not a mock
+    permission: allowed
+
+channels:
+  - type: webhook
+    path: /inbound
+
+approvals:
+  default: required_for_external_actions
+
+observability:
+  logs: true
+  traces: true
+  audit: true
+"""
+
+MINIMAL_AGENT_TEMPLATE = '''\
+"""A minimal, production-shaped assistant - no mocked domain data.
+
+Every side effect goes through ctx.*, so runs are durable, replayable, and
+traced. Grow it the real way:
+
+- add tools as @agent.tool functions (your code) or `url:` HTTP tools in the
+  manifest (scoped credentials injected by the runtime),
+- gate external actions with ctx.approvals.request (pauses durably for a human),
+- add per-purpose models under model.routes, cron triggers, and evals.
+"""
+
+from rya import define_agent
+
+agent = define_agent()
 
 
-def write_project(target: Path, name: str, *, overwrite: bool = False) -> list[str]:
+@agent.on_event
+async def handle_event(ctx, event):
+    channel = event.payload.get("channel", "web")
+    external_id = event.payload.get("externalId") or event.payload.get("email") or "anonymous"
+    body = event.payload.get("body") or "(empty message)"
+
+    session = await ctx.sessions.get_or_create(channel, external_id, title=external_id)
+    await ctx.sessions.append(session["id"], "user", body)
+
+    reply = await ctx.llm.respond(
+        system="You are a concise, honest assistant. If you do not know, say so.",
+        input={"message": body},
+    )
+    await ctx.sessions.append(session["id"], "assistant", reply.text)
+    await ctx.tools.call("notes.save", {"note": f"replied on {channel} to {external_id}"})
+    return {"session": session["id"], "reply": reply.text}
+
+
+@agent.tool("notes.save")
+async def notes_save(input):
+    """A REAL tool: this is your project's code, not a registry mock."""
+    return {"saved": True, "note": input.get("note", "")}
+'''
+
+MINIMAL_TEST_TEMPLATE = '''\
+"""Smoke test: an inbound message produces a completed, traced run."""
+
+from pathlib import Path
+
+from rya.manifest import load_manifest
+from rya.runtime import Engine, load_agent
+from rya.store import Store
+
+
+def test_message_run_completes():
+    root = Path(__file__).resolve().parents[1]
+    manifest = load_manifest(root / "rya.agent.yaml")
+    agent = load_agent(manifest, root)
+    engine = Engine(manifest, agent, Store(root), root)
+
+    run = engine.run_event("message.received", {"email": "ada@example.com", "body": "hello"})
+    assert run["status"] == "completed"
+    assert any(e["kind"] == "llm.respond" for e in run["trace"])
+'''
+
+MINIMAL_EVALS_TEMPLATE = """\
+# Eval suite - run with `rya eval`. Each case fires a real event and scores the
+# resulting run; `rya eval` exits non-zero on failure so a deploy can gate on it.
+evals:
+  - id: replies_without_error
+    trigger:
+      type: message.received
+      payload: { email: "ada@example.com", body: "quick question" }
+    expect:
+      status: completed
+      no_failure: true
+      max_tokens: 100000                # cost guardrail
+"""
+
+MINIMAL_ENV_TEMPLATE = """\
+# Secrets are read from here by the runtime and ctx.secrets.get(NAME).
+# Never commit real values. Set a provider key to use a real model:
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+"""
+
+MINIMAL_README_TEMPLATE = """\
+# {name}
+
+A Rya agent project (minimal template - real seams, no mocked domain data).
+
+```bash
+rya dev                                   # validate + inspect the agent
+rya events send --type message.received \\
+  --payload '{{"email":"ada@example.com","body":"hello"}}'
+rya runs list                             # see the run
+rya runs trace <run_id>                   # full journaled trace
+```
+
+Without a provider key the LLM is an offline mock (clearly labeled in output);
+set ANTHROPIC_API_KEY or OPENAI_API_KEY in `.env` to use a real model.
+
+Want the fully-featured showcase (approval gate, cron, custom model, mocked
+CRM domain)? `rya create <name> --template demo`.
+
+Add `--json` to any command for machine-readable output.
+"""
+
+
+def scaffold_files(name: str, template: str = "minimal") -> Dict[str, str]:
+    if template == "demo":
+        return {
+            "rya.agent.yaml": MANIFEST_TEMPLATE.format(name=name),
+            "rya.guard.yaml": GUARD_TEMPLATE,
+            "rya.evals.yaml": EVALS_TEMPLATE,
+            "pyproject.toml": PYPROJECT_TEMPLATE.format(name=name),
+            ".env.example": ENV_TEMPLATE,
+            ".env": ENV_TEMPLATE,
+            "README.md": README_TEMPLATE.format(name=name),
+            "src/agent.py": AGENT_TEMPLATE,
+            "src/tools.py": TOOLS_TEMPLATE,
+            "src/models.py": MODELS_TEMPLATE,
+            "tests/test_agent.py": TEST_TEMPLATE,
+        }
+    if template == "minimal":
+        return {
+            "rya.agent.yaml": MINIMAL_MANIFEST_TEMPLATE.format(name=name),
+            "rya.guard.yaml": GUARD_TEMPLATE,
+            "rya.evals.yaml": MINIMAL_EVALS_TEMPLATE,
+            "pyproject.toml": PYPROJECT_TEMPLATE.format(name=name),
+            ".env.example": MINIMAL_ENV_TEMPLATE,
+            ".env": MINIMAL_ENV_TEMPLATE,
+            "README.md": MINIMAL_README_TEMPLATE.format(name=name),
+            "src/agent.py": MINIMAL_AGENT_TEMPLATE,
+            "tests/test_agent.py": MINIMAL_TEST_TEMPLATE,
+        }
+    raise ValueError(f"unknown scaffold template '{template}' (have: minimal, demo)")
+
+
+def write_project(target: Path, name: str, *, overwrite: bool = False,
+                  template: str = "minimal") -> list[str]:
     written = []
-    for rel, content in scaffold_files(name).items():
+    for rel, content in scaffold_files(name, template).items():
         path = target / rel
         if path.exists() and not overwrite:
             continue

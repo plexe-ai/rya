@@ -445,9 +445,16 @@ class _LLM:
         usable = sorted(allowed & want)
         def _tool_def(tid):
             spec = self._ctx._tools.get(tid)
-            desc = (spec.description if spec else None) or next(
-                (d.description for d in self._ctx.manifest.tools if d.id == tid), None) or tid
-            schema = (spec.input_schema if spec else None) or {"type": "object"}
+            decl = next((d for d in self._ctx.manifest.tools if d.id == tid), None)
+            desc = (decl.description if decl else None) or (spec.description if spec else None) or tid
+            # Schema precedence: manifest decl > @agent.tool(input_schema=...) >
+            # registry spec > empty object. First match with real properties lets
+            # the model use correct argument names instead of guessing.
+            agent_schema = self._ctx._agent.tool_schema(tid) if self._ctx._agent else None
+            schema = ((decl.input_schema if decl else None)
+                      or agent_schema
+                      or (spec.input_schema if spec else None)
+                      or {"type": "object"})
             return {"name": tid, "description": desc, "input_schema": schema}
         tool_defs = [_tool_def(tid) for tid in usable]
 

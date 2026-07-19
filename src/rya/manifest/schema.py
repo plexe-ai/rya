@@ -83,6 +83,10 @@ class ToolDecl(BaseModel):
     #   "identity.sub"          - the verified caller identity
     #   anything else           - a literal value
     pin: dict[str, str] = Field(default_factory=dict)
+    # JSON Schema for the tool's arguments. Given to the model in ctx.llm.run so
+    # it uses the RIGHT argument names/types instead of guessing. Pinned args are
+    # server-supplied, so they need not appear here.
+    input_schema: Optional[dict] = None
 
 
 class ModelDecl(BaseModel):

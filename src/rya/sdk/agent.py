@@ -34,6 +34,7 @@ class Agent:
         self._job_handlers: Dict[str, Callable] = {}
         self._cron_handlers: Dict[str, Callable] = {}
         self._tool_handlers: Dict[str, Callable] = {}
+        self._tool_schemas: Dict[str, dict] = {}
 
     # ---- decorators ----------------------------------------------------
     def on_event(self, fn: Callable) -> Callable:
@@ -50,15 +51,22 @@ class Agent:
 
         return deco
 
-    def tool(self, tool_id: str) -> Callable:
+    def tool(self, tool_id: str, input_schema: Optional[dict] = None) -> Callable:
         """Register a real tool implementation: ``async def fn(input) -> dict``.
 
         The handler is a leaf — it may do real IO (HTTP, DB, read env for secrets)
         but must not call journaled ``ctx`` operations (durable-replay rule).
+
+        Pass ``input_schema`` (a JSON Schema) to declare the tool's arguments, so
+        the model in ``ctx.llm.run`` uses the right argument names/types instead
+        of guessing. A manifest ``input_schema`` on the same tool takes
+        precedence over this.
         """
 
         def deco(fn: Callable) -> Callable:
             self._tool_handlers[tool_id] = fn
+            if input_schema is not None:
+                self._tool_schemas[tool_id] = input_schema
             return fn
 
         return deco
@@ -84,6 +92,9 @@ class Agent:
 
     def tool_handler(self, tool_id: str) -> Optional[Callable]:
         return self._tool_handlers.get(tool_id)
+
+    def tool_schema(self, tool_id: str) -> Optional[dict]:
+        return self._tool_schemas.get(tool_id)
 
 
 def define_agent(name: Optional[str] = None) -> Agent:

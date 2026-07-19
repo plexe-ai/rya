@@ -165,7 +165,7 @@ class Engine:
 
     # ---- execution -----------------------------------------------------
     def run_event(self, type: str, payload: dict, source: str = "manual", identity=None,
-                  on_trace=None, on_token=None) -> dict:
+                  on_trace=None, on_token=None, on_ui=None) -> dict:
         handler = self.agent.event_handler()
         if handler is None:
             raise RyaError(
@@ -178,7 +178,7 @@ class Engine:
         if identity is not None:
             run["identity"] = identity.to_dict() if hasattr(identity, "to_dict") else identity
         return self._execute(run, handler, Event.from_dict(event), identity=identity,
-                             on_trace=on_trace, on_token=on_token)
+                             on_trace=on_trace, on_token=on_token, on_ui=on_ui)
 
     def run_job(self, job_id: str) -> dict:
         job = self.store.get_job(job_id)
@@ -265,7 +265,7 @@ class Engine:
         run = self._new_run("cron", event)
         return self._execute(run, handler, Event.from_dict(event))
 
-    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None) -> dict:
+    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None, on_ui=None) -> dict:
         ctx = RuntimeContext(
             store=self.store,
             manifest=self.manifest,
@@ -277,6 +277,7 @@ class Engine:
             agent=self.agent,
             on_trace=on_trace,
             on_token=on_token,
+            on_ui=on_ui,
         )
 
         async def invoke():
@@ -371,7 +372,7 @@ class Engine:
         spec = self.tools.get(tool)
         return spec.fn(inp) if spec is not None else None
 
-    def approve(self, approval_id: str, on_trace=None, on_token=None) -> dict:
+    def approve(self, approval_id: str, on_trace=None, on_token=None, on_ui=None) -> dict:
         approval = self.store.get_approval(approval_id)
         if approval is None:
             raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
@@ -429,7 +430,7 @@ class Engine:
             ident = run["identity"]
             identity = Identity(sub=ident["sub"], claims=ident)
         return self._execute(run, handler, arg, identity=identity,
-                             on_trace=on_trace, on_token=on_token)
+                             on_trace=on_trace, on_token=on_token, on_ui=on_ui)
 
     def reject(self, approval_id: str) -> dict:
         approval = self.store.get_approval(approval_id)

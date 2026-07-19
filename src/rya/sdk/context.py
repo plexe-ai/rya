@@ -125,6 +125,7 @@ class RuntimeContext:
         agent=None,
         on_trace=None,
         on_token=None,
+        on_ui=None,
     ) -> None:
         self.store = store
         # Optional live trace subscriber — fired on every trace event as it
@@ -134,6 +135,10 @@ class RuntimeContext:
         # Tokens are NOT journaled (only the final response is), so a replay
         # after an approval pause never re-streams.
         self._on_token = on_token
+        # Optional UI subscriber — fired when the handler emits a custom UI frame
+        # (a card, form, chart) via ctx.emit_ui. Journaled through _step, so a
+        # replay after an approval pause never re-emits it.
+        self._on_ui = on_ui
         self.manifest = manifest
         self.run = run
         self._tools = tools
@@ -221,6 +226,26 @@ class RuntimeContext:
                 self._on_trace(entry)
             except Exception:  # never let a subscriber break the run
                 pass
+
+    def emit_ui(self, component: str, data: Optional[dict] = None) -> dict:
+        """Emit a first-class UI frame to the turn stream — a card, form, chart,
+        or any component the frontend renders. Lands as a ``ui`` frame (SSE
+        ``event: ui`` / WebSocket ``{"type":"ui"}``) with ``{component, data}``,
+        so the client never has to scrape tool-call traces to build custom UI.
+
+        Journaled: a replay after an approval pause returns the recorded frame
+        and does NOT re-emit, exactly like tool/model steps."""
+        payload = {"component": component, "data": self._redact(data or {})}
+
+        def run():
+            if self._on_ui is not None:
+                try:
+                    self._on_ui(payload)
+                except Exception:  # never let a subscriber break the run
+                    pass
+            return payload
+
+        return self._step("ui.emit", component, run, {"component": component})
 
     # ---- secret redaction ---------------------------------------------
     def _seed_secret(self, value) -> None:

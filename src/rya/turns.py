@@ -62,9 +62,12 @@ def _run_turn(engine, job: dict, worker_id: str) -> None:
     def on_token(chunk):
         store.stream_append(turn_id, [{"kind": "token", "data": {"text": chunk}}])
 
+    def on_ui(frame):
+        store.stream_append(turn_id, [{"kind": "ui", "data": frame}])
+
     try:
         run = engine.run_event(ev.get("type", "message.received"), ev.get("payload", {}),
-                               source="turn", on_trace=on_trace, on_token=on_token)
+                               source="turn", on_trace=on_trace, on_token=on_token, on_ui=on_ui)
         if run["status"] == "waiting_approval":
             # Tag the paused run with its turn so the approval resolution can
             # stream the continuation onto this same buffer (resolve_on_stream).
@@ -128,6 +131,7 @@ def resolve_on_stream(engine, approval_id: str, approve: bool = True) -> dict:
             approval_id,
             on_trace=lambda ev: store.stream_append(turn_id, [{"kind": "trace", "data": ev}]),
             on_token=lambda ch: store.stream_append(turn_id, [{"kind": "token", "data": {"text": ch}}]),
+            on_ui=lambda frame: store.stream_append(turn_id, [{"kind": "ui", "data": frame}]),
         )
         ev = resumed.get("event") or {}
         _append_session_replies(engine, turn_id, ev.get("payload") or {}, resumed)

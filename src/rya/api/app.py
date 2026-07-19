@@ -472,9 +472,14 @@ def build_app(root: Path) -> FastAPI:
                     futs.append(asyncio.run_coroutine_threadsafe(
                         websocket.send_json({"type": "token", "text": chunk}), loop))
 
+                # Custom UI frames emitted by the handler via ctx.emit_ui.
+                def on_ui(frame):
+                    futs.append(asyncio.run_coroutine_threadsafe(
+                        websocket.send_json({"type": "ui", **frame}), loop))
+
                 try:
                     run = await asyncio.to_thread(
-                        engine.run_event, event_type, payload, "websocket", None, on_trace, on_token)
+                        engine.run_event, event_type, payload, "websocket", None, on_trace, on_token, on_ui)
                 except RyaError as e:
                     await websocket.send_json({"type": "error", **e.to_dict()["error"]})
                     continue
@@ -538,7 +543,8 @@ def build_app(root: Path) -> FastAPI:
             try:
                 run = engine.run_event(event_type, payload, "sse", identity=identity,
                                        on_trace=lambda ev: emit("trace", ev),
-                                       on_token=lambda chunk: emit("token", {"text": chunk}))
+                                       on_token=lambda chunk: emit("token", {"text": chunk}),
+                                       on_ui=lambda frame: emit("ui", frame))
                 # Chat agents: surface assistant messages this run wrote, BEFORE
                 # the terminal summary (same contract as the WebSocket).
                 if hasattr(engine.store, "find_session") and isinstance(payload, dict) \

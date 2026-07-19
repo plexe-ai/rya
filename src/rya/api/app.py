@@ -786,6 +786,62 @@ def build_app(root: Path) -> FastAPI:
     def list_runs(agent_id: str, engine: Engine = Depends(get_engine)):
         return {"runs": engine.store.list_runs(manifest.name)}
 
+    @api.post("/runs/ingest")
+    async def ingest_run(request: Request, engine: Engine = Depends(get_engine)):
+        """Ingest a run that executed OUTSIDE Rya (an external agent loop), so
+        its trace shows in Runs & traces next to native runs - the single-pane
+        step of a sidecar migration. The caller maps its events onto Rya's
+        trace vocabulary (tool.call, llm.respond {result: {model, usage}}, log,
+        run.completed...); token usage and cost then render natively. The
+        caller is responsible for scrubbing PII before shipping.
+
+        Body: {trigger?, status, event?, error?, createdAt?, source?,
+               agentVersion?, trace: [{kind, label?, ts?, data?}, ...]}
+        """
+        from ..store import now_iso
+        body = await request.json()
+        status = body.get("status")
+        if status not in ("completed", "failed", "running", "waiting_approval", "rejected"):
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION",
+                "message": "status must be one of completed|failed|running|waiting_approval|rejected."})
+        raw_trace = body.get("trace")
+        if not isinstance(raw_trace, list) or not raw_trace or len(raw_trace) > 1000:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "trace must be a non-empty list (max 1000 events)."})
+        trace = []
+        for i, ev in enumerate(raw_trace):
+            if not isinstance(ev, dict) or not ev.get("kind"):
+                raise HTTPException(status_code=400, detail={
+                    "code": "E_VALIDATION", "message": f"trace[{i}] must be an object with a 'kind'."})
+            trace.append({"seq": i, "ts": str(ev.get("ts") or now_iso())[:32],
+                          "kind": str(ev["kind"])[:60], "label": str(ev.get("label") or "")[:200],
+                          "data": ev.get("data") if isinstance(ev.get("data"), dict) else {}})
+        run = {
+            "id": engine.store.new_run_id(),
+            "agent": manifest.name,
+            "agentVersion": str(body.get("agentVersion") or "external")[:40],
+            "trigger": str(body.get("trigger") or "ingested")[:60],
+            "status": status,
+            "event": body.get("event") if isinstance(body.get("event"), dict) else None,
+            "job": None, "journal": {}, "trace": trace,
+            "pendingApproval": None,
+            "error": body.get("error") if isinstance(body.get("error"), dict) else None,
+            "scheduledJobs": [], "parentRunId": None,
+            "createdAt": str(body.get("createdAt") or now_iso())[:32],
+            "ingested": True,
+            "sourceSystem": str(body.get("source") or "external")[:60],
+        }
+        engine.store.save_run(run)
+        # Onward export (Langfuse/OTLP/webhook) like any finished run - best effort.
+        if status in ("completed", "failed", "rejected"):
+            try:
+                from ..observability.export import export_run
+                export_run(run)
+            except Exception:
+                pass
+        return {"ok": True, "runId": run["id"], "events": len(trace)}
+
     @api.get("/runs/{run_id}")
     def get_run(run_id: str, engine: Engine = Depends(get_engine)):
         run = engine.store.get_run(run_id)

@@ -340,6 +340,18 @@ def _anthropic_chat(name, system, messages, tools, temperature, max_tokens) -> d
             amsgs.append({"role": "user", "content": [{"type": "tool_result",
                           "tool_use_id": m.get("toolUseId", "call_1"),
                           "content": _stringify(m["content"])}]})
+        elif m["role"] == "assistant" and m.get("toolCalls"):
+            # Reconstruct the tool_use content blocks so the following
+            # tool_result messages have their matching tool_use (required by
+            # Anthropic; without this a multi-tool ctx.llm.run turn 400s).
+            content = []
+            if m.get("content"):
+                content.append({"type": "text", "text": m["content"] if isinstance(m["content"], str)
+                                else _stringify(m["content"])})
+            for c in m["toolCalls"]:
+                content.append({"type": "tool_use", "id": c.get("id", "call_1"),
+                                "name": c.get("name"), "input": c.get("input") or {}})
+            amsgs.append({"role": "assistant", "content": content})
         else:
             amsgs.append({"role": m["role"], "content": m["content"] if isinstance(m["content"], str)
                           else _stringify(m["content"])})
@@ -370,6 +382,14 @@ def _openai_chat(name, system, messages, tools, temperature, max_tokens) -> dict
         if m["role"] == "tool":
             omsgs.append({"role": "tool", "tool_call_id": m.get("toolUseId", "call_1"),
                           "content": _stringify(m["content"])})
+        elif m["role"] == "assistant" and m.get("toolCalls"):
+            # Attach the assistant's tool_calls so the following tool messages
+            # have their matching call (required by OpenAI).
+            omsgs.append({"role": "assistant", "content": m.get("content") or None,
+                          "tool_calls": [{"id": c.get("id", "call_1"), "type": "function",
+                                          "function": {"name": c.get("name"),
+                                                       "arguments": json.dumps(c.get("input") or {})}}
+                                         for c in m["toolCalls"]]})
         else:
             omsgs.append({"role": m["role"], "content": m["content"] if isinstance(m["content"], str)
                           else _stringify(m["content"])})

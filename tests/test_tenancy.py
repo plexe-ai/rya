@@ -174,3 +174,68 @@ def test_multi_tenant_http_isolation(tmp_path, monkeypatch):
     # Tenant A sees its own.
     a_runs = c.get("/agents/mt-agent/runs", headers={"Authorization": f"Bearer {key_a}"}).json()["runs"]
     assert any(r["id"] == run_a["runId"] for r in a_runs)
+
+
+def test_workspace_membership_invite_and_claim(tmp_path, monkeypatch):
+    """Team access: owner invites an email; the teammate signs up later, lands
+    in the shared workspace, and can mint their own key for it."""
+    from fastapi.testclient import TestClient
+    from rya.api.app import build_app
+    from rya.cli import scaffold
+    from rya.tenancy import Tenancy
+    import psycopg
+
+    monkeypatch.setenv("RYA_DATABASE_URL", PG)
+    monkeypatch.setenv("RYA_MULTITENANT", "1")
+
+    t = Tenancy(PG)
+    t.setup()
+    with psycopg.connect(PG, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("TRUNCATE rya_runs, rya_approvals, rya_jobs, rya_memory")
+        cur.execute("TRUNCATE rya_workspace_members, rya_api_keys, rya_users CASCADE")
+        cur.execute("TRUNCATE rya_workspaces CASCADE")
+
+    scaffold.write_project(tmp_path, "team-agent", template="demo")
+    client = TestClient(build_app(tmp_path))
+
+    # Owner signs up -> workspace + session.
+    owner = client.post("/v1/signup", json={"email": "owner@csa.test",
+                                            "password": "password123",
+                                            "workspaceName": "ChatStudyAbroad"}).json()
+    ws_id = owner["workspace"]["id"]
+    oh = {"Authorization": "Bearer " + owner["token"]}
+
+    # Owner invites a teammate who has NO account yet.
+    r = client.post(f"/v1/workspaces/{ws_id}/members", json={"email": "teammate@csa.test"},
+                    headers=oh)
+    assert r.status_code == 200 and r.json()["claimed"] is False
+
+    # Teammate signs up -> the invite is claimed; shared workspace is listed
+    # as 'member' next to their own.
+    mate = client.post("/v1/signup", json={"email": "teammate@csa.test",
+                                           "password": "password123",
+                                           "workspaceName": "My own"}).json()
+    login = client.post("/v1/login", json={"email": "teammate@csa.test",
+                                           "password": "password123"}).json()
+    roles = {w["id"]: w["role"] for w in login["workspaces"]}
+    assert roles[ws_id] == "member"
+    assert roles[mate["workspace"]["id"]] == "owner"
+
+    # Teammate mints a key for the SHARED workspace and uses it.
+    mh = {"Authorization": "Bearer " + login["token"]}
+    k = client.post(f"/v1/workspaces/{ws_id}/keys", json={}, headers=mh).json()
+    assert k["apiKey"].startswith("rya_sk_")
+    tools = client.get("/tools", headers={"Authorization": "Bearer " + k["apiKey"]})
+    assert tools.status_code == 200
+
+    # A member cannot invite; a stranger cannot mint a key.
+    r = client.post(f"/v1/workspaces/{ws_id}/members", json={"email": "x@y.test"}, headers=mh)
+    assert r.status_code == 403
+    stranger = client.post("/v1/signup", json={"email": "stranger@nowhere.test",
+                                               "password": "password123"}).json()
+    sh = {"Authorization": "Bearer " + stranger["token"]}
+    assert client.post(f"/v1/workspaces/{ws_id}/keys", json={}, headers=sh).status_code == 403
+
+    # Owner sees the member list with claim state.
+    members = client.get(f"/v1/workspaces/{ws_id}/members", headers=oh).json()["members"]
+    assert members[0]["email"] == "teammate@csa.test" and members[0]["claimed"] is True

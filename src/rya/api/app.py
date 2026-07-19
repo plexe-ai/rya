@@ -1189,6 +1189,8 @@ def build_app(root: Path) -> FastAPI:
             raise HTTPException(status_code=401, detail={"code": "E_UNAUTHORIZED",
                 "message": "Invalid email or password."})
         token = issue_session(user["id"], user["email"])
+        # Claim any invites sent to this email before the account existed.
+        tenancy.claim_invites(user["email"], user["id"])
         return {"ok": True, "token": token, "user": user,
                 "workspaces": tenancy.list_user_workspaces(user["id"])}
 
@@ -1208,6 +1210,58 @@ def build_app(root: Path) -> FastAPI:
         body = await request.json()
         ws = tenancy.create_workspace(body.get("name") or "Workspace", owner_user_id=s["sub"])
         key = tenancy.create_api_key(ws["id"], label=body.get("label", "default"))
+        return {"ok": True, "workspace": ws, "apiKey": key["key"]}
+
+    # ---- team access: invites + per-workspace keys ------------------------
+    def _require_access(ws_id: str, user_id: str, need_owner: bool = False) -> str:
+        role = tenancy.workspace_access(ws_id, user_id)
+        if role is None or (need_owner and role != "owner"):
+            raise HTTPException(status_code=403, detail={
+                "code": "E_UNAUTHORIZED",
+                "message": "You are not " + ("the owner of" if need_owner else "a member of") + " this workspace."})
+        return role
+
+    @api.post("/v1/workspaces/{ws_id}/members")
+    async def invite_workspace_member(ws_id: str, request: Request,
+                                      authorization: Optional[str] = Header(None),
+                                      x_rya_session: Optional[str] = Header(None)):
+        """Owner invites a teammate by email. If the account exists, access is
+        immediate; otherwise the invite is claimed automatically at signup."""
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"], need_owner=True)
+        body = await request.json()
+        try:
+            m = tenancy.invite_member(ws_id, body.get("email"), invited_by=s["sub"])
+        except RyaError as e:
+            raise HTTPException(status_code=400, detail=e.to_dict()["error"])
+        return {"ok": True, **m}
+
+    @api.get("/v1/workspaces/{ws_id}/members")
+    def list_workspace_members(ws_id: str, authorization: Optional[str] = Header(None),
+                               x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"])
+        return {"members": tenancy.list_members(ws_id)}
+
+    @api.post("/v1/workspaces/{ws_id}/keys")
+    async def mint_workspace_key(ws_id: str, request: Request,
+                                 authorization: Optional[str] = Header(None),
+                                 x_rya_session: Optional[str] = Header(None)):
+        """Mint an API key for an EXISTING workspace the caller can access
+        (owner or member) - this is how an invited teammate opens the shared
+        workspace in the console."""
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"])
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        key = tenancy.create_api_key(ws_id, label=(body or {}).get("label") or s["email"])
+        ws = next((w for w in tenancy.list_user_workspaces(s["sub"]) if w["id"] == ws_id), {"id": ws_id})
         return {"ok": True, "workspace": ws, "apiKey": key["key"]}
 
     # Mount remote MCP last so its catch-all under /mcp doesn't shadow API routes.

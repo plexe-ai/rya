@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS rya_api_keys (
     label TEXT,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS rya_workspace_members (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES rya_workspaces(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    user_id TEXT,               -- NULL until the invite is claimed at signup/login
+    role TEXT NOT NULL DEFAULT 'member',
+    invited_by TEXT,
+    created_at TEXT,
+    UNIQUE (workspace_id, email)
+);
 """
 
 
@@ -202,14 +212,81 @@ class Tenancy:
         return {"id": row[0], "email": email}
 
     def list_user_workspaces(self, user_id: str) -> List[dict]:
+        """Workspaces the user OWNS plus those they are a MEMBER of (claimed invites)."""
         with self._conn.cursor() as cur:
-            cur.execute("SELECT id, name, created_at FROM rya_workspaces WHERE owner_user_id=%s ORDER BY created_at",
-                        (user_id,))
-            return [{"id": r[0], "name": r[1], "createdAt": r[2]} for r in cur.fetchall()]
+            cur.execute(
+                """SELECT id, name, created_at, 'owner' AS role FROM rya_workspaces
+                   WHERE owner_user_id=%s
+                   UNION
+                   SELECT w.id, w.name, w.created_at, m.role FROM rya_workspaces w
+                   JOIN rya_workspace_members m ON m.workspace_id = w.id
+                   WHERE m.user_id=%s
+                   ORDER BY created_at""",
+                (user_id, user_id))
+            return [{"id": r[0], "name": r[1], "createdAt": r[2], "role": r[3]}
+                    for r in cur.fetchall()]
+
+    # ---- team membership (invites) --------------------------------------
+    def invite_member(self, workspace_id: str, email: str, invited_by: str) -> dict:
+        """Invite an email to a workspace. Idempotent per (workspace, email).
+        If the account already exists, membership is effective immediately;
+        otherwise the invite is claimed automatically at signup/login."""
+        from .errors import RyaError
+        email = (email or "").strip().lower()
+        if not email or "@" not in email:
+            raise RyaError("E_VALIDATION", "A valid email is required.")
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id FROM rya_users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            uid = row[0] if row else None
+            cur.execute(
+                """INSERT INTO rya_workspace_members
+                       (id, workspace_id, email, user_id, role, invited_by, created_at)
+                   VALUES (%s, %s, %s, %s, 'member', %s, %s)
+                   ON CONFLICT (workspace_id, email) DO UPDATE SET user_id=EXCLUDED.user_id
+                   RETURNING id""",
+                (_new_id("mem"), workspace_id, email, uid, invited_by, now_iso()))
+            mid = cur.fetchone()[0]
+        return {"id": mid, "workspaceId": workspace_id, "email": email,
+                "claimed": uid is not None}
+
+    def list_members(self, workspace_id: str) -> List[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT email, user_id, role, created_at FROM rya_workspace_members
+                   WHERE workspace_id=%s ORDER BY created_at""", (workspace_id,))
+            return [{"email": r[0], "claimed": r[1] is not None, "role": r[2],
+                     "invitedAt": r[3]} for r in cur.fetchall()]
+
+    def claim_invites(self, email: str, user_id: str) -> int:
+        """Bind pending invites for this email to the (new or logging-in) user."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rya_workspace_members SET user_id=%s WHERE email=%s AND user_id IS NULL",
+                (user_id, (email or "").strip().lower()))
+            return cur.rowcount
+
+    def workspace_access(self, workspace_id: str, user_id: str) -> Optional[str]:
+        """'owner', 'member', or None for this user on this workspace."""
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT owner_user_id FROM rya_workspaces WHERE id=%s", (workspace_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if row[0] == user_id:
+                return "owner"
+            cur.execute(
+                "SELECT role FROM rya_workspace_members WHERE workspace_id=%s AND user_id=%s",
+                (workspace_id, user_id))
+            m = cur.fetchone()
+            return m[0] if m else None
 
     def signup(self, email: str, password: str, workspace_name: str = "My workspace") -> dict:
-        """One-step onboarding: create the user + their first workspace + an API key."""
+        """One-step onboarding: create the user + their first workspace + an API key.
+        Pending invites for this email are claimed, so a teammate who was invited
+        before signing up lands in the shared workspace immediately."""
         user = self.create_user(email, password)
+        self.claim_invites(user["email"], user["id"])
         ws = self.create_workspace(workspace_name, owner_user_id=user["id"])
         key = self.create_api_key(ws["id"], label="default")
         return {"user": user, "workspace": ws, "apiKey": key["key"]}

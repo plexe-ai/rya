@@ -367,7 +367,11 @@ function renderWorkspaces(wss){
   ['signup','login','key'].forEach(x=>document.getElementById('ap-'+x).classList.add('hidden'));
   document.querySelectorAll('.atab').forEach(b=>b.classList.remove('on'));
   const p=document.getElementById('ap-ws'); p.classList.remove('hidden');
-  p.innerHTML=(wss.length?'<div class="sub" style="margin:0 0 10px">Your workspaces — generate a key to open one:</div>'+wss.map(w=>`<div class="wsrow"><span class="nm">${esc(w.name)}</span><button class="btn" onclick="newKeyFor('${jss(w.id)}','${jss(w.name)}')">Generate key</button></div>`).join(''):'<div class="sub" style="margin:0 0 10px">No workspaces yet.</div>')
+  p.innerHTML=(wss.length?'<div class="sub" style="margin:0 0 10px">Your workspaces — open one, or invite a teammate:</div>'+wss.map(w=>
+      `<div class="wsrow"><span class="nm">${esc(w.name)}</span><span class="ptag">${esc(w.role||'owner')}</span>`+
+      `<button class="btn" onclick="newKeyFor('${jss(w.id)}')">Open</button>`+
+      (w.role!=='member'?`<button class="btn" onclick="inviteTo('${jss(w.id)}','${jss(w.name)}')" title="Invite a teammate by email">Invite</button>`:'')+
+      `</div>`).join(''):'<div class="sub" style="margin:0 0 10px">No workspaces yet.</div>')
     +`<input id="newWsName" placeholder="New workspace name" aria-label="New workspace name" style="margin-top:6px"/><button class="btn dark" onclick="createWorkspace()"><i data-lucide="plus"></i>New workspace</button>`;
   icons();
 }
@@ -377,7 +381,19 @@ async function createWorkspace(){
     if(d.apiKey){ showKeyThenEnter(d.workspace.name, d.apiKey); } else authErr(d.detail?.message||'Failed'); }
   catch(e){ authErr(e.message); }
 }
-async function newKeyFor(wsId,wsName){ authErr('Generating…'); try{ const d=await fetch(API+'/v1/workspaces',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION},body:JSON.stringify({name:wsName})}).then(r=>r.json()); if(d.apiKey) showKeyThenEnter(d.workspace.name,d.apiKey); }catch(e){ authErr(e.message); } }
+async function newKeyFor(wsId){
+  authErr('Generating a key for this workspace…');
+  try{ const d=await fetch(API+'/v1/workspaces/'+encodeURIComponent(wsId)+'/keys',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION},body:'{}'}).then(r=>r.json());
+    if(d.apiKey) showKeyThenEnter(d.workspace.name||wsId, d.apiKey); else authErr(d.detail?.message||'Failed'); }
+  catch(e){ authErr(e.message); }
+}
+async function inviteTo(wsId,wsName){
+  const email=prompt('Invite a teammate to "'+wsName+'" - their email:');
+  if(!email) return;
+  try{ const d=await fetch(API+'/v1/workspaces/'+encodeURIComponent(wsId)+'/members',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION},body:JSON.stringify({email})}).then(r=>r.json());
+    authErr(d.ok?('Invited '+email+(d.claimed?' - access is live now.':' - access starts when they sign up.')):(d.detail?.message||'Invite failed')); }
+  catch(e){ authErr(e.message); }
+}
 function showKeyThenEnter(name,key){ const p=document.getElementById('ap-ws'); p.innerHTML='<div class="keynote">Workspace <span class="mono">'+esc(name)+'</span> ready. API key (saved in this browser):<br><span class="mono">'+esc(key)+'</span></div><button class="btn dark" onclick="enterWithKey(\''+jss(key)+'\')"><i data-lucide="arrow-right"></i>Open console</button>'; icons(); }
 function hideAuth(){ document.getElementById('authwrap').style.display='none'; if(lastFocus&&lastFocus.focus){try{lastFocus.focus();}catch(e){}} }
 function saveToken(){ const v=document.getElementById('tokInput').value.trim(); if(!v)return; localStorage.setItem(TKEY,v); hideAuth(); refresh(); }

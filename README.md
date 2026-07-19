@@ -1,10 +1,23 @@
-# Rya
+<div align="center">
 
-**The backend your AI agents deserve.** Durable runs, human approvals, memory,
-tools, guardrails, and observability - as primitives, not plumbing you rebuild
-every time.
+<img src="docs/assets/banner.svg" alt="Rya - the backend your AI agents deserve" width="820">
 
-> From prompt to production-grade agent backend in an afternoon.
+<br/>
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-191918?style=flat-square&labelColor=37352f)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-191918?style=flat-square&labelColor=37352f)](pyproject.toml)
+![Self-hosted](https://img.shields.io/badge/open--core-self--hostable-191918?style=flat-square&labelColor=37352f)
+![Coding-agent-first](https://img.shields.io/badge/coding--agent-first-191918?style=flat-square&labelColor=37352f)
+
+**[Quickstart](#quickstart) · [Why it's different](#why-it-feels-different) · [Docs](docs/DEEP_DIVE.md) · [Deploy](deploy/AGENTS.md) · [Repository map](src/rya/AGENTS.md)**
+
+</div>
+
+---
+
+> Durable runs, human approvals, memory, tools, guardrails, and observability -
+> as primitives, not plumbing you rebuild every time. From prompt to
+> production-grade agent backend in an afternoon.
 
 You declare what an agent may do. The runtime enforces it, makes it durable, and
 streams it live. Here is a complete agent:

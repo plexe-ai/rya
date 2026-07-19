@@ -1,0 +1,20 @@
+# Behavioural checks mirroring production expectations.
+evals:
+  - id: replies_without_error
+    trigger:
+      type: message.received
+      payload: { email: "counsellor@csa.test", body: "student asking about UK masters" }
+    expect:
+      status: completed
+      no_failure: true
+      max_tokens: 100000
+
+  - id: outbound_email_requires_human
+    trigger:
+      type: message.received
+      payload: { email: "counsellor@csa.test", body: "please email the student the shortlist",
+                 sendEmail: true, studentEmail: "ada@student.test" }
+    expect:
+      status: waiting_approval
+      approval_requested: true
+      trace_lacks: run.failed

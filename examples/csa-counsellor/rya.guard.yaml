@@ -1,0 +1,19 @@
+# Action Guard for the CSA counsellor agent - mirrors production's egress
+# posture. deny beats allow; default deny; fail closed.
+ssrf: true
+default: deny
+fail: closed
+policy: >
+  This agent may call the Crizac API, CAMS, and approved model providers. It
+  must never exfiltrate student data to webhooks, pastebins, or chat bridges,
+  and never call a payment processor directly. Student PII stays inside the
+  approved hosts.
+grounding:
+  enabled: true   # money figures in outbound messages must come from tool output
+rules:
+  - {action: allow, kind: glob, pattern: "https://api.anthropic.com/*", note: Claude inference}
+  # Set this pattern to your CRIZAC_BASE_URL host when wiring live tools:
+  - {action: allow, kind: glob, pattern: "https://crizac-api.example/*", note: "Crizac API (placeholder - set to CRIZAC_BASE_URL host)"}
+  - {action: deny, kind: glob, pattern: "https://webhook.site/*", note: exfiltration host}
+  - {action: deny, kind: glob, pattern: "https://hooks.slack.com/*", note: no outbound chat webhooks}
+  - {action: deny, kind: glob, pattern: "https://api.stripe.com/*", note: no direct card charges}

@@ -1,0 +1,151 @@
+name: csa-counsellor
+runtime: python
+entrypoint: src/agent.py
+version: 0.1.0
+environment: local
+owner: platform@chatstudyabroad
+instructions: >
+  ChatStudyAbroad's counsellor agent, represented on Rya. The tool registry
+  below mirrors the production agent's real 28 tools with their TRUE governance
+  tiers: hidden tools are disabled here (runtime-enforced instead of stripped
+  from the prompt), confirm-gated actions are approval_required (runtime-
+  enforced instead of a prompt convention), and student-scoped tools carry
+  server-side pins for camsId (the model can never target another student).
+  Tools are declared for governance and visibility; wiring each to the live
+  CSA endpoint is the `url:` field per tool (Phase 1 of the migration plan).
+
+model:
+  # Mirrors production model usage: Sonnet composes, Haiku runs the sidecars.
+  default: claude-sonnet-4-6
+  fallback: claude-haiku-4-5
+  routes:
+    compose:      {model: claude-sonnet-4-6}
+    extract:      {model: claude-haiku-4-5, temperature: 0, max_tokens: 512}
+    title:        {model: claude-haiku-4-5, max_tokens: 64}
+    passport_ocr: {model: claude-haiku-4-5}
+    doc_analysis: {model: claude-sonnet-4-6}
+
+memory:
+  type: managed
+  collections:
+    - conversations
+    - student_facts
+    - student_state
+
+tools:
+  # ---- student lookup + profile (CAMS) ------------------------------------
+  - id: cams_lookup_student
+    permission: allowed
+    description: Look up a student record in CAMS by id.
+  - id: cams_update_profile
+    permission: approval_required
+    description: Write profile fields back to CAMS. Production gates this behind a human form; here the runtime enforces the gate.
+    pin: {camsId: event.payload.camsId}
+  - id: collect_profile
+    permission: allowed
+    description: Render the inline profile-collection form to the counsellor.
+  - id: duplicates_check
+    permission: read_only
+    description: Check CAMS for duplicate student records.
+
+  # ---- discovery (Crizac catalogue) ---------------------------------------
+  - id: course_catalogue
+    permission: allowed
+    description: The ONLY discovery tool the agent may use - Crizac's server-side catalogue search.
+  - id: present_recommendations
+    permission: allowed
+    description: Render curated recommendation cards (8-15, rich detail).
+  - id: programme_detail
+    permission: read_only
+    description: Full detail for one programme.
+  - id: university_search
+    permission: read_only
+    description: Search universities.
+  - id: university_recommendations
+    permission: read_only
+    description: University-level recommendations.
+  - id: scholarship_search
+    permission: read_only
+    description: Search scholarships.
+  - id: crizac_filters
+    permission: read_only
+    description: Available eligibility filters.
+  - id: visa_requirements
+    permission: read_only
+    description: Visa requirements per destination.
+
+  # ---- hidden in production (API-route / human-UI only) --------------------
+  - id: course_search
+    permission: disabled
+    description: HIDDEN in production (AGENT_HIDDEN_TOOLS) - API routes only. Disabled = runtime-enforced, not prompt-stripped.
+  - id: course_recommendations
+    permission: disabled
+    description: HIDDEN in production - API routes only.
+  - id: apply_to_programme
+    permission: disabled
+    description: Applications are submitted ONLY by a human clicking Instant/Normal Apply. The agent can never call this.
+
+  # ---- writes into Crizac / external actions -------------------------------
+  - id: create_lead
+    permission: allowed
+    description: Create a lead in Crizac (agent retries once on 5xx in production).
+  - id: create_leads_bulk
+    permission: allowed
+    description: Bulk lead creation.
+  - id: crizac_update_application
+    permission: approval_required
+    description: Write visa history / application updates. Confirm-gated by prompt in production; runtime-gated here.
+  - id: submit_scholarship_enquiry
+    permission: approval_required
+    description: Submit a scholarship enquiry on the student's behalf.
+  - id: loan_apply_for_student
+    permission: approval_required
+    description: Start a loan application for the student.
+  - id: send_email
+    permission: approval_required
+    description: Send email to a student. Production uses a preview->confirm convention; here the run pauses durably for a human.
+
+  # ---- student workspace (pinned: model can never target another student) --
+  - id: shortlist_add
+    permission: allowed
+    pin: {camsId: event.payload.camsId}
+    description: Add a programme to this student's shortlist.
+  - id: shortlist_remove
+    permission: allowed
+    pin: {camsId: event.payload.camsId}
+    description: Remove from this student's shortlist.
+  - id: compare_programmes
+    permission: allowed
+    pin: {camsId: event.payload.camsId}
+    description: Generate the comparison PDF for this student's shortlist.
+  - id: application_activity
+    permission: read_only
+    description: Timeline of application activity.
+
+  # ---- drafting + prediction ----------------------------------------------
+  - id: draft_sop
+    permission: allowed
+    description: Draft a statement of purpose.
+  - id: draft_lor
+    permission: allowed
+    description: Draft a letter of recommendation.
+  - id: offer_prediction
+    permission: allowed
+    description: Plexe XGBoost offer-probability prediction.
+
+models:
+  - id: offer-prediction-xgb
+    type: custom
+    permission: allowed
+
+channels:
+  - type: webhook
+    path: /inbound
+
+approvals:
+  default: required_for_external_actions
+
+observability:
+  logs: true
+  traces: true
+  audit: true

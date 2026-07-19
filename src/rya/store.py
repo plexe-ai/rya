@@ -67,13 +67,14 @@ class FileStore:
         self.approvals_dir = self.dir / "approvals"
         self.jobs_dir = self.dir / "jobs"
         self.queue_dir = self.dir / "queue"
+        self.streams_dir = self.dir / "streams"
         self.memory_dir = self.dir / "memory"
         self.sessions_dir = self.dir / "sessions"
         self.connections_dir = self.dir / "connections"
 
     def ensure(self) -> None:
         for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.queue_dir,
-                  self.memory_dir, self.sessions_dir, self.connections_dir):
+                  self.streams_dir, self.memory_dir, self.sessions_dir, self.connections_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # ---- low level -----------------------------------------------------
@@ -258,6 +259,28 @@ class FileStore:
             if data:
                 counts[data.get("status", "?")] = counts.get(data.get("status", "?"), 0) + 1
         return counts
+
+    # ---- durable turn stream buffer --------------------------------------
+    # A chat turn executes on a leased worker (see rya.turns) and relays its
+    # frames here; the streaming endpoint TAILS this buffer by monotonic seq.
+    # That decouples the stream connection from the executor, so a dropped
+    # connection resumes from its last seq and a crashed executor's re-run just
+    # appends more frames. One writer per turn (the lease holder), so seq is safe.
+    def stream_append(self, turn_id: str, frames: List[dict]) -> int:
+        p = self.streams_dir / f"{turn_id}.json"
+        doc = self._read(p) or {"turnId": turn_id, "frames": []}
+        base = len(doc["frames"])
+        for i, f in enumerate(frames):
+            doc["frames"].append({"seq": base + i, "kind": f["kind"],
+                                  "data": f.get("data"), "ts": now_iso()})
+        self._write(p, doc)
+        return base + len(frames)
+
+    def stream_read(self, turn_id: str, after_seq: int = -1) -> List[dict]:
+        doc = self._read(self.streams_dir / f"{turn_id}.json")
+        if not doc:
+            return []
+        return [f for f in doc["frames"] if f["seq"] > after_seq]
 
     # ---- memory --------------------------------------------------------
     def _memory_path(self, scope: str) -> Path:

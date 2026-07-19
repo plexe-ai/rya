@@ -134,6 +134,34 @@ reflected in `GET /tools` as `effectivePermission`, enforced on the next call
 and removed from the `ctx.llm.run` loop immediately. `{"clear": true}` reverts
 to the manifest. Unreadable runtime config fails closed.
 
+## Durable chat turns
+
+A plain chat turn (`/events/stream`) is synchronous: a mid-turn server crash
+strands the run and a dropped connection loses the stream. A **turn** fixes both
+by making the turn a durable, leased, reclaimable job and the stream a resumable
+tail over a durable buffer:
+
+- `POST /agents/{id}/turns` → `{turnId}`. Enqueues a `chat-turn` job (so it has a
+  lease and is reclaimed if its executor dies) and kicks execution inline.
+- `GET /agents/{id}/turns/{turnId}/stream?after=N` → SSE tail of the durable
+  buffer. Resumable: reconnect with `?after=<lastSeq>` (or the browser's
+  `Last-Event-ID`) to continue exactly where a dropped connection left off. Each
+  frame carries `id: <seq>`; ends on the terminal `run`/`error` frame.
+- `POST /agents/{id}/turns/reclaim` → runs any pending or crashed (lease-expired)
+  turns for the workspace. The durability backstop - call it from a periodic
+  sweeper / `rya` worker loop so an interrupted turn always finishes.
+
+A reclaimed re-run appends a `restart` frame then fresh frames (monotonic seqs
+preserved). Crash-retry re-runs the handler fresh (same idempotency contract as
+any queue job); an approval PAUSE inside a turn is durable via journal replay.
+TS client: `startTurn()` + `streamTurn(turnId, afterSeq)` (auto-reconnects from
+the last seq on a dropped connection).
+
+Known follow-ups: post-approval continuation is not yet streamed on the original
+turn (fetch the final run, or start a follow-up turn); the reclaim sweeper is
+per-workspace via the endpoint - a global background loop across workspaces is
+not wired into `rya serve` yet.
+
 ## Token streaming
 
 Two transports, same frames:

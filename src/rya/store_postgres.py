@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS rya_queue (
     data JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_queue_claim ON rya_queue (workspace_id, status, run_at);
+CREATE TABLE IF NOT EXISTS rya_stream (
+    turn_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    seq INTEGER NOT NULL,
+    kind TEXT,
+    data JSONB,
+    ts TEXT,
+    PRIMARY KEY (workspace_id, turn_id, seq)
+);
 CREATE TABLE IF NOT EXISTS rya_memory (
     workspace_id TEXT NOT NULL DEFAULT 'default',
     scope TEXT NOT NULL,
@@ -372,6 +381,29 @@ class PostgresStore:
             cur.execute("SELECT status, count(*) FROM rya_queue WHERE workspace_id=%s GROUP BY status",
                         (self._ws,))
             return {r[0]: r[1] for r in cur.fetchall()}
+
+    # ---- durable turn stream buffer --------------------------------------
+    def stream_append(self, turn_id: str, frames: List[dict]) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(seq), -1) FROM rya_stream WHERE workspace_id=%s AND turn_id=%s",
+                        (self._ws, turn_id))
+            base = cur.fetchone()[0] + 1
+            for i, f in enumerate(frames):
+                cur.execute(
+                    """INSERT INTO rya_stream (turn_id, workspace_id, seq, kind, data, ts)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (turn_id, self._ws, base + i, f["kind"], Json(f.get("data")), now_iso()),
+                )
+        return base + len(frames)
+
+    def stream_read(self, turn_id: str, after_seq: int = -1) -> List[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT seq, kind, data, ts FROM rya_stream
+                   WHERE workspace_id=%s AND turn_id=%s AND seq > %s ORDER BY seq""",
+                (self._ws, turn_id, after_seq),
+            )
+            return [{"seq": r[0], "kind": r[1], "data": r[2], "ts": r[3]} for r in cur.fetchall()]
 
     # ---- memory --------------------------------------------------------
     def load_memory(self, scope: str) -> Dict[str, Any]:

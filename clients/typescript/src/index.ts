@@ -214,6 +214,91 @@ export class RyaClient {
     }
   }
 
+  // ---- durable chat turns --------------------------------------------------
+
+  /** Start a durable chat turn. The turn survives a server crash (it's a leased,
+   * reclaimable job) and its stream survives a dropped connection. */
+  startTurn(
+    payload: Record<string, unknown>,
+    type = "message.received"
+  ): Promise<{ turnId: string; status: string }> {
+    return this.request("POST", `/agents/_/turns`, { type, payload });
+  }
+
+  /**
+   * Stream a durable turn, resuming across dropped connections: yields frames
+   * from `afterSeq`, and on a network drop it reconnects from the last seq it
+   * saw (the durable buffer means nothing is lost). Ends on `run`/`error`.
+   */
+  async *streamTurn(
+    turnId: string,
+    afterSeq = -1,
+    opts?: { maxReconnects?: number }
+  ): AsyncGenerator<StreamFrame> {
+    let cursor = afterSeq;
+    let reconnects = 0;
+    const maxReconnects = opts?.maxReconnects ?? 20;
+    while (true) {
+      const headers: Record<string, string> = { accept: "text/event-stream" };
+      if (this.token) headers["authorization"] = `Bearer ${this.token}`;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(
+          `${this.baseUrl}/agents/_/turns/${encodeURIComponent(turnId)}/stream?after=${cursor}`,
+          { method: "GET", headers }
+        );
+      } catch {
+        if (reconnects++ >= maxReconnects) return;
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      if (!res.ok || !res.body) {
+        const text = await res.text();
+        throw new RyaError(res.status, JSON.parse(text || "{}") as RyaErrorBody);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let event: string | null = null;
+      let id: number | null = null;
+      let data: string[] = [];
+      let terminated = false;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, nl).replace(/\r$/, "");
+            buffer = buffer.slice(nl + 1);
+            if (line.startsWith(":")) continue; // keep-alive / idle comment
+            if (line.startsWith("id:")) id = Number(line.slice(3).trim());
+            else if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(5).trim());
+            else if (line === "" && event) {
+              if (id !== null) cursor = id;
+              yield { event, data: data.length ? JSON.parse(data.join("\n")) : null };
+              if (event === "run" || event === "error") {
+                terminated = true;
+                break;
+              }
+              event = null;
+              id = null;
+              data = [];
+            }
+          }
+          if (terminated) break;
+        }
+      } catch {
+        // connection dropped mid-stream: reconnect from the last seq we saw
+      }
+      if (terminated) return;
+      if (reconnects++ >= maxReconnects) return;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+
   // ---- queue: durable jobs executed by YOUR workers (any language) ---------
 
   /** Enqueue a durable job for an external worker. `jobId` is an idempotency key. */

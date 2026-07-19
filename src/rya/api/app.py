@@ -25,7 +25,16 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import HTMLResponse
 
 from .. import __version__ as RYA_VERSION
@@ -523,6 +532,92 @@ def build_app(root: Path) -> FastAPI:
         return StreamingResponse(sse(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
+
+    # ---- durable chat turns ---------------------------------------------
+    # Unlike /events/stream (synchronous - a mid-turn crash strands the run), a
+    # TURN is a durable, leased, reclaimable job whose frames land in a durable
+    # buffer; the stream endpoint just tails it and resumes on reconnect. See
+    # rya.turns.
+    from .. import turns as _turns
+
+    def _fresh_engine_for(authorization, x_rya_token) -> Engine:
+        """A standalone engine for background turn execution - never shares the
+        request engine's connection across the response boundary."""
+        if mt:
+            return engine_for(authorize(authorization, x_rya_token))
+        return base_engine
+
+    @api.post("/agents/{agent_id}/turns")
+    async def create_turn_ep(agent_id: str, request: Request, background: BackgroundTasks,
+                             engine: Engine = Depends(get_engine),
+                             authorization: Optional[str] = Header(None),
+                             x_rya_token: Optional[str] = Header(None)):
+        """Start a DURABLE chat turn. Returns ``{turnId}`` immediately; the turn
+        runs on a worker (kicked inline here, reclaimed on crash) and streams via
+        GET /agents/{id}/turns/{turnId}/stream."""
+        body = await request.json()
+        res = _turns.create_turn(engine, body.get("type", "message.received"),
+                                 body.get("payload", {}))
+
+        def _kick():
+            try:
+                _turns.execute_pending(_fresh_engine_for(authorization, x_rya_token),
+                                       worker_id="inline", limit=1)
+            except Exception:  # reclaim will re-drive it; never fail the request
+                import logging
+                logging.getLogger("rya.turns").warning("inline turn execution failed", exc_info=True)
+
+        background.add_task(_kick)
+        return res
+
+    @api.get("/agents/{agent_id}/turns/{turn_id}/stream")
+    async def turn_stream_ep(agent_id: str, turn_id: str, request: Request,
+                             after: int = -1, engine: Engine = Depends(get_engine)):
+        """Tail a turn's durable stream as SSE. Resumable: reconnect with
+        ``?after=<lastSeq>`` (or the browser's Last-Event-ID header) to continue
+        exactly where the dropped connection left off. Ends on the terminal
+        run/error frame."""
+        import asyncio
+
+        from fastapi.responses import StreamingResponse
+
+        last_id = request.headers.get("last-event-id")
+        start = int(last_id) if (last_id and last_id.lstrip("-").isdigit()) else after
+
+        async def sse():
+            cursor = start
+            idle = 0
+            while True:
+                if await request.is_disconnected():
+                    return
+                frames = await asyncio.to_thread(engine.store.stream_read, turn_id, cursor)
+                if frames:
+                    idle = 0
+                    for f in frames:
+                        cursor = f["seq"]
+                        yield (f"id: {f['seq']}\nevent: {f['kind']}\n"
+                               f"data: {json.dumps(f['data'], default=str)}\n\n")
+                        if f["kind"] in ("run", "error"):
+                            return
+                else:
+                    idle += 1
+                    if idle >= 200:  # ~60s with no new frame; client reconnects w/ Last-Event-ID
+                        yield ": idle-timeout\n\n"
+                        return
+                    if idle % 15 == 0:
+                        yield ": keep-alive\n\n"
+                    await asyncio.sleep(0.3)
+
+        return StreamingResponse(sse(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @api.post("/agents/{agent_id}/turns/reclaim")
+    def reclaim_turns_ep(agent_id: str, engine: Engine = Depends(get_engine)):
+        """Reclaim + run any pending or crashed (lease-expired) chat turns for
+        this workspace. The durability backstop - call periodically (cron / a
+        `rya` worker loop) so an interrupted turn always finishes."""
+        ran = _turns.execute_pending(engine, worker_id="reclaimer", limit=50)
+        return {"reclaimed": ran, "count": len(ran)}
 
     @api.get("/guard")
     def get_guard(engine: Engine = Depends(get_engine)):

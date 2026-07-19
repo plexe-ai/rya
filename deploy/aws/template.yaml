@@ -213,6 +213,12 @@ Resources:
               ValueFrom: !Sub "${AppSecret}:RYA_SECRET_KEY::"
             - Name: RYA_ADMIN_TOKEN
               ValueFrom: !Sub "${AppSecret}:RYA_ADMIN_TOKEN::"
+            # Model key: added to the AppSecret OUT of band (operator step, see
+            # README "model keys populated post-deploy") - CloudFormation never
+            # sees the value. The task fails to start if the JSON key is absent,
+            # so populate the secret BEFORE deploying this reference.
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub "${AppSecret}:ANTHROPIC_API_KEY::"
           LogConfiguration:
             LogDriver: awslogs
             Options:

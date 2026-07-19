@@ -1,502 +1,97 @@
 # Rya
 
-**Production backend/runtime for AI agents.** Rya gives developers and coding
-agents the runtime, memory, tools, approvals, channels, jobs, model access, and
-observability needed to build production-grade AI agents — without rebuilding
-the infrastructure every time.
+**The backend your AI agents deserve.** Durable runs, human approvals, memory,
+tools, guardrails, and observability - as primitives, not plumbing you rebuild
+every time.
 
-> From prompt to production-grade agent backend in minutes.
+> From prompt to production-grade agent backend in an afternoon.
 
-Rya is **coding-agent-first**: Claude Code, Codex, and Cursor drive it through a
-CLI, an MCP server, and skills — and the platform encodes *what production
-requires* as a green checklist (`rya deploy --check`) the agent satisfies, so it
-ships something safe without being a production expert.
+You declare what an agent may do. The runtime enforces it, makes it durable, and
+streams it live. Here is a complete agent:
 
-One command — `rya provision` — stands up the **full base infrastructure** a
-production agent needs and reports it as an inventory: durable database, memory,
-conversation sessions, authentication, guardrails, the real-time **WebSocket**
-channel, background jobs with retry + dead-letter, horizontal scale, and
-observability.
+```python
+from rya import define_agent
 
-What's real today: durable runs on **Postgres** (survive restarts) with
-pause/resume by journal replay; **durable chat turns** (leased, crash-reclaimed,
-resumable token streams with post-approval continuation) and a **durable
-external-worker queue** (any language, retries, dead-letter, concurrency caps);
-**per-user row-level-security** multi-tenancy with **workspaces, invites, and
-API-key management**; real **Anthropic/OpenAI** + channel seams with **token
-streaming** (SSE + WebSocket) and **per-purpose model routes**; a first-class
-**LLM layer** (structured output + a governed agent loop with tool `input_schema`);
-governance enforced by the runtime - **permission tiers, server-side arg pinning,
-runtime kill switches, an Action Guard egress firewall, and a grounding gate**;
-first-class **UI frames** on the turn stream (`ctx.emit_ui`); scoped **encrypted
-credentials**; conversation **sessions** and two-tier **memory**; a built-in
-**web console**; **remote MCP** over HTTP; **run ingest** for external agent
-loops; observability export to **Langfuse / OTLP**; and a
-**production-readiness gate** + declarative **evals**. Real general-purpose
-**built-in tools** (`web.fetch`, `http.request`) ship so agents do real work.
+agent = define_agent()
 
-What's honest about maturity: the default scaffold is **mock-free** (real seams
-only); the `demo` template carries deterministic domain mocks for the tutorial.
-The **managed** hosting platform is not built - the hosted instance *is*
-`rya serve` (deploy via the AWS IaC in [`deploy/`](deploy/AGENTS.md) or
-`docker compose`); there's no one-click cloud yet. The durable-execution
-primitives are young: correct and tested, but not yet load-tested at high volume.
+@agent.on_event
+async def handle(ctx, event):
+    ticket = await ctx.tools.call("crm.lookup", {"email": event.payload["email"]})
+    reply  = await ctx.llm.respond(system="Draft a refund reply.", input=ticket)
 
-**For the full picture, read [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md). For the code
-layout, see the [repository map](#repository-map) and the per-module `AGENTS.md`.**
+    # pauses the run - durably, for days if needed - until a human approves
+    await ctx.approvals.request(
+        title="Issue refund", body=reply.text,
+        action={"tool": "refund.issue", "input": {"ticket": ticket["id"]}},
+    )
+    await ctx.channels.send("email", {"to": ticket["email"], "body": reply.text})
+```
+
+Every `ctx.*` call is journaled. So this run survives a crash, resumes exactly
+where it paused, streams token-by-token to your UI, and leaves a full audit
+trace - and you wrote none of that.
+
+## Quickstart
+
+```bash
+uvx rya create support-agent && cd support-agent
+rya dev                                                   # validate + inspect. no keys, no database
+rya events send --type message.received \
+  --payload '{"email":"ada@example.com"}'                 # run pauses for approval
+rya approvals approve <id>                                # resume; the email is sent
+```
+
+Offline it uses a mock model, so this just works. Set `ANTHROPIC_API_KEY` for
+real Claude, `RYA_DATABASE_URL` for durable Postgres - the same agent code runs
+on a laptop, a self-hosted box, and the cloud.
+
+## Why it feels different
+
+- **Approvals actually pause the process.** A human gate is not a prompt
+  convention - `ctx.approvals.request` unwinds the coroutine, persists, and
+  resumes in another process by replaying the journal. The model never sees a
+  gated tool.
+- **The model can act, sandboxed.** `ctx.llm.run` lets the model call tools in a
+  loop - and every call goes through the same permissions, scoped credentials,
+  egress firewall, and audit as your own code.
+- **Governance the runtime enforces, not the prompt.** Permission tiers,
+  server-side argument pinning, runtime kill switches, an egress firewall, and a
+  grounding gate that blocks any number the agent did not get from a tool.
+- **Durable chat, durable jobs.** Chat turns are leased and crash-reclaimed with
+  resumable token streams; the queue runs background work in any language with
+  retries and dead-letter. An interrupted turn is retried, not dropped.
+- **Coding-agent-first.** Claude Code, Codex, and Cursor drive the whole thing
+  over a CLI (`--json` everywhere), an MCP server, and skills - and `rya deploy
+  --check` is a green checklist they satisfy so they ship something safe.
+- **Yours to run.** Open-core, self-hostable, offline-capable. No SDK lock-in for
+  callers: any app talks to it over HTTP.
+
+## Ship it
+
+```bash
+rya deploy --check     # production-readiness gate: blocks on missing evals, ungated actions, secrets in the repo...
+rya serve              # API + web console + realtime (WS/SSE) + remote MCP, one process
+```
+
+`rya serve` is the whole product in one process. Deploy it with the AWS IaC in
+[`deploy/`](deploy/AGENTS.md) or `docker compose` - the hosted instance *is*
+`rya serve`.
 
 ## Install
 
 ```bash
-uvx rya create support-agent      # zero-install: scaffold + run in one command
-pipx install rya                  # or install the CLI globally
-pip install 'rya[api,mcp,postgres,llm]'   # full: control-plane API, MCP, Postgres, real Claude
+uvx rya create my-agent                    # zero-install: scaffold + run
+pip install 'rya[api,mcp,postgres,llm]'    # full: control plane, MCP, Postgres, real models
 ```
 
-From a checkout, for development:
-
-```bash
-cd rya
-pip install -e '.[api,mcp,postgres,llm,dev]'
-```
-
-Maintainers — build + publish:
-
-```bash
-uv build                      # → dist/rya-*.whl + .tar.gz
-uvx --from dist/rya-*.whl rya --version   # smoke-test the artifact in isolation
-uv publish                    # needs a PyPI token; this is what makes `uvx rya` resolve
-```
-
-## Self-host (production-grade, OSS)
-
-The same runtime runs on a real Postgres — durable runs that survive restarts:
-
-```bash
-cp .env.example .env       # optionally add ANTHROPIC_API_KEY for real Claude
-docker compose up          # Postgres + `rya serve` on :8787
-```
-
-Locally, set `RYA_DATABASE_URL=postgres://…` and every command uses Postgres
-instead of files — no code change. See [docs/architecture.md](docs/architecture.md)
-for the OSS-core / managed-cloud split.
-
-### Trigger a live agent over HTTP
-
-`rya serve` exposes a webhook so external systems drive real runs. Set
-`RYA_TOKEN` to require an operator token on the control API, and
-`RYA_WEBHOOK_SECRET` to require signed inbound webhooks:
-
-```bash
-export RYA_TOKEN=$(rya token --json | jq -r .token)
-export RYA_WEBHOOK_SECRET=whsec123
-rya serve --port 8787      # POST /inbound (signed) → real run; control routes need the token
-
-# external system fires a signed webhook → agent runs, pauses for approval
-SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$RYA_WEBHOOK_SECRET" | sed 's/^.*= //')"
-curl -XPOST localhost:8787/inbound -H "X-Rya-Signature: $SIG" -d "$BODY"
-
-# operator approves with the token → run resumes and completes
-curl -XPOST localhost:8787/approvals/<id>/approve -H "Authorization: Bearer $RYA_TOKEN"
-```
-
-## 60-second tour
-
-```bash
-rya create support-agent
-cd support-agent
-rya dev                                                    # validate + inspect
-rya events send --type message.received \
-  --payload '{"email":"ada@example.com"}'                  # run pauses for approval
-rya approvals list                                         # see the gate
-rya approvals approve <approval_id>                        # resume; email "sent"
-rya runs trace <run_id>                                    # full run trace
-rya jobs run --all                                         # run the scheduled follow-up
-```
-
-Add `--json` to **any** command for machine-readable output, and
-`--non-interactive` to forbid hidden prompts. Errors carry a stable `E_*` code,
-a suggested next action, and a semantic exit code.
-
-## What the vertical slice proves
-
-The example follow-up agent ([examples/followup_agent](examples/followup_agent))
-exercises every core primitive in one run:
-
-| Step | Primitive |
-|------|-----------|
-| Receive a webhook-style event | **Events** |
-| Store the event | **Memory** |
-| Look up the customer | **Tools** (permissioned) |
-| Score churn risk | **Models** (gateway) |
-| Schedule a delayed follow-up | **Jobs / Cron** |
-| Draft a message | **LLM** |
-| Gate the send behind a human | **Approvals** (pause/resume) |
-| Send after approval | **Channels** |
-| Capture everything | **Observability** (trace) |
-
-## How pause/resume works
-
-A run is durable. When the handler calls `ctx.approvals.request(...)`, the run
-**pauses** (the coroutine unwinds) and its journal is persisted to `.rya/`. A
-*separate* `rya approvals approve` invocation resolves the approval, executes
-the gated action, and **resumes** the run by replaying the handler against the
-journal — prior tool/model/memory steps are memoized, so only the code after
-the approval runs for real. See [src/rya/sdk/context.py](src/rya/sdk/context.py).
-
-## Layout
-
-```
-src/rya/
-  manifest/        rya.agent.yaml schema + loader/validator
-  sdk/             define_agent(), the ctx runtime context
-  runtime/         engine: load, execute, pause/resume, retries, timeouts, cron
-  tools/ models/   permissioned tool + model registries (mock IO)
-  providers/       real seams: llm (anthropic/openai), channels, embeddings
-  approvals/       approval lifecycle + pause signal
-  store.py         FileStore; store_postgres.py PostgresStore (RLS); open_store()
-  tenancy.py       workspaces, API keys, per-user RLS provisioning
-  guard.py         Action Guard — egress firewall
-  provision.py     rya provision — stand up the full base infra inventory
-  readiness.py     production-readiness checklist (rya deploy --check)
-  snapshot.py      rya context + the console aggregate
-  observability/   structured logs, usage/cost, Langfuse/webhook export
-  auth.py          JWT identity (HS256 / JWKS)
-  api/             FastAPI control plane + webhook + console + guard ([api])
-  console/         the built-in web console (served by rya serve)
-  mcp/             MCP server (25 rya_* tools) — FastMCP ([mcp] extra)
-  skills/          bundled skills (rya = authoring, rya-ops = operating)
-  cli/             rya CLI (Typer), scaffolding, deploy templates
-clients/typescript/ @plexe/rya — typed TS client
-deploy/aws/        single-tenant CloudFormation/SAM (cfn-lint clean)
-examples/ docs/ tests/
-```
-
-## Web console
-
-`rya serve` ships a built-in web console — an agent **backend infrastructure**
-dashboard (the primitives a coding agent provisions and operates):
-
-```bash
-rya serve --port 8787        # → console at http://localhost:8787/
-```
-
-It renders live state from the runtime (`GET /console`): the **Overview**
-primitive grid, an **Infrastructure** view (compute, data substrate, auth/RLS,
-observability — computed from the running process), the tool registry with
-permissions, the model gateway, runs with **forensic traces**, a working
-**approvals queue** (approving resumes the real paused run), and the
-**Action Guard** editor. The page is public; its data calls are auth-gated by
-`RYA_TOKEN` (a Connect dialog prompts when set). Source:
-[src/rya/console/index.html](src/rya/console/index.html), served by
-[api/app.py](src/rya/api/app.py).
-
-## LLM layer: real models, structured output, governed agent loop
-
-The model is first-class, not an afterthought. `ctx.llm` is a real multi-provider
-gateway (Anthropic/OpenAI over stdlib HTTP — real when a key is present, a
-deterministic mock otherwise) with the two things agent-building actually needs:
-
-```python
-# 1. Structured output — pass a JSON Schema, get a validated object back.
-res = await ctx.llm.respond(system="classify", input={"text": msg},
-                            schema={"type": "object", "required": ["sentiment", "score"], …})
-res.json["sentiment"]            # parsed + validated, not string-parsing
-
-# 2. Governed agent loop — the model reasons and CALLS TOOLS until it answers.
-out = await ctx.llm.run(input={"q": "look up Ada and summarize"}, tools=["crm.lookup"])
-out["toolCalls"]                 # what the model actually ran
-```
-
-The agent loop is the differentiator: **every tool the model calls goes through
-`ctx.tools.call`** — so the same permissions, **scoped + encrypted credentials**,
-**Action Guard egress firewall**, and audit trail apply to what the *model*
-decides to do. Approval-gated tools are never exposed to the loop, so a model can
-autonomously use safe/read tools but a side-effectful action still requires an
-explicit `ctx.approvals.request` (human gate). An LLM that can act, sandboxed by
-the same governance as the rest of the runtime. See
-[src/rya/providers/llm.py](src/rya/providers/llm.py).
-
-Two **real, general-purpose built-in tools** ship so the loop does actual work
-out of the box: `web.fetch` (GET a URL → readable text) and `http.request`
-(any method) — both routed through the Action Guard before a byte leaves the
-process. Declare them in the manifest like any tool; everything else an agent
-integrates with is HTTP on top of these. See
-[src/rya/tools/builtins.py](src/rya/tools/builtins.py).
-
-## Durable execution: chat turns + the external-worker queue
-
-A run is durable through the journal; two primitives extend that to whole chat
-turns and to background work in any language.
-
-**Durable chat turns.** A chat turn is a leased job with a resumable stream
-buffer, so an interrupted turn is *retried, not dropped*, and a dropped
-connection *resumes from its last frame*:
-
-```bash
-POST /agents/_/turns              # start a durable turn -> {turnId}
-GET  /agents/_/turns/{id}/stream  # SSE: token / trace / message / ui / run frames,
-                                  # resumable via Last-Event-ID
-```
-
-An approval mid-turn is a *pause*, not the end: approving streams the
-post-approval continuation onto the same buffer, ending with the real terminal
-frame. `rya serve` runs a background sweeper that reclaims any crashed turn, so
-worst case a turn finishes one sweep interval late. TS: `streamTurn(id, -1,
-{untilFinal: true})` tails straight through the pause. See
-[src/rya/turns.py](src/rya/turns.py).
-
-**External-worker queue.** Rya owns durability, retries with backoff,
-dead-lettering, idempotent enqueue, per-key concurrency caps, and cancellation;
-*your* workers (Python or TypeScript, via `createQueueWorker`) execute the jobs.
-This is how a polyglot backend uses Rya as its durable job queue without adopting
-Python:
-
-```bash
-POST /queue/jobs                  # enqueue (jobId = idempotency key)
-POST /queue/claim                 # a worker claims due jobs with a lease
-POST /queue/jobs/{id}/{heartbeat,complete,fail,cancel,retry}
-```
-
-Claims use `FOR UPDATE SKIP LOCKED`, so N workers never double-claim; every
-transition verifies the reporting worker still holds the lease. See
-[src/rya/queue.py](src/rya/queue.py) and
-[clients/typescript/](clients/typescript/AGENTS.md).
-
-## Memory (core blocks + consolidated long-term recall)
-
-`ctx.memory` is more than a vector store — it's the two-tier memory production
-agents need:
-
-- **Core memory blocks** (Letta-style): small, named, *always-in-context*,
-  agent-editable slots — persona, the user's profile, current task state.
-  `ctx.memory.block_set("persona", …)` / `block_append` / `blocks()`.
-- **Long-term facts** (Mem0-style): `ctx.memory.remember(text)` extracts atomic
-  facts, embeds them, and **consolidates** — a near-duplicate updates in place
-  instead of piling up, which is what keeps recall token-efficient.
-  `ctx.memory.recall(query)` does semantic retrieval (vector + lexical fallback).
-- **Budget-bounded assembly** (virtual-memory paging): `ctx.memory.assemble(query,
-  token_budget=1000)` returns the core blocks (always) plus the most relevant
-  facts paged in until the budget is spent — the working context you feed the model.
-
-All of it is scoped per user by RLS and visible in the console's **Memory** view
-(core blocks + long-term collections with semantic recall). See
-[src/rya/sdk/context.py](src/rya/sdk/context.py).
-
-## Provision the full base infra
-
-A coding agent shouldn't hand-assemble a database, auth, guardrails, a realtime
-channel, and a job queue every time. `rya provision` stands the whole base
-infrastructure up and reports it as one inventory — each component with a status
-and an exact fix:
-
-```bash
-rya provision --json            # auto target (Postgres if RYA_DATABASE_URL, else local)
-rya provision --target postgres # durable + multi-worker production substrate
-rya provision --dry-run         # inspect without writing anything
-```
-
-It covers every primitive a production agent needs — **compute/runtime, durable
-database, memory, conversation sessions, authentication, guardrails (egress
-firewall), the real-time WebSocket channel, background jobs with retry +
-dead-letter, horizontal scale, observability, secrets** — and is idempotent
-(re-running converges). It provisions what it safely can (writes a default guard
-policy, runs the Postgres tenancy/RLS setup, mints a workspace API key, generates
-an operator token) and reports what still needs a human (missing secrets,
-readiness blocks). It never deploys to a cloud or moves money — that stays an
-explicit, separate step. Available to coding agents as the `rya_provision` MCP
-tool. See [src/rya/provision.py](src/rya/provision.py).
-
-## Real-time channel (WebSocket)
-
-Beyond signed HTTP webhooks, `rya serve` exposes a **bidirectional WebSocket** at
-`/ws` — drive the agent and watch a run execute live, step by step:
-
-```js
-const ws = new WebSocket("ws://localhost:8787/ws?token=$RYA_TOKEN");
-ws.onmessage = (e) => console.log(JSON.parse(e.data));   // ready → trace… → run
-ws.send(JSON.stringify({ type: "message", channel: "web",
-                         externalId: "user-7", content: "my export is broken" }));
-```
-
-Frames are JSON: `event`/`message` trigger a real run and stream every trace
-event the instant it happens, ending with a terminal `run` summary; `replay`
-re-streams a stored run; `ping`→`pong`. The conversational `message` form threads
-into a durable **session** and streams the agent's reply. Auth mirrors the HTTP
-API (`?token=` carries the operator token or `rya_sk_…` workspace key). Needs the
-`[api]` extra. See [src/rya/api/app.py](src/rya/api/app.py).
-
-## Evals (behavioural checks, gate-able)
-
-The readiness gate proves an agent *could* ship; **evals** prove it *behaves*.
-Cases live in `rya.evals.yaml` — each fires a real event and scores the run:
-
-```bash
-rya eval --json     # runs every case; exits non-zero if any fails
-```
-
-```yaml
-evals:
-  - id: high_risk_pauses_for_approval
-    trigger: { type: message.received, payload: { email: "risk@acme.io" } }
-    expect:
-      status: waiting_approval
-      tools_called: [crm.lookup]
-      approval_requested: true
-```
-
-Scorers are deterministic (`status`, `tools_called`, `approval_requested`,
-`no_failure`, `result_contains`, `max_tokens`, `max_cost`, `trace_has/lacks`)
-plus an optional LLM `judge` (skipped on the mock provider so the suite stays
-runnable offline). `rya eval` exits non-zero on any failure, so you gate a deploy
-on **behaviour** like `rya deploy --check` gates on readiness — and the console's
-**Evals** view runs the suite with one click. Also the `rya_eval` MCP tool. See
-[src/rya/evals.py](src/rya/evals.py).
-
-## Production-readiness gate
-
-A coding agent can write a handler; it can't *know production*. So Rya encodes
-the production bar as a machine-checkable checklist — make it green to ship:
-
-```bash
-rya deploy --check --json    # blocks (must fix) + warnings, each with an exact fix
-```
-
-Blockers (deploy-stopping, e.g. `E_UNGATED_SIDE_EFFECT`, `E_SECRET_UNSET`,
-`E_TOOL_NO_IMPL`, `E_NO_EVENT_HANDLER`) carry a stable code + the fix; warnings
-(mock LLM, file store, no trace export…) are advisory. A plain `rya deploy`
-runs the check as a **hard gate** (`E_NOT_PRODUCTION_READY` unless `--force`),
-so an unsafe agent is un-shippable. The verdict also rides along in
-`rya context`, so the agent's one orient call already knows what to fix.
-
-## Action Guard (egress firewall)
-
-Every outbound request the runtime makes — HTTP tools, model calls, channel
-sends — is checked **before the bytes leave the process**:
-
-```
-SSRF blocklist  →  deny rules  →  allow rules  →  default (deny | allow)
-```
-
-The policy lives in `rya.guard.yaml` (hot-reloaded on save; a no-op if absent).
-A blocked request raises `E_EGRESS_BLOCKED` and never goes out — real
-network-level blocking, editable live in the console's **Action Guard** page,
-with a built-in policy test suite. See [src/rya/guard.py](src/rya/guard.py).
-
-## Connected credentials (scoped, vaulted, delegated)
-
-The industry default is still an unscoped API key the agent can read — over-broad
-and leakable. Rya makes a tool's credential a **scoped connection** instead:
-
-```bash
-rya connect github --scopes "issues:write,repo:read" --token "$GH_TOKEN"
-rya connections list          # provider, scopes, owner, status — never the secret
-```
-
-A tool binds to a provider in the manifest (`provider: github`, `scopes:
-[issues:write]`). At call time the runtime enforces the **intersection rule** —
-a tool may run only if its required scopes are within *(connection scopes ∩ the
-requesting user's scopes)* — then **injects the secret** into the call. The secret
-is protected in three places: **encrypted at rest** (Fernet; key from
-`RYA_SECRET_KEY` / KMS in production, or a per-project `0600` keyfile for dev),
-**redacted** from every trace/log, and **never returned** by any read — the
-handler and model never see it. A missing connection raises `E_NO_CONNECTION`; an
-out-of-scope call raises `E_SCOPE_DENIED`, before any bytes leave the process.
-Connections are per-user/workspace under the same RLS as runs. CLI + the
-`rya_connect` MCP tool + a console **Connections** view. See
-[src/rya/seal.py](src/rya/seal.py) and [src/rya/sdk/context.py](src/rya/sdk/context.py).
-
-## Coding-agent surfaces
-
-Four ways a coding agent drives Rya, all over the same operations:
-
-```bash
-rya <cmd> --json        # 1. CLI — every command emits machine-readable JSON
-rya mcp                 # 2a. MCP server (stdio) — 25 rya_* tools  [pip install 'rya[mcp]']
-rya mcp --http          # 2b. REMOTE MCP over HTTP — agents connect by URL, no local install
-rya skills install      # 3. Skills — teach the workflow so agents don't guess
-rya context --json      #    one-call orient: state + readiness + the rules to respect
-rya provision --json    #    stand up the full base infra inventory (rya_provision tool)
-```
-
-See [docs/mcp.md](docs/mcp.md) for the tool list and how to register the MCP
-server with Claude Code.
-
-## Remote MCP & hosted instances
-
-`rya serve` is a **single hosted origin** for everything — the control plane, the
-console, the real-time WebSocket, **and remote MCP at `/mcp`**. An agent in any
-editor connects to the URL with no local Rya install:
-
-```jsonc
-// .mcp.json (Claude Code / Cursor)
-{ "mcpServers": { "rya": {
-  "type": "http", "url": "https://your-rya-host/mcp",
-  "headers": { "Authorization": "Bearer ${RYA_TOKEN}" } } } }
-```
-
-Point the CLI and your agent at a hosted instance in one command:
-
-```bash
-rya login https://rya.yourco.com --key rya_sk_…   # verifies, stores creds, prints .mcp.json
-rya whoami                                          # cloud → https://rya.yourco.com
-rya cloud send --type message.received --payload '{"email":"a@b.co"}'   # drive the hosted agent
-rya cloud approvals && rya cloud approve <id>       # resume a hosted run
-rya logout                                          # back to the local runtime
-```
-
-`GET /v1/info` advertises the endpoints (remote MCP, API, console, WebSocket).
-In **multi-tenant** mode (`RYA_MULTITENANT=1` + Postgres), `POST /v1/projects`
-self-provisions a project — a workspace + a one-time `rya_sk_…` API key — the
-hosted "create a project" flow (gate signup with `RYA_ADMIN_TOKEN`). Remote MCP
-is auth-gated: when `RYA_TOKEN` is set, `/mcp` requires it. Nothing phones home —
-the cloud is strictly opt-in (`rya login` / `RYA_REMOTE_URL`). Deploy the same
-runtime to your own host via `docker compose` / `rya deploy` artifacts — there is
-no separate cloud build; the hosted instance *is* `rya serve`.
-
-See [docs/primitives.md](docs/primitives.md), [docs/devex.md](docs/devex.md), and
-[docs/mcp.md](docs/mcp.md).
-
-## Repository map
-
-Every module has an `AGENTS.md` describing what it does, its key files, and its
-gotchas - written so a coding agent can orient without reading the source. Start
-at [`src/rya/AGENTS.md`](src/rya/AGENTS.md) for the package overview and the
-single-file module index.
-
-| Path | What it is |
-| --- | --- |
-| [`src/rya/`](src/rya/AGENTS.md) | The runtime package: overview + `store.py`, `tenancy.py`, `queue.py`, `turns.py`, `guard.py`, `evals.py`, `readiness.py`, `snapshot.py`, ... |
-| [`src/rya/sdk/`](src/rya/sdk/AGENTS.md) | `define_agent()` and the `ctx` runtime surface - the heart of Rya |
-| [`src/rya/runtime/`](src/rya/runtime/AGENTS.md) | The engine: load, execute, pause/resume, retries, cron |
-| [`src/rya/providers/`](src/rya/providers/AGENTS.md) | Real seams: LLM (Anthropic/OpenAI/mock), channels, embeddings |
-| [`src/rya/manifest/`](src/rya/manifest/AGENTS.md) | `rya.agent.yaml` schema + loader |
-| [`src/rya/tools/`](src/rya/tools/AGENTS.md) | Permissioned tool registry + real built-ins |
-| [`src/rya/models/`](src/rya/models/AGENTS.md) | Custom-model registry |
-| [`src/rya/approvals/`](src/rya/approvals/AGENTS.md) | The pause/resume signal |
-| [`src/rya/api/`](src/rya/api/AGENTS.md) | FastAPI control plane: REST, webhook, WebSocket, SSE, console, MCP |
-| [`src/rya/observability/`](src/rya/observability/AGENTS.md) | Logs, token/cost usage, run export |
-| [`src/rya/mcp/`](src/rya/mcp/AGENTS.md) | MCP server + testable ops |
-| [`src/rya/cli/`](src/rya/cli/AGENTS.md) | The `rya` CLI + scaffolding + deploy templates |
-| [`src/rya/console/`](src/rya/console/AGENTS.md) | The built-in web console (single-file SPA) |
-| [`src/rya/skills/`](src/rya/skills/AGENTS.md) | Bundled coding-agent skills |
-| [`clients/typescript/`](clients/typescript/AGENTS.md) | `@plexe/rya` typed TS client + queue worker |
-| [`deploy/`](deploy/AGENTS.md) | AWS IaC (single-tenant Fargate/RDS/Cognito) + deploy recipe |
-| [`examples/`](examples/AGENTS.md) | Runnable reference agents |
-| `tests/` | pytest suite (file + Postgres); run with `pytest -q`, set `RYA_TEST_DATABASE_URL` for the Postgres path |
-
-## Contributing / working in this repo
-
-- **Read the module's `AGENTS.md` first.** It names the load-bearing mechanics
-  (journaling, permission resolution, the store surface) you must not break.
-- **Tests**: `pip install -e '.[api,mcp,postgres,llm,dev]'` then `pytest -q`.
-  Postgres-gated tests need `RYA_TEST_DATABASE_URL` (a throwaway
-  `postgres:16` container works).
-- **Durability rule**: any new side-effecting `ctx.*` operation must route
-  through `RuntimeContext._step`/`_astep` so replay-after-approval memoizes it.
-- **Store parity**: `FileStore` and `PostgresStore` keep an identical method
-  surface. Add a method to both.
-- **Errors** carry a stable `E_*` code from `errors.py`; **UI** follows the
-  standing design system (no emojis, no em dashes, `" - "` instead).
-- Real providers enforce the tool-use protocol the mock does not - integration-
-  test multi-tool loops against a real key.
+## Learn more
+
+- **[Repository map](src/rya/AGENTS.md)** - the codebase, module by module. Every
+  directory has an `AGENTS.md` written so a coding agent can orient fast.
+- **[Deep dive](docs/DEEP_DIVE.md)** and **[primitives](docs/primitives.md)** -
+  the full picture and every `ctx.*` primitive.
+- **[MCP setup](docs/mcp.md)** - point Claude Code / Cursor at Rya.
+
+Honest about maturity: the durable-execution primitives are correct and tested
+but young (not yet load-tested at high volume), and there is no one-click managed
+cloud yet. Everything above runs today.

@@ -228,6 +228,7 @@
       <button data-v="jobs"><i data-lucide="clock"></i>Jobs &amp; cron</button>
       <button data-v="queue"><i data-lucide="list-ordered"></i>Queue &amp; turns<span class="ct" data-ct="queue"></span></button>
       <button data-v="secrets"><i data-lucide="key-round"></i>Secrets<span class="ct" data-ct="secrets"></span></button>
+      <button data-v="team"><i data-lucide="users"></i>Team &amp; access</button>
     </nav>
     <div class="side-foot"><div class="ava" id="meAva">RY</div><div><div class="me" id="meName">—</div><div class="em" id="meEmail">—</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
   </aside>
@@ -274,6 +275,7 @@
       <div class="view wrap hidden" id="v-secrets"><div class="h2">Secrets</div><div class="sub">Names only, never values — they never reach the agent.</div><div id="secretsBody"></div></div>
       <div class="view wrap hidden" id="v-evals"><div class="h2">Evals</div><div class="sub">Behavioural checks — each case fires a real event and scores the run. Gate a deploy on it with <span class="mono">rya eval</span>.</div><div style="margin-bottom:16px"><button class="btn dark sm" id="evalRunBtn" onclick="runEvals()"><i data-lucide="play"></i>Run evals</button></div><div id="evalsBody"><div class="empty">Loading cases…</div></div></div>
       <div class="view wrap hidden" id="v-guard"><div class="h2">Action Guard</div><div class="sub">Every outbound request the agent makes is checked against the SSRF blocklist and the rules below, then forwarded or blocked — before it leaves the process. Edits take effect immediately.</div><div id="guardBody"><div class="empty">Loading policy…</div></div></div>
+      <div class="view wrap hidden" id="v-team"><div class="h2">Team &amp; access</div><div class="sub">Who can open this workspace, the API keys minted for it, and your account. Removing a member also revokes every key they minted.</div><div id="teamBody"><div class="empty">Loading…</div></div></div>
     </div>
   </main>
 </div>
@@ -315,7 +317,7 @@
 const API = (new URLSearchParams(location.search).get('api') || '').replace(/\/$/,'');
 const TKEY = 'rya_token';
 const getToken = () => localStorage.getItem(TKEY) || '';
-const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','queue','secrets'];
+const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','runs','conversations','approvals','evals','guard','jobs','queue','secrets','team'];
 let STATE = null, wasLive = null, lastFocus = null;
 const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 // JS-string-escape for ids interpolated into inline handlers (defense-in-depth).
@@ -350,17 +352,19 @@ async function doSignup(){
   const email=document.getElementById('suEmail').value.trim(), pass=document.getElementById('suPass').value, ws=document.getElementById('suWs').value.trim()||'My workspace';
   authErr(''); if(!email||pass.length<8){ authErr('Enter an email and an 8+ character password.'); return; }
   try{ const d=await authPost('/v1/signup',{email,password:pass,workspaceName:ws});
+    if(d.token) saveSession(d.token,email);
     // show the key once, then enter
     document.getElementById('ap-signup').classList.add('hidden'); document.querySelector('.atab.on')?.classList.remove('on');
     const p=document.getElementById('ap-ws'); p.classList.remove('hidden');
     p.innerHTML='<div class="keynote">Workspace <span class="mono">'+esc(d.workspace.name)+'</span> created. Your API key (saved in this browser — copy it somewhere safe):<br><span class="mono">'+esc(d.apiKey)+'</span></div><button class="btn dark" onclick="enterWithKey(\''+jss(d.apiKey)+'\')"><i data-lucide="arrow-right"></i>Open console</button>'; icons();
   }catch(e){ authErr(e.message); }
 }
-let SESSION=null;
+let SESSION=localStorage.getItem('rya_session')||null;
+function saveSession(token,email){ SESSION=token; localStorage.setItem('rya_session',token); if(email)localStorage.setItem('rya_email',email); }
 async function doLogin(){
   const email=document.getElementById('liEmail').value.trim(), pass=document.getElementById('liPass').value;
   authErr(''); if(!email||!pass){ authErr('Enter your email and password.'); return; }
-  try{ const d=await authPost('/v1/login',{email,password:pass}); SESSION=d.token; renderWorkspaces(d.workspaces||[]); }
+  try{ const d=await authPost('/v1/login',{email,password:pass}); saveSession(d.token,email); renderWorkspaces(d.workspaces||[]); }
   catch(e){ authErr(e.message); }
 }
 function renderWorkspaces(wss){
@@ -397,7 +401,7 @@ async function inviteTo(wsId,wsName){
 function showKeyThenEnter(name,key){ const p=document.getElementById('ap-ws'); p.innerHTML='<div class="keynote">Workspace <span class="mono">'+esc(name)+'</span> ready. API key (saved in this browser):<br><span class="mono">'+esc(key)+'</span></div><button class="btn dark" onclick="enterWithKey(\''+jss(key)+'\')"><i data-lucide="arrow-right"></i>Open console</button>'; icons(); }
 function hideAuth(){ document.getElementById('authwrap').style.display='none'; if(lastFocus&&lastFocus.focus){try{lastFocus.focus();}catch(e){}} }
 function saveToken(){ const v=document.getElementById('tokInput').value.trim(); if(!v)return; localStorage.setItem(TKEY,v); hideAuth(); refresh(); }
-function signOut(){ localStorage.removeItem(TKEY); showAuth(); }
+function signOut(){ localStorage.removeItem(TKEY); localStorage.removeItem('rya_session'); localStorage.removeItem('rya_email'); SESSION=null; showAuth(); }
 function icons(){ if(window.lucide&&lucide.createIcons) lucide.createIcons({attrs:{'stroke-width':1.85,'aria-hidden':'true','focusable':'false'}}); }
 // Modal a11y: Escape closes, Tab is trapped inside the dialog.
 document.addEventListener('keydown',e=>{
@@ -411,7 +415,7 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{ const t=e.target;
   if((e.key==='Enter'||e.key===' ')&&t.classList&&t.classList.contains('clickable')){ e.preventDefault(); t.click(); } });
 
-function show(v){views.forEach(x=>document.getElementById('v-'+x).classList.toggle('hidden',x!==v));document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));document.querySelector('.scroll').scrollTop=0;document.getElementById('traceBody').innerHTML='';document.getElementById('threadBody').innerHTML='';document.getElementById('turnStreamBody').innerHTML='';document.querySelector('.side').classList.remove('open');if(v==='guard')loadGuard();if(v==='evals')loadEvals();if(v==='queue')loadQueue();if(v==='tools')loadToolSwitches();}
+function show(v){views.forEach(x=>document.getElementById('v-'+x).classList.toggle('hidden',x!==v));document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));document.querySelector('.scroll').scrollTop=0;document.getElementById('traceBody').innerHTML='';document.getElementById('threadBody').innerHTML='';document.getElementById('turnStreamBody').innerHTML='';document.querySelector('.side').classList.remove('open');if(v==='guard')loadGuard();if(v==='evals')loadEvals();if(v==='queue')loadQueue();if(v==='tools')loadToolSwitches();if(v==='team')loadTeam();}
 document.querySelectorAll('#nav button,#nav2 button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.v)));
 function toggleNav(){ document.querySelector('.side').classList.toggle('open'); }
 
@@ -810,6 +814,76 @@ async function openTurnStream(id){
   body.innerHTML=`<div class="secrow"><span class="l">Turn stream · ${esc(id)}</span><span class="r mono">${frames.length} frames · durable buffer</span></div><div class="window" style="padding:10px 16px"><div class="trace">${html}</div></div>`;
   icons();
   body.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+// ---- Team & access -----------------------------------------------------------
+async function v1(path,opts){
+  const r=await fetch(API+path,Object.assign({headers:{'content-type':'application/json','Authorization':'Bearer '+SESSION}},opts||{}));
+  const d=await r.json().catch(()=>({}));
+  if(r.status===401){ SESSION=null; localStorage.removeItem('rya_session'); }
+  if(!r.ok) throw Object.assign(new Error((d.detail&&d.detail.message)||('HTTP '+r.status)),{status:r.status});
+  return d;
+}
+async function loadTeam(){
+  const body=document.getElementById('teamBody');
+  const wsId=STATE&&STATE.viewer&&STATE.viewer.workspace;
+  const me=localStorage.getItem('rya_email')||'';
+  if(!SESSION){
+    body.innerHTML=`<div class="downcard"><div class="dic"><i data-lucide="users"></i></div><h3>Sign in to manage the team</h3><p>Team management needs your account session (the API key only scopes data access). Sign in with your email to invite, remove, and manage keys.</p><div class="dbtns"><button class="btn dark sm" onclick="signOut()"><i data-lucide="log-in"></i>Sign in</button></div></div>`;
+    icons(); return;
+  }
+  let members=null, keys=null, ownerView=true;
+  try{ members=(await v1(`/v1/workspaces/${encodeURIComponent(wsId)}/members`)).members;
+       keys=(await v1(`/v1/workspaces/${encodeURIComponent(wsId)}/keys`)).keys; }
+  catch(e){ if(e.status===403) ownerView=false; else { body.innerHTML=empty('Team unavailable — '+e.message); return; } }
+  let html='';
+  if(ownerView){
+    html+=`<div class="secrow"><span class="l">Members</span><span class="r">${members.length} invited · removing a member revokes their keys</span></div>`;
+    html+= (members.length? table(['Email','Role','Status','Invited',''],
+      members.map(m=>[`<span class="mono">${esc(m.email)}</span>`,`<span class="ptag">${esc(m.role)}</span>`,
+        m.claimed?'<span class="stbadge ok"><span class="d"></span>active</span>':'<span class="stbadge wait"><span class="d"></span>invited</span>',
+        `<span class="dim">${esc((m.invitedAt||'').replace('T',' ').replace('Z',''))}</span>`,
+        `<button class="btn sm" onclick="teamRemove('${jss(m.email)}')">Remove</button>`])) : empty('No members yet — invite your team below.'));
+    html+=`<div class="grow2" style="margin:10px 0 0"><input id="invEmail" class="gin" placeholder="teammate@company.com" style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter')teamInvite()"/><button class="btn dark sm" onclick="teamInvite()"><i data-lucide="user-plus"></i>Invite</button></div>`;
+    html+=`<div class="secrow"><span class="l">API keys</span><span class="r">metadata only — values are shown once at mint time</span></div>`;
+    html+= (keys.length? table(['Label','Created','Key id',''],
+      keys.map(k=>[esc(k.label||'—'),`<span class="dim">${esc((k.createdAt||'').replace('T',' ').replace('Z',''))}</span>`,
+        `<span class="mono dim">${esc(k.id)}</span>`,
+        `<button class="btn sm" onclick="teamRevoke('${jss(k.id)}')">Revoke</button>`])) : empty('No keys.'));
+  } else {
+    html+=`<div class="gcard"><div class="gch"><span class="gct">Membership</span></div><div class="sub" style="margin:0">You are a <strong>member</strong> of this workspace. Members and keys are managed by the workspace owner.</div></div>`;
+  }
+  html+=`<div class="secrow"><span class="l">Your account</span><span class="r mono">${esc(me)}</span></div>`+
+    `<div class="gcard"><div class="gch"><span class="gct">Change password</span></div>`+
+    `<div class="grow2" style="margin-top:0"><input id="pwCur" class="gin" type="password" placeholder="current password"/>`+
+    `<input id="pwNew" class="gin" type="password" placeholder="new password (8+)"/>`+
+    `<button class="btn dark sm" onclick="changePw()"><i data-lucide="key-round"></i>Update</button></div></div>`;
+  body.innerHTML=html; icons();
+}
+async function teamInvite(){
+  const email=document.getElementById('invEmail').value.trim(); if(!email)return;
+  const wsId=STATE.viewer.workspace;
+  try{ const d=await v1(`/v1/workspaces/${encodeURIComponent(wsId)}/members`,{method:'POST',body:JSON.stringify({email})});
+    toast('Invited '+email+(d.claimed?' — access is live now':' — access starts at signup')); loadTeam(); }
+  catch(e){ toast('Invite failed — '+e.message); }
+}
+async function teamRemove(email){
+  if(!confirm('Remove '+email+' and revoke every key they minted for this workspace?'))return;
+  try{ const d=await v1(`/v1/workspaces/${encodeURIComponent(STATE.viewer.workspace)}/members/${encodeURIComponent(email)}`,{method:'DELETE'});
+    toast('Removed '+email+' · '+(d.keysRevoked||0)+' key(s) revoked'); loadTeam(); }
+  catch(e){ toast('Remove failed — '+e.message); }
+}
+async function teamRevoke(keyId){
+  if(!confirm('Revoke key '+keyId+'? Anything using it stops working immediately.'))return;
+  try{ await v1(`/v1/workspaces/${encodeURIComponent(STATE.viewer.workspace)}/keys/${encodeURIComponent(keyId)}`,{method:'DELETE'});
+    toast('Key revoked'); loadTeam(); }
+  catch(e){ toast('Revoke failed — '+e.message); }
+}
+async function changePw(){
+  const cur=document.getElementById('pwCur').value, nw=document.getElementById('pwNew').value;
+  if(!cur||nw.length<8){ toast('Enter your current password and a new one (8+).'); return; }
+  try{ await v1('/v1/password',{method:'POST',body:JSON.stringify({current:cur,new:nw})});
+    toast('Password updated'); document.getElementById('pwCur').value=''; document.getElementById('pwNew').value=''; }
+  catch(e){ toast('Update failed — '+e.message); }
 }
 // ---- Tools: runtime kill switches ------------------------------------------
 // TOOL_EFF caches GET /tools (effective permissions + overrides); renderTools

@@ -239,3 +239,57 @@ def test_workspace_membership_invite_and_claim(tmp_path, monkeypatch):
     # Owner sees the member list with claim state.
     members = client.get(f"/v1/workspaces/{ws_id}/members", headers=oh).json()["members"]
     assert members[0]["email"] == "teammate@csa.test" and members[0]["claimed"] is True
+
+
+def test_key_management_removal_and_password(tmp_path, monkeypatch):
+    """Owner lists/revokes keys; removing a member revokes their keys; change
+    password requires the current one and takes effect immediately."""
+    from fastapi.testclient import TestClient
+    from rya.api.app import build_app
+    from rya.cli import scaffold
+    from rya.tenancy import Tenancy
+    import psycopg
+
+    monkeypatch.setenv("RYA_DATABASE_URL", PG)
+    monkeypatch.setenv("RYA_MULTITENANT", "1")
+    t = Tenancy(PG)
+    t.setup()
+    with psycopg.connect(PG, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("TRUNCATE rya_runs, rya_approvals, rya_jobs, rya_memory")
+        cur.execute("TRUNCATE rya_workspace_members, rya_api_keys, rya_users CASCADE")
+        cur.execute("TRUNCATE rya_workspaces CASCADE")
+
+    scaffold.write_project(tmp_path, "mgmt-agent", template="demo")
+    client = TestClient(build_app(tmp_path))
+
+    owner = client.post("/v1/signup", json={"email": "own@csa.test", "password": "password123",
+                                            "workspaceName": "W"}).json()
+    ws, oh = owner["workspace"]["id"], {"Authorization": "Bearer " + owner["token"]}
+
+    client.post(f"/v1/workspaces/{ws}/members", json={"email": "m@csa.test"}, headers=oh)
+    mate = client.post("/v1/signup", json={"email": "m@csa.test", "password": "password123"}).json()
+    mh = {"Authorization": "Bearer " + mate["token"]}
+    mate_key = client.post(f"/v1/workspaces/{ws}/keys", json={}, headers=mh).json()["apiKey"]
+    assert client.get("/tools", headers={"Authorization": "Bearer " + mate_key}).status_code == 200
+
+    # owner sees key metadata (values never listed) and can revoke one
+    keys = client.get(f"/v1/workspaces/{ws}/keys", headers=oh).json()["keys"]
+    assert all("key" not in k and "hash" not in str(k).lower() for k in keys)
+    assert any(k["label"] == "m@csa.test" for k in keys)
+
+    # removing the member revokes their minted key -> access actually gone
+    r = client.delete(f"/v1/workspaces/{ws}/members/m@csa.test", headers=oh).json()
+    assert r["removed"] is True and r["keysRevoked"] == 1
+    assert client.get("/tools", headers={"Authorization": "Bearer " + mate_key}).status_code == 401
+    login = client.post("/v1/login", json={"email": "m@csa.test", "password": "password123"}).json()
+    assert all(w["id"] != ws for w in login["workspaces"])
+
+    # password change: wrong current rejected; new one takes effect
+    assert client.post("/v1/password", json={"current": "wrong", "new": "newpassword1"},
+                       headers=oh).status_code == 401
+    assert client.post("/v1/password", json={"current": "password123", "new": "newpassword1"},
+                       headers=oh).json()["ok"] is True
+    assert client.post("/v1/login", json={"email": "own@csa.test",
+                                          "password": "password123"}).status_code == 401
+    assert client.post("/v1/login", json={"email": "own@csa.test",
+                                          "password": "newpassword1"}).json()["ok"] is True

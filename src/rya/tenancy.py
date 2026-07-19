@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS rya_api_keys (
     label TEXT,
     created_at TEXT
 );
+ALTER TABLE rya_api_keys ADD COLUMN IF NOT EXISTS created_by TEXT;
 CREATE TABLE IF NOT EXISTS rya_workspace_members (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES rya_workspaces(id) ON DELETE CASCADE,
@@ -291,7 +292,8 @@ class Tenancy:
         key = self.create_api_key(ws["id"], label="default")
         return {"user": user, "workspace": ws, "apiKey": key["key"]}
 
-    def create_api_key(self, workspace_id: str, label: str = "") -> dict:
+    def create_api_key(self, workspace_id: str, label: str = "",
+                       created_by: Optional[str] = None) -> dict:
         import secrets
 
         plaintext = "rya_sk_" + secrets.token_urlsafe(24)
@@ -299,11 +301,62 @@ class Tenancy:
                "createdAt": now_iso()}
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO rya_api_keys (id, workspace_id, key_hash, label, created_at) VALUES (%s,%s,%s,%s,%s)",
-                (rec["id"], workspace_id, hash_key(plaintext), label, rec["createdAt"]),
+                """INSERT INTO rya_api_keys (id, workspace_id, key_hash, label, created_at, created_by)
+                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                (rec["id"], workspace_id, hash_key(plaintext), label, rec["createdAt"], created_by),
             )
         # Plaintext returned ONCE; only the hash is persisted.
         return {**rec, "key": plaintext}
+
+    def list_keys(self, workspace_id: str) -> List[dict]:
+        """Key METADATA only - hashes never leave the store."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, label, created_at, created_by FROM rya_api_keys
+                   WHERE workspace_id=%s ORDER BY created_at""", (workspace_id,))
+            return [{"id": r[0], "label": r[1], "createdAt": r[2], "createdBy": r[3]}
+                    for r in cur.fetchall()]
+
+    def revoke_key(self, workspace_id: str, key_id: str) -> bool:
+        with self._conn.cursor() as cur:
+            cur.execute("DELETE FROM rya_api_keys WHERE id=%s AND workspace_id=%s",
+                        (key_id, workspace_id))
+            return cur.rowcount > 0
+
+    def remove_member(self, workspace_id: str, email: str) -> dict:
+        """Remove a member AND revoke every key they minted for this workspace -
+        removal must actually remove access, not just the list entry."""
+        email = (email or "").strip().lower()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM rya_workspace_members WHERE workspace_id=%s AND email=%s",
+                (workspace_id, email))
+            row = cur.fetchone()
+            if row is None:
+                return {"removed": False, "keysRevoked": 0}
+            uid = row[0]
+            revoked = 0
+            if uid:
+                cur.execute("DELETE FROM rya_api_keys WHERE workspace_id=%s AND created_by=%s",
+                            (workspace_id, uid))
+                revoked = cur.rowcount
+            cur.execute("DELETE FROM rya_workspace_members WHERE workspace_id=%s AND email=%s",
+                        (workspace_id, email))
+            return {"removed": True, "keysRevoked": revoked}
+
+    def change_password(self, user_id: str, current: str, new: str) -> None:
+        """Verify the current password, then set a new one."""
+        from .accounts import hash_password, verify_password
+        from .errors import RyaError
+        if len(new or "") < 8:
+            raise RyaError("E_VALIDATION", "The new password must be 8+ characters.")
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM rya_users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
+            if row is None or not verify_password(current, row[0]):
+                raise RyaError("E_UNAUTHORIZED", "Current password is incorrect.")
+            cur.execute("UPDATE rya_users SET password_hash=%s WHERE id=%s",
+                        (hash_password(new), user_id))
 
     def resolve_key(self, plaintext: str) -> Optional[str]:
         """Return the workspace_id for an API key, or None."""

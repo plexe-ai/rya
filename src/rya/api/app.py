@@ -1260,9 +1260,49 @@ def build_app(root: Path) -> FastAPI:
             body = await request.json()
         except Exception:
             pass
-        key = tenancy.create_api_key(ws_id, label=(body or {}).get("label") or s["email"])
+        key = tenancy.create_api_key(ws_id, label=(body or {}).get("label") or s["email"],
+                                     created_by=s["sub"])
         ws = next((w for w in tenancy.list_user_workspaces(s["sub"]) if w["id"] == ws_id), {"id": ws_id})
         return {"ok": True, "workspace": ws, "apiKey": key["key"]}
+
+    @api.get("/v1/workspaces/{ws_id}/keys")
+    def list_workspace_keys(ws_id: str, authorization: Optional[str] = Header(None),
+                            x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"], need_owner=True)
+        return {"keys": tenancy.list_keys(ws_id)}
+
+    @api.delete("/v1/workspaces/{ws_id}/keys/{key_id}")
+    def revoke_workspace_key(ws_id: str, key_id: str, authorization: Optional[str] = Header(None),
+                             x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"], need_owner=True)
+        return {"ok": tenancy.revoke_key(ws_id, key_id)}
+
+    @api.delete("/v1/workspaces/{ws_id}/members/{email}")
+    def remove_workspace_member(ws_id: str, email: str, authorization: Optional[str] = Header(None),
+                                x_rya_session: Optional[str] = Header(None)):
+        """Owner removes a member; every key that member minted for this
+        workspace is revoked with them."""
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        _require_access(ws_id, s["sub"], need_owner=True)
+        return {"ok": True, **tenancy.remove_member(ws_id, email)}
+
+    @api.post("/v1/password")
+    async def change_password(request: Request, authorization: Optional[str] = Header(None),
+                              x_rya_session: Optional[str] = Header(None)):
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        body = await request.json()
+        try:
+            tenancy.change_password(s["sub"], body.get("current") or "", body.get("new") or "")
+        except RyaError as e:
+            code = 401 if e.code == "E_UNAUTHORIZED" else 400
+            raise HTTPException(status_code=code, detail=e.to_dict()["error"])
+        return {"ok": True}
 
     # Mount remote MCP last so its catch-all under /mcp doesn't shadow API routes.
     if mcp_asgi is not None:

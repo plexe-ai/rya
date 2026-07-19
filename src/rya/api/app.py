@@ -249,21 +249,65 @@ def build_app(root: Path) -> FastAPI:
     # Remote MCP: mount the same MCP tools at /mcp so `rya serve` is a single
     # hosted origin for API + console + MCP. Optional (needs the [mcp] extra).
     mcp_asgi = None
-    mcp_lifespan = None
+    _mcp_sm = None
     try:
         from ..mcp.server import mounted_app
-        from contextlib import asynccontextmanager
         mcp_asgi, _mcp_sm = mounted_app()
-
-        @asynccontextmanager
-        async def mcp_lifespan(_app):
-            async with _mcp_sm.run():
-                yield
     except Exception:  # pragma: no cover - mcp extra absent / import issue
         mcp_asgi = None
-        mcp_lifespan = None
+        _mcp_sm = None
 
-    api = FastAPI(title="Rya Control Plane", version=manifest.version, lifespan=mcp_lifespan)
+    # ---- global turn-reclaim sweeper (the built-in cron) ------------------
+    # A crashed chat turn is reclaimable, but reclaim only happens when someone
+    # runs it. This background loop IS that someone: every RYA_TURN_SWEEP_SECONDS
+    # (default 30; 0 disables) it reclaims + runs crashed/pending turns - across
+    # ALL workspaces in multi-tenant mode. Interrupted turns therefore always
+    # finish without any external cron.
+    def _sweep_once() -> int:
+        from .. import turns as _t
+        total = 0
+        if mt:
+            for ws in tenancy.list_workspaces():
+                eng = engine_for(ws["id"])
+                try:
+                    total += len(_t.execute_pending(eng, worker_id="sweeper", limit=20))
+                finally:
+                    if hasattr(eng.store, "close"):
+                        eng.store.close()
+        else:
+            total += len(_t.execute_pending(base_engine, worker_id="sweeper", limit=20))
+        return total
+
+    async def _sweeper_loop(interval: float):
+        import asyncio
+        import logging
+        log = logging.getLogger("rya.turns.sweeper")
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                ran = await asyncio.to_thread(_sweep_once)
+                if ran:
+                    log.info("reclaimed %d turn(s)", ran)
+            except Exception:  # never let the sweeper kill the server
+                log.warning("turn sweep failed", exc_info=True)
+
+    from contextlib import AsyncExitStack, asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        import asyncio
+        sweep_seconds = float(os.environ.get("RYA_TURN_SWEEP_SECONDS", "30") or 0)
+        task = asyncio.create_task(_sweeper_loop(sweep_seconds)) if sweep_seconds > 0 else None
+        async with AsyncExitStack() as stack:
+            if _mcp_sm is not None:
+                await stack.enter_async_context(_mcp_sm.run())
+            try:
+                yield
+            finally:
+                if task is not None:
+                    task.cancel()
+
+    api = FastAPI(title="Rya Control Plane", version=manifest.version, lifespan=_lifespan)
 
     # CORS: the console is served SAME-ORIGIN by `rya serve`, so no CORS is needed
     # by default. Cross-origin callers (a dev console on another port) must be

@@ -155,6 +155,35 @@ def test_turn_http_roundtrip(tmp_path):
     assert ids == sorted(ids)  # monotonic id: fields for Last-Event-ID resume
 
 
+def test_background_sweeper_recovers_stranded_turn(tmp_path, monkeypatch):
+    """The built-in cron: a turn stranded before execution (crash) is picked up
+    by the serve-embedded sweeper loop with no reclaim call and no stream tail."""
+    import time
+
+    monkeypatch.setenv("RYA_TURN_SWEEP_SECONDS", "0.2")
+    scaffold.write_project(tmp_path, "turn-sweep-agent")
+
+    from rya.store import open_store
+    from rya.manifest import load_manifest as _lm
+    from rya.runtime import Engine as _E, load_agent as _la
+
+    m = _lm(tmp_path / "rya.agent.yaml")
+    eng = _E(m, _la(m, tmp_path), open_store(tmp_path), tmp_path)
+    tid = turns.create_turn(eng, "message.received", {"email": "ada@x.com"})["turnId"]
+    assert turns.read_stream(eng, tid) == []  # stranded - nothing ran it
+
+    with TestClient(build_app(tmp_path)):  # lifespan starts the sweeper
+        deadline = time.time() + 10
+        frames = []
+        while time.time() < deadline:
+            frames = turns.read_stream(eng, tid)
+            if frames and frames[-1]["kind"] in ("run", "error"):
+                break
+            time.sleep(0.2)
+    assert frames and frames[-1]["kind"] == "run", _kinds(frames)
+    assert eng.store.queue_get(tid)["status"] == "completed"
+
+
 def test_reclaim_endpoint(tmp_path):
     scaffold.write_project(tmp_path, "turn-reclaim-agent")
     app = build_app(tmp_path)

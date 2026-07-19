@@ -11,6 +11,10 @@
 
 **[Quickstart](#quickstart) · [Why it's different](#why-it-feels-different) · [Docs](docs/DEEP_DIVE.md) · [Deploy](deploy/AGENTS.md) · [Repository map](src/rya/AGENTS.md)**
 
+<br/>
+
+<img src="docs/assets/demo.gif" alt="A durable agent turn on Rya: streaming, a governed tool loop, recommendation cards, and a pause for human approval" width="820">
+
 </div>
 
 ---

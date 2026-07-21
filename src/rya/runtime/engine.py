@@ -293,8 +293,9 @@ class Engine:
                 return await asyncio.wait_for(invoke(), timeout)
             return await invoke()
 
+        out_box = {}
         try:
-            _run_coro(invoke_guarded())
+            out_box["value"] = _run_coro(invoke_guarded())
         except PausedForApproval as p:
             run["status"] = "waiting_approval"
             run["pendingApproval"] = p.approval_id
@@ -317,6 +318,9 @@ class Engine:
         else:
             run["status"] = "completed"
             run["pendingApproval"] = None
+            # The handler's return value is part of the run record: the console
+            # and API consumers read it as run.output (serialized default=str).
+            run["output"] = out_box.get("value")
             ctx._trace("run.completed", "ok", {})
 
         self.store.save_run(run)

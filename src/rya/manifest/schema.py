@@ -34,6 +34,8 @@ class ModelBlock(BaseModel):
     # provider drives ctx.llm. "auto" (default) = real if an API key is present,
     # else mock — keeps zero-config local dev working. "mock" forces the offline
     # deterministic stub; "anthropic"/"openai" require the matching API key.
+    # "adapter" is the keyless Governance Adapter path: no provider key, only a
+    # governance-minted Platform Token; fails closed (see providers/adapter.py).
     provider: str = "auto"
     default: str = "mock-llm"  # model name (e.g. claude-haiku-4-5-20251001, gpt-4.1-mini)
     fallback: Optional[str] = None
@@ -46,7 +48,7 @@ class ModelBlock(BaseModel):
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, v):
-        allowed = {"auto", "mock", "anthropic", "openai"}
+        allowed = {"auto", "mock", "anthropic", "openai", "adapter"}
         if v not in allowed:
             raise ValueError(f"model.provider must be one of {sorted(allowed)}")
         return v

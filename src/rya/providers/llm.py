@@ -30,7 +30,17 @@ _DEFAULT_OPENAI = "gpt-4.1-mini"
 
 
 def resolve_provider(provider: str = "auto") -> str:
-    """Resolve ``auto`` to a concrete provider based on which API key is present."""
+    """Resolve ``auto`` to a concrete provider based on which API key is present.
+
+    Keyless mode (``RYA_KEYLESS=1``) forces the Governance Adapter: it refuses
+    ``anthropic``/``openai`` even if a key is present, so a leaked credential is
+    never used. ``mock`` stays available for offline dev/tests (it holds no key),
+    and an explicit ``adapter`` always routes to the keyless path."""
+    if os.environ.get("RYA_KEYLESS") == "1":
+        from . import adapter as _adapter
+        _adapter.assert_keyless()
+        if provider in ("auto", "anthropic", "openai"):
+            return "adapter"
     if provider and provider != "auto":
         return provider
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -281,6 +291,11 @@ def respond(*, system: str, input: dict, model_default: str = "mock-llm", provid
         out = (_openai_stream(model_default, sys, content, temperature, max_tokens, on_token)
                if on_token else
                _openai(model_default, sys, content, temperature, max_tokens))
+    elif effective == "adapter":
+        # Keyless path: no provider key, only the Platform Token; fails closed.
+        from . import adapter as _adapter
+        out = _adapter.adapter_respond(model_default, sys, content, temperature,
+                                       max_tokens or (1024 if schema else None), on_token)
     else:
         text = _mock_stream(system, input, on_token) if on_token else _mock_text(system, input)
         out = {"text": text, "model": model_default, "provider": "mock", "usage": None}
@@ -325,6 +340,10 @@ def chat(*, messages: list, tools: Optional[list] = None, system: str = "",
         return _anthropic_chat(model_default, system, messages, tools, temperature, max_tokens)
     if effective == "openai":
         return _openai_chat(model_default, system, messages, tools, temperature, max_tokens)
+    if effective == "adapter":
+        # Keyless path: no provider key, only the Platform Token; fails closed.
+        from . import adapter as _adapter
+        return _adapter.adapter_chat(model_default, system, messages, tools, temperature, max_tokens)
     return _mock_chat(messages, tools)
 
 

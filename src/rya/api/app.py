@@ -900,12 +900,31 @@ def build_app(root: Path) -> FastAPI:
     def list_sessions(engine: Engine = Depends(get_engine)):
         return {"sessions": engine.store.list_sessions(manifest.name)}
 
+    @api.get("/sessions/find")
+    def find_session(channel: str, externalId: str, engine: Engine = Depends(get_engine)):
+        """Resolve the session for a (channel, externalId) identity - how a chat
+        client locates its own thread after a reload without listing everything."""
+        session = engine.store.find_session(manifest.name, channel, externalId)
+        if session is None:
+            raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
+        return session
+
     @api.get("/sessions/{session_id}")
     def get_session(session_id: str, engine: Engine = Depends(get_engine)):
         session = engine.store.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
         return session
+
+    @api.get("/sessions/{session_id}/messages")
+    def session_messages(session_id: str, limit: int = 200,
+                         engine: Engine = Depends(get_engine)):
+        """The durable transcript, oldest first - restored on client reload
+        (render instantly; never replay a typewriter)."""
+        if engine.store.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
+        msgs = engine.store.list_messages(session_id)
+        return {"messages": msgs[-limit:]}
 
     @api.get("/approvals")
     def list_approvals(status: Optional[str] = None, engine: Engine = Depends(get_engine)):

@@ -357,6 +357,8 @@ def eval_cmd(
             head = "[green]✓[/green]" if rep["ok"] else "[red]✗[/red]"
             console.print(f"{head} evals: {rep['passed']}/{rep['total']} passed "
                           f"(score {rep['score']})")
+            if rep.get("langfuse"):
+                console.print("  [dim]traces + scores exported to Langfuse[/dim]")
             for r in rep["results"]:
                 g = "[green]✓[/green]" if r["pass"] else "[red]✗[/red]"
                 console.print(f"  {g} [bold]{r['id']}[/bold]  [dim]{r['status']} · {r['runId']}[/dim]")

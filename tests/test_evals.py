@@ -96,3 +96,59 @@ def test_deepeval_faithfulness_discriminates_live():
     ok_good, _ = _score_deepeval(spec, run_with("The capital of France is Paris."), {})
     ok_bad, _ = _score_deepeval(spec, run_with("The capital of France is Berlin."), {})
     assert ok_good and not ok_bad
+
+
+def test_eval_scores_export_to_langfuse(tmp_path, monkeypatch):
+    """With LANGFUSE_* configured, every case's run exports as a trace (from the
+    engine) and its checks land as scores on that trace."""
+    from tests.test_export import _capture
+
+    manifest, agent, store = _project(tmp_path)
+    with _capture() as (url, captured):
+        monkeypatch.setenv("LANGFUSE_HOST", url)
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk")
+        rep = run_evals(manifest, agent, store, tmp_path)
+
+    assert rep["ok"] and rep["langfuse"] == "enabled"
+    assert all(r.get("langfuse") == "sent" for r in rep["results"])
+
+    batches = [body["batch"] for path, body in captured if path == "/api/public/ingestion"]
+    flat = [item for b in batches for item in b]
+    # engine exported each eval run as a trace...
+    traces = [i for i in flat if i["type"] == "trace-create"]
+    assert len(traces) == rep["total"]
+    # ...and the harness attached scores to those same trace ids
+    scores = [i for i in flat if i["type"] == "score-create"]
+    assert {s["body"]["traceId"] for s in scores} <= {t["body"]["id"] for t in traces}
+    names = {s["body"]["name"] for s in scores}
+    assert "eval:high_risk_pauses_for_approval" in names
+    assert "high_risk_pauses_for_approval:approval_requested" in names
+    verdicts = [s for s in scores if s["body"]["name"].startswith("eval:")]
+    assert all(s["body"]["value"] == 1.0 and s["body"]["dataType"] == "BOOLEAN" for s in verdicts)
+
+
+def test_numeric_scorer_value_exports_as_numeric(tmp_path, monkeypatch):
+    """A scorer returning (ok, detail, value) - like deepeval - exports NUMERIC."""
+    import rya.evals as ev
+    from tests.test_export import _capture
+
+    manifest, agent, store = _project(tmp_path)
+    (tmp_path / "rya.evals.yaml").write_text(
+        "evals:\n  - id: metric_case\n    trigger:\n      type: message.received\n"
+        "      payload: { email: a@b.co }\n    expect:\n      fake_metric: 0.5\n")
+    monkeypatch.setitem(ev.SCORERS, "fake_metric",
+                        lambda expected, run, env: (True, "fake score=0.83", 0.83))
+    with _capture() as (url, captured):
+        monkeypatch.setenv("LANGFUSE_HOST", url)
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk")
+        rep = run_evals(manifest, agent, store, tmp_path)
+
+    assert rep["ok"]
+    case = rep["results"][0]
+    assert case["checks"][0]["value"] == 0.83
+    flat = [i for _, body in captured for i in body["batch"]]
+    metric = next(i for i in flat if i["type"] == "score-create"
+                  and i["body"]["name"] == "metric_case:fake_metric")
+    assert metric["body"]["value"] == 0.83 and metric["body"]["dataType"] == "NUMERIC"

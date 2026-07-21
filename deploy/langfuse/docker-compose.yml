@@ -1,0 +1,144 @@
+# Self-hosted Langfuse v3 for Rya - traces, generations, and eval scores.
+#
+#   docker compose up -d          # UI on http://localhost:3300
+#
+# Headless-provisioned: the org/project/API keys below are created on first
+# boot (LANGFUSE_INIT_*), so Rya can export immediately with no UI clicks:
+#
+#   LANGFUSE_HOST=http://localhost:3300
+#   LANGFUSE_PUBLIC_KEY=pk-lf-rya-local
+#   LANGFUSE_SECRET_KEY=sk-lf-rya-local
+#
+# UI login: rya@local.dev / ryalangfuse  (change for anything non-local).
+# All secrets in this file are LOCAL-DEV defaults - override via env for any
+# shared deployment.
+
+services:
+  langfuse-web:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:3300:3000"
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse
+      SALT: rya-local-salt-not-for-prod
+      ENCRYPTION_KEY: 0e4680ba929c9b6b1a11c62e33f0b461e0fdf83ac1e5f4d0f96f0f4be7a5d8c1
+      NEXTAUTH_SECRET: rya-local-nextauth-secret
+      NEXTAUTH_URL: http://localhost:3300
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ryaredis
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      # Headless bootstrap: org + project + API keys + first user on first boot.
+      LANGFUSE_INIT_ORG_ID: rya
+      LANGFUSE_INIT_ORG_NAME: Rya
+      LANGFUSE_INIT_PROJECT_ID: rya-agents
+      LANGFUSE_INIT_PROJECT_NAME: Rya Agents
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-rya-local
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-rya-local
+      LANGFUSE_INIT_USER_EMAIL: rya@local.dev
+      LANGFUSE_INIT_USER_NAME: Rya Local
+      LANGFUSE_INIT_USER_PASSWORD: ryalangfuse
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    environment: *langfuse-env
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - langfuse_pg:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    user: "101:101"
+    # The image's docker config listens on "::" only; on hosts where the
+    # container network has IPv6 disabled every bind fails. Force IPv4.
+    entrypoint: ["/bin/sh", "-c",
+                 "echo '<clickhouse><listen_host>0.0.0.0</listen_host></clickhouse>' > /etc/clickhouse-server/config.d/listen_ipv4.xml && exec /entrypoint.sh"]
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    healthcheck:
+      # 127.0.0.1 explicitly: busybox wget resolves localhost to ::1 first, and
+      # the server listens on IPv4 only here.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - langfuse_ch:/var/lib/clickhouse
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ryaredis
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ryaredis ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server /data --address ":9000"'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - langfuse_minio:/data
+
+volumes:
+  langfuse_pg:
+  langfuse_ch:
+  langfuse_minio:

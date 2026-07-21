@@ -161,3 +161,33 @@ def test_real_engine_run_exports_to_otlp_and_langfuse(tmp_path, monkeypatch):
     assert any(a["key"] == "gen_ai.operation.name" for s in spans for a in s["attributes"])
     lf = next(b for p, b in captured if p == "/api/public/ingestion")
     assert any(i["type"] == "generation-create" for i in lf["batch"])
+
+
+def test_export_scores_ships_boolean_and_numeric():
+    from rya.observability.export import export_scores
+    scores = [
+        {"name": "eval:high_risk_pauses", "value": 1.0, "dataType": "BOOLEAN", "comment": "status=waiting_approval"},
+        {"name": "high_risk_pauses:deepeval", "value": 0.83, "dataType": "NUMERIC", "comment": "faithfulness score=0.83"},
+    ]
+    with _capture() as (url, captured):
+        res = export_scores("run_abc123", scores,
+                            {"LANGFUSE_HOST": url, "LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"})
+    assert res == "sent"
+    (path, body), = captured
+    assert path == "/api/public/ingestion"
+    batch = body["batch"]
+    assert [i["type"] for i in batch] == ["score-create", "score-create"]
+    assert all(i["body"]["traceId"] == "run_abc123" for i in batch)
+    b0, b1 = batch[0]["body"], batch[1]["body"]
+    assert b0["name"] == "eval:high_risk_pauses" and b0["value"] == 1.0 and b0["dataType"] == "BOOLEAN"
+    assert b1["value"] == 0.83 and b1["dataType"] == "NUMERIC" and "faithfulness" in b1["comment"]
+
+
+def test_export_scores_noop_without_config_and_survives_error():
+    from rya.observability.export import export_scores
+    assert export_scores("r1", [{"name": "x", "value": 1}], {}) is None
+    # unreachable host -> "error: ...", never an exception
+    res = export_scores("r1", [{"name": "x", "value": 1}],
+                        {"LANGFUSE_HOST": "http://127.0.0.1:9", "LANGFUSE_PUBLIC_KEY": "pk",
+                         "LANGFUSE_SECRET_KEY": "sk"})
+    assert res.startswith("error:")

@@ -185,7 +185,12 @@ def _score_deepeval(expected, run, env):
     if ctx is None:
         ctx = [str(e.get("data", {}).get("result")) for e in run.get("trace", [])
                if e.get("kind") == "tool.call"] or None
-    inp = spec.get("input") or json.dumps((run.get("trigger") or {}).get("payload", {}), default=str)
+    # Engine runs store trigger as a string ("event"/"api") with the event dict
+    # alongside; ingested runs may carry a dict trigger. Handle both.
+    trig, event = run.get("trigger"), run.get("event")
+    payload = ((trig.get("payload") if isinstance(trig, dict) else None)
+               or (event.get("payload") if isinstance(event, dict) else None) or {})
+    inp = spec.get("input") or json.dumps(payload, default=str)
     try:
         kwargs = {"input": inp, "actual_output": actual}
         if ctx:
@@ -197,7 +202,9 @@ def _score_deepeval(expected, run, env):
         metric.measure(tc)
         score = getattr(metric, "score", None)
         ok = getattr(metric, "is_successful", lambda: (score or 0) >= threshold)()
-        return bool(ok), f"{name} score={score} (threshold {threshold})"
+        # third element = the numeric metric score, exported to Langfuse as-is
+        return bool(ok), f"{name} score={score} (threshold {threshold})", (
+            float(score) if score is not None else None)
     except Exception as e:  # missing model key / network — skip, never break the harness
         return True, f"deepeval '{name}' skipped ({type(e).__name__}: {e})"
 
@@ -216,6 +223,42 @@ SCORERS = {
     "judge": _score_judge,
     "deepeval": _score_deepeval,
 }
+
+
+def _export_case_scores(cid: str, run: dict, checks: list, passed: bool, env: dict) -> Optional[str]:
+    """Push one eval case's results to Langfuse as scores on the run's trace.
+
+    The engine already exported the run itself as a trace, so scores attach by
+    ``traceId == run id``: the case verdict as ``eval:<id>`` (BOOLEAN), each
+    check as ``<id>:<check>`` (BOOLEAN, or NUMERIC when the scorer produced a
+    real metric value, e.g. DeepEval faithfulness). No-op unless LANGFUSE_* is
+    configured; never breaks the harness."""
+    from .observability.export import export_run, export_scores
+
+    run_id = run.get("id")
+    if not run_id:
+        return None
+    # The engine exports only terminal runs; an eval case can legitimately end
+    # paused (e.g. waiting_approval). Export those here so the scores have a
+    # trace to attach to.
+    if run.get("status") not in ("completed", "failed", "rejected"):
+        try:
+            export_run(run, env)
+        except Exception:
+            pass
+    scores = [{"name": f"eval:{cid}", "value": 1.0 if passed else 0.0,
+               "dataType": "BOOLEAN", "comment": f"status={run.get('status')}"}]
+    for c in checks:
+        if c.get("value") is not None:
+            scores.append({"name": f"{cid}:{c['check']}", "value": float(c["value"]),
+                           "dataType": "NUMERIC", "comment": c.get("detail")})
+        else:
+            scores.append({"name": f"{cid}:{c['check']}", "value": 1.0 if c["pass"] else 0.0,
+                           "dataType": "BOOLEAN", "comment": c.get("detail")})
+    try:
+        return export_scores(run_id, scores, env)
+    except Exception:
+        return None
 
 
 def run_evals(manifest, agent, store, root, only: Optional[str] = None) -> dict:
@@ -246,19 +289,29 @@ def run_evals(manifest, agent, store, root, only: Optional[str] = None) -> dict:
                 checks.append({"check": key, "pass": False, "detail": "unknown scorer"})
                 continue
             try:
-                ok, detail = scorer(expected, run, env)
+                out = scorer(expected, run, env)
+                ok, detail = out[0], out[1]
+                value = out[2] if len(out) > 2 else None  # numeric metric score, if any
             except Exception as e:
-                ok, detail = False, f"scorer error: {e}"
-            checks.append({"check": key, "pass": bool(ok), "detail": detail})
+                ok, detail, value = False, f"scorer error: {e}", None
+            check = {"check": key, "pass": bool(ok), "detail": detail}
+            if value is not None:
+                check["value"] = value
+            checks.append(check)
         passed = all(c["pass"] for c in checks) and error is None
+        exported = _export_case_scores(cid, run, checks, passed, env)
         results.append({"id": cid, "pass": passed, "runId": run.get("id"),
-                        "status": run.get("status"), "checks": checks, "error": error})
+                        "status": run.get("status"), "checks": checks, "error": error,
+                        **({"langfuse": exported} if exported else {})})
 
     n_pass = sum(1 for r in results if r["pass"])
+    lf_on = bool(env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY")
+                 and env.get("LANGFUSE_SECRET_KEY"))
     return {
         "ok": all(r["pass"] for r in results),
         "total": len(results), "passed": n_pass, "failed": len(results) - n_pass,
         "score": round(n_pass / len(results), 3) if results else None,
         "results": results,
         "hasEvals": bool(cases),
+        "langfuse": "enabled" if lf_on else None,
     }

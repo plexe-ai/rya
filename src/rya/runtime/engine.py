@@ -330,7 +330,8 @@ class Engine:
         if run["status"] in ("completed", "failed", "rejected"):
             try:
                 from ..observability.export import export_run
-                export_run(run)
+                from ..sdk.context import load_env
+                export_run(run, load_env(self.project_root))
             except Exception:
                 pass
         return run

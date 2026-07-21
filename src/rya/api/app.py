@@ -843,7 +843,8 @@ def build_app(root: Path) -> FastAPI:
         if status in ("completed", "failed", "rejected"):
             try:
                 from ..observability.export import export_run
-                export_run(run)
+                from ..sdk.context import load_env
+                export_run(run, load_env(engine.project_root))
             except Exception:
                 pass
         return {"ok": True, "runId": run["id"], "events": len(trace)}

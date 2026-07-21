@@ -108,6 +108,8 @@ pip install 'rya[api,mcp,postgres,llm]'    # full: control plane, MCP, Postgres,
 - **[Deep dive](docs/DEEP_DIVE.md)** and **[primitives](docs/primitives.md)** -
   the full picture and every `ctx.*` primitive.
 - **[MCP setup](docs/mcp.md)** - point Claude Code / Cursor at Rya.
+- **[Langfuse](docs/langfuse.md)** - self-host it in one compose; every run and
+  eval score lands there, deep evals via DeepEval.
 - **[RWAP on Rya](docs/integrations/rwap.md)** - running a visual agent builder's
   workflows on Rya's durable queue (architecture + AWS).
 

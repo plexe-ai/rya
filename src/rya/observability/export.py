@@ -86,13 +86,18 @@ def _langfuse(run: dict, env: dict) -> None:
     auth = base64.b64encode(f"{env['LANGFUSE_PUBLIC_KEY']}:{env['LANGFUSE_SECRET_KEY']}".encode()).decode()
     created = run.get("createdAt")
     rid = run["id"]
+    # Engine runs: trigger is a string and the event dict sits alongside.
+    # Ingested runs: trigger may itself be the dict. Prefer the richer one.
     trigger = run.get("trigger") or {}
+    event = run.get("event")
+    trace_input = event if isinstance(event, dict) else (
+        trigger if isinstance(trigger, dict) else {"trigger": trigger})
     batch = [{
         "id": f"{rid}-trace",
         "type": "trace-create",
         "timestamp": created,
         "body": {"id": rid, "name": run.get("agent"),
-                 "input": trigger, "output": run.get("result"),
+                 "input": trace_input, "output": run.get("result"),
                  "metadata": {"status": run.get("status"), "usage": run_usage(run, env),
                               "agentVersion": run.get("agentVersion")}},
     }]
@@ -203,6 +208,38 @@ def _otlp(run: dict, env: dict) -> None:
                 k, v = pair.split("=", 1)
                 headers[k.strip()] = v.strip()
     _post(endpoint, headers, payload)
+
+
+def export_scores(trace_id: str, scores: list, env: Optional[dict] = None) -> Optional[str]:
+    """Attach scores to an already-exported trace in Langfuse (``score-create``).
+
+    Evals call this so every eval check lands on the run's trace in the Langfuse
+    UI: pass/fail checks as BOOLEAN scores, metric scores (e.g. DeepEval
+    faithfulness) as NUMERIC. Each score dict: ``{name, value, comment?,
+    dataType?}``. Best-effort like every exporter here - returns "sent", an
+    "error: ..." string, or None when Langfuse isn't configured.
+    """
+    env = env or os.environ
+    if not (env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY") and env.get("LANGFUSE_SECRET_KEY")):
+        return None
+    auth = base64.b64encode(f"{env['LANGFUSE_PUBLIC_KEY']}:{env['LANGFUSE_SECRET_KEY']}".encode()).decode()
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    batch = []
+    for i, s in enumerate(scores):
+        sid = f"{trace_id}-score-{i}"
+        body = {"id": sid, "traceId": trace_id, "name": s["name"],
+                "value": float(s["value"]), "dataType": s.get("dataType", "NUMERIC")}
+        if s.get("comment"):
+            body["comment"] = str(s["comment"])[:500]
+        batch.append({"id": sid, "type": "score-create", "timestamp": now, "body": body})
+    if not batch:
+        return None
+    try:
+        host = env["LANGFUSE_HOST"].rstrip("/")
+        _post(f"{host}/api/public/ingestion", {"Authorization": f"Basic {auth}"}, {"batch": batch})
+        return "sent"
+    except Exception as e:
+        return f"error: {e}"
 
 
 def export_run(run: dict, env: Optional[dict] = None) -> dict:

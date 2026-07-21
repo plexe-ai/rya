@@ -1,0 +1,85 @@
+# Langfuse - traces and eval scores
+
+Rya owns the durable journal (replay depends on it) but does not try to be an
+observability product. Point it at a Langfuse - self-hosted or cloud - and every
+run and every eval score lands there automatically.
+
+## What gets exported
+
+- **Every finished run** becomes a Langfuse **trace**: LLM steps are
+  **generations** (model, input/output, token usage), tool calls are **spans**
+  (input, output, permission), everything else (approvals, guard checks,
+  memory writes) are **events**. Exported by the engine at terminal status;
+  ingested external runs (`POST /runs/ingest`) flow through too.
+- **Every eval case** attaches **scores** to its run's trace:
+  - `eval:<case-id>` - the case verdict (BOOLEAN)
+  - `<case-id>:<check>` - each individual check (BOOLEAN), e.g.
+    `high_risk_pauses_for_approval:approval_requested`
+  - metric checks export their real value (NUMERIC), e.g. a DeepEval
+    faithfulness of `0.83`
+  - a case that ends paused (`waiting_approval`) is still exported so its
+    scores have a trace to attach to.
+
+Everything is best-effort: an export failure never breaks a run or an eval.
+
+## Configure
+
+Three env vars (in the project `.env` or the process environment):
+
+```bash
+LANGFUSE_HOST=http://localhost:3300
+LANGFUSE_PUBLIC_KEY=pk-lf-rya-local
+LANGFUSE_SECRET_KEY=sk-lf-rya-local
+```
+
+That's it. `rya dev`, `rya serve`, and `rya eval` all pick them up.
+
+## Self-host it
+
+```bash
+cd deploy/langfuse && docker compose up -d
+# UI:    http://localhost:3300   (rya@local.dev / ryalangfuse)
+# keys:  pk-lf-rya-local / sk-lf-rya-local (provisioned headlessly on first boot)
+```
+
+The compose file runs the full Langfuse v3 stack (web, worker, Postgres,
+ClickHouse, Redis, MinIO) with local-dev credentials baked in - override every
+secret via env before exposing it anywhere. The web port binds to 127.0.0.1
+only.
+
+## Deep evals
+
+Behavioural checks (status, tools called, approvals, cost caps) are native to
+`rya eval`. LLM-output-quality metrics are delegated to
+[DeepEval](https://github.com/confident-ai/deepeval):
+
+```bash
+pip install 'rya[deepeval]'
+```
+
+```yaml
+# rya.evals.yaml
+evals:
+  - id: refund_reply_grounded
+    trigger: { type: message.received, payload: { email: ada@acme.io } }
+    expect:
+      status: waiting_approval
+      deepeval: { metric: faithfulness, threshold: 0.7 }
+```
+
+Metrics: `faithfulness`, `answer_relevancy`, `hallucination`, `bias`,
+`toxicity`, `contextual_relevancy` / `_precision` / `_recall`. The metric's own
+judge uses your Anthropic or OpenAI key (`RYA_DEEPEVAL_MODEL` to pin one).
+Retrieval context defaults to the run's tool results, so faithfulness scores
+"did the reply stick to what the tools returned" with zero extra config. The
+numeric score is exported to Langfuse per case, so you can chart eval quality
+over time next to the traces that produced it.
+
+Offline behaviour is honest but non-blocking: with no provider key the judge
+and DeepEval checks are SKIPPED (reported as such), never silently failed.
+
+## Also speaks OTLP
+
+`RYA_OTLP_ENDPOINT` exports the same runs as OpenTelemetry GenAI spans (Arize
+Phoenix, Grafana Tempo, Datadog...), and `RYA_TRACE_WEBHOOK` POSTs run
+summaries anywhere. All three can be enabled at once.

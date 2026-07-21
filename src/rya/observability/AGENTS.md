@@ -13,7 +13,10 @@ best-of-breed tools.
   Rya never hard-codes provider prices.
 - `export.py` - `export_run(run)` ships a finished run to a configured backend:
   Langfuse (`LANGFUSE_HOST`), OTLP, or a webhook (`RYA_TRACE_WEBHOOK`).
-  Best-effort: never lets an export failure break a run.
+  `export_scores(trace_id, scores)` attaches eval scores to a run's Langfuse
+  trace (the eval harness calls it per case). Best-effort: never lets an
+  export failure break a run. Self-hosted stack: `deploy/langfuse/`; guide:
+  `docs/langfuse.md`.
 
 ## Division of labor
 

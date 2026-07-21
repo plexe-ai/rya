@@ -27,3 +27,9 @@ AWS topology and deploy steps.
   secret out of band, never in CloudFormation, and referenced via `ValueFrom`.
 - Secrets and account IDs must never be committed. HTTPS is fronted by
   CloudFront over the ALB.
+
+## langfuse/
+
+Self-hosted Langfuse v3 (web, worker, Postgres, ClickHouse, Redis, MinIO) via
+docker compose, headlessly provisioned with local-dev keys so Rya exports
+traces + eval scores with zero UI setup. See `docs/langfuse.md`.

@@ -1,49 +1,26 @@
-<svg width="1200" height="340" viewBox="0 0 1200 340" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Rya - the backend your AI agents deserve">
-  <defs>
-    <style>
-      .sans { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, sans-serif; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    </style>
-  </defs>
-
-  <rect width="1200" height="340" rx="22" fill="#191918"/>
-
-  <!-- left: lockup -->
-  <rect x="72" y="78" width="60" height="60" rx="14" fill="#232322" stroke="#35342f" stroke-width="1"/>
-  <text x="102" y="119" class="mono" font-size="30" font-weight="600" fill="#ffffff" text-anchor="middle">R</text>
-  <text x="150" y="128" class="sans" font-size="60" font-weight="600" letter-spacing="-2.5" fill="#fafaf9">Rya</text>
-
-  <text x="74" y="182" class="sans" font-size="22" fill="#a5a39e">The backend your AI agents deserve.</text>
-  <text x="74" y="214" class="mono" font-size="13" fill="#6f6d67">open-core &#183; self-hostable &#183; coding-agent-first</text>
-
-  <g class="mono" font-size="13.5" fill="#c4c2bc">
-    <rect x="74"  y="246" width="128" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="138" y="265" text-anchor="middle">durable runs</text>
-    <rect x="214" y="246" width="102" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="265" y="265" text-anchor="middle">approvals</text>
-    <rect x="328" y="246" width="100" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="378" y="265" text-anchor="middle">streaming</text>
-    <rect x="440" y="246" width="108" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="494" y="265" text-anchor="middle">guardrails</text>
-  </g>
-
-  <!-- right: a durable run, mid-flight, paused for a human -->
-  <rect x="620" y="46" width="508" height="248" rx="12" fill="#1c1c1a" stroke="#302f2c" stroke-width="1"/>
-  <circle cx="644" cy="72" r="4" fill="#3d3c38"/><circle cx="660" cy="72" r="4" fill="#3d3c38"/><circle cx="676" cy="72" r="4" fill="#3d3c38"/>
-  <text x="1104" y="76" class="mono" font-size="12" fill="#6f6d67" text-anchor="end">durable run &#183; live trace</text>
-  <line x1="644" y1="90" x2="1104" y2="90" stroke="#2b2a27"/>
-
-  <g class="mono" font-size="14">
-    <circle cx="650" cy="116" r="4" fill="#4f9d7f"/>
-    <text x="666" y="121" fill="#d6d4ce">run.started</text><text x="900" y="121" fill="#6f6d67">message.received</text>
-
-    <text x="666" y="151" fill="#d6d4ce">tool.call</text><text x="900" y="151" fill="#6f6d67">crm.lookup</text>
-
-    <text x="666" y="181" fill="#d6d4ce">llm.respond</text><text x="900" y="181" fill="#6f6d67">claude &#183; streaming</text>
-
-    <rect x="638" y="196" width="474" height="26" rx="6" fill="#2a2113"/>
-    <circle cx="650" cy="209" r="4" fill="#d59436"/>
-    <text x="666" y="214" fill="#e6b25f">approval.requested</text><text x="1100" y="214" fill="#d59436" text-anchor="end">waiting for human</text>
-
-    <text x="666" y="245" fill="#8a8880">approval.approved</text>
-
-    <circle cx="650" cy="268" r="4" fill="#4f9d7f"/>
-    <text x="666" y="273" fill="#d6d4ce">run.completed</text><text x="900" y="273" fill="#6f6d67">ok</text>
-  </g>
+<svg width="1200" height="340" viewBox="0 0 1200 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Rya - the backend your AI agents deserve">
+<rect width="1200" height="340" rx="22" fill="#191918"/>
+<rect x="72" y="78" width="60" height="60" rx="14" fill="#232322" stroke="#35342f" stroke-width="1"/>
+<text x="102" y="119" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="30" font-weight="600" fill="#ffffff" text-anchor="middle">R</text>
+<text x="150" y="128" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="60" font-weight="600" letter-spacing="-2.5" fill="#fafaf9">Rya</text>
+<text x="74" y="182" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="22" fill="#a5a39e">The backend your AI agents deserve.</text>
+<text x="74" y="214" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#6f6d67">open-core &#183; self-hostable &#183; coding-agent-first</text>
+<rect x="74" y="246" width="128" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="138" y="265" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#c4c2bc" text-anchor="middle">durable runs</text>
+<rect x="214" y="246" width="102" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="265" y="265" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#c4c2bc" text-anchor="middle">approvals</text>
+<rect x="328" y="246" width="100" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="378" y="265" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#c4c2bc" text-anchor="middle">streaming</text>
+<rect x="440" y="246" width="108" height="30" rx="15" fill="none" stroke="#3a3a37"/><text x="494" y="265" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" fill="#c4c2bc" text-anchor="middle">guardrails</text>
+<rect x="620" y="46" width="508" height="248" rx="12" fill="#1c1c1a" stroke="#302f2c" stroke-width="1"/>
+<circle cx="644" cy="72" r="4" fill="#3d3c38"/><circle cx="660" cy="72" r="4" fill="#3d3c38"/><circle cx="676" cy="72" r="4" fill="#3d3c38"/>
+<text x="1104" y="76" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#6f6d67" text-anchor="end">durable run &#183; live trace</text>
+<line x1="644" y1="90" x2="1104" y2="90" stroke="#2b2a27"/>
+<circle cx="650" cy="116" r="4" fill="#4f9d7f"/>
+<text x="666" y="121" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#d6d4ce">run.started</text><text x="900" y="121" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#6f6d67">message.received</text>
+<text x="666" y="151" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#d6d4ce">tool.call</text><text x="900" y="151" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#6f6d67">crm.lookup</text>
+<text x="666" y="181" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#d6d4ce">llm.respond</text><text x="900" y="181" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#6f6d67">claude &#183; streaming</text>
+<rect x="638" y="196" width="474" height="26" rx="6" fill="#2a2113"/>
+<circle cx="650" cy="209" r="4" fill="#d59436"/>
+<text x="666" y="214" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#e6b25f">approval.requested</text><text x="1100" y="214" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#d59436" text-anchor="end">waiting for human</text>
+<text x="666" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#8a8880">approval.approved</text>
+<circle cx="650" cy="268" r="4" fill="#4f9d7f"/>
+<text x="666" y="273" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#d6d4ce">run.completed</text><text x="900" y="273" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#6f6d67">ok</text>
 </svg>

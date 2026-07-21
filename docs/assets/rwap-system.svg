@@ -1,33 +1,39 @@
-<svg width="100%" viewBox="0 0 680 396" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RWAP on Rya system architecture">
+<svg width="100%" viewBox="0 0 680 396" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RWAP on Rya - system architecture">
 <title>RWAP on Rya - system architecture</title>
 <desc>RWAP enqueues jobs to Rya's durable queue; RWAP workers claim and execute them; Rya owns durability, retries, dead-letter, approvals, and traces on Postgres.</desc>
-<style>
-  text{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
-  .t{font-size:14px;fill:#191918}.ts{font-size:12px;fill:#787774}.th{font-size:14px;font-weight:600;fill:#191918}
-  .box{fill:#ffffff;stroke:#e3e2e0;stroke-width:1}
-  .blue .box{fill:#edf1f6;stroke:#cfe0ef}
-  .arr{stroke:#9b9a97;stroke-width:1.5;fill:none;marker-end:url(#c)}
-</style>
 <defs><marker id="c" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M1,1 L7,4.5 L1,8" fill="none" stroke="#9b9a97" stroke-width="1.4"/></marker></defs>
 <rect x="0" y="0" width="680" height="396" rx="12" fill="#fbfbfa"/>
-
-<g><rect class="box" x="40" y="40" width="270" height="60" rx="8"/><text class="th" x="175" y="66" text-anchor="middle">RWAP app</text><text class="ts" x="175" y="86" text-anchor="middle">visual builder, triggers</text></g>
-<g><rect class="box" x="370" y="40" width="270" height="60" rx="8"/><text class="th" x="505" y="66" text-anchor="middle">RWAP worker</text><text class="ts" x="505" y="86" text-anchor="middle">executes workflow code (TS)</text></g>
-
-<line class="arr" x1="140" y1="100" x2="140" y2="154"/>
-<text class="ts" x="132" y="128" text-anchor="end">enqueue</text><text class="ts" x="132" y="143" text-anchor="end">POST /queue/jobs</text>
-<line class="arr" x1="520" y1="154" x2="520" y2="102"/>
-<line class="arr" x1="548" y1="100" x2="548" y2="154"/>
-<text class="ts" x="560" y="124" text-anchor="start">claim,</text><text class="ts" x="560" y="139" text-anchor="start">heartbeat, report</text>
-
-<g class="blue"><rect class="box" x="40" y="154" width="600" height="96" rx="8"/></g>
-<text class="th" x="60" y="178">Rya - durable agent backend</text>
-<text class="ts" x="620" y="178" text-anchor="end">JobQueueBackend seam</text>
-<g><rect class="box" x="60" y="194" width="132" height="42" rx="6"/><text class="t" x="126" y="211" text-anchor="middle">Queue</text><text class="ts" x="126" y="227" text-anchor="middle">leases, retries, DLQ</text></g>
-<g><rect class="box" x="202" y="194" width="132" height="42" rx="6"/><text class="t" x="268" y="211" text-anchor="middle">Durable runs</text><text class="ts" x="268" y="227" text-anchor="middle">journal, replay</text></g>
-<g><rect class="box" x="344" y="194" width="132" height="42" rx="6"/><text class="t" x="410" y="211" text-anchor="middle">Approvals</text><text class="ts" x="410" y="227" text-anchor="middle">human gates</text></g>
-<g><rect class="box" x="486" y="194" width="134" height="42" rx="6"/><text class="t" x="553" y="211" text-anchor="middle">Guard + traces</text><text class="ts" x="553" y="227" text-anchor="middle">kill switch, console</text></g>
-
-<line class="arr" x1="340" y1="250" x2="340" y2="296"/><text class="ts" x="348" y="276" text-anchor="start">persist</text>
-<g><rect class="box" x="220" y="296" width="240" height="52" rx="8"/><text class="th" x="340" y="318" text-anchor="middle">Postgres</text><text class="ts" x="340" y="336" text-anchor="middle">jobs, runs, leases (RLS)</text></g>
+<rect x="40" y="40" width="270" height="60" rx="8" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="175" y="66" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#191918" text-anchor="middle">RWAP app</text>
+<text x="175" y="86" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">visual builder, triggers</text>
+<rect x="370" y="40" width="270" height="60" rx="8" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="505" y="66" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#191918" text-anchor="middle">RWAP worker</text>
+<text x="505" y="86" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">executes workflow code (TS)</text>
+<line x1="140" y1="100" x2="140" y2="154" stroke="#9b9a97" stroke-width="1.5" fill="none" marker-end="url(#c)"/>
+<text x="132" y="128" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="end">enqueue</text>
+<text x="132" y="143" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="end">POST /queue/jobs</text>
+<line x1="520" y1="154" x2="520" y2="102" stroke="#9b9a97" stroke-width="1.5" fill="none" marker-end="url(#c)"/>
+<line x1="548" y1="100" x2="548" y2="154" stroke="#9b9a97" stroke-width="1.5" fill="none" marker-end="url(#c)"/>
+<text x="560" y="124" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="start">claim,</text>
+<text x="560" y="139" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="start">heartbeat, report</text>
+<rect x="40" y="154" width="600" height="96" rx="8" fill="#edf1f6" stroke="#cfe0ef" stroke-width="1"/>
+<text x="60" y="178" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#191918">Rya - durable agent backend</text>
+<text x="620" y="178" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="end">JobQueueBackend seam</text>
+<rect x="60" y="194" width="132" height="42" rx="6" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="126.0" y="211" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" fill="#191918" text-anchor="middle">Queue</text>
+<text x="126.0" y="227" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">leases, retries, DLQ</text>
+<rect x="202" y="194" width="132" height="42" rx="6" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="268.0" y="211" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" fill="#191918" text-anchor="middle">Durable runs</text>
+<text x="268.0" y="227" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">journal, replay</text>
+<rect x="344" y="194" width="132" height="42" rx="6" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="410.0" y="211" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" fill="#191918" text-anchor="middle">Approvals</text>
+<text x="410.0" y="227" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">human gates</text>
+<rect x="486" y="194" width="134" height="42" rx="6" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="553.0" y="211" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" fill="#191918" text-anchor="middle">Guard + traces</text>
+<text x="553.0" y="227" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">kill switch, console</text>
+<line x1="340" y1="250" x2="340" y2="296" stroke="#9b9a97" stroke-width="1.5" fill="none" marker-end="url(#c)"/>
+<text x="348" y="276" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="start">persist</text>
+<rect x="220" y="296" width="240" height="52" rx="8" fill="#ffffff" stroke="#e3e2e0" stroke-width="1"/>
+<text x="340" y="318" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#191918" text-anchor="middle">Postgres</text>
+<text x="340" y="336" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#787774" text-anchor="middle">jobs, runs, leases (RLS)</text>
 </svg>

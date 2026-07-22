@@ -429,5 +429,39 @@ $('rejectBtn').onclick = async () => {
 };
 $('send').onclick = send;
 $('input').addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
-say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".');
+
+/* Hydrate: an application, not a demo - a reload rejoins the live case. */
+async function hydrate(){
+  try{
+    const runs = (await (await fetch(`${API}/agents/loan-renewal/runs`)).json()).runs || [];
+    const opener = runs.find(r => r.output && r.output.caseId);
+    if(!opener){ say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".'); return; }
+    state.caseId = opener.output.caseId; state.cif = state.caseId.split('-').pop();
+    const detail = await (await fetch(`${API}/runs/${opener.id}`)).json();
+    // customer name from the opener's reply text if the trace lacks the lookup
+    const m = (opener.output.reply || '').match(/\(([^)]+)\)/);
+    if(m && !((detail.trace||[]).some(e => e.label === 'archive.lookup_cif')))
+      detail.trace = [...(detail.trace||[]), {kind:'tool.call', label:'archive.lookup_cif',
+        data:{result:{customer:{customerName: m[1]}}}}];
+    say('agent', `Resumed case ${state.caseId} - this case is durable, so the view picks up wherever the pipeline is.`);
+    const files = (await (await fetch(`${API}/files`)).json()).files || [];
+    for(const f of files){
+      const tg = f.tags || {};
+      if(tg.cif === state.cif && tg.docType){ state.uploaded[tg.docType] = true; state.filenames[tg.docType] = f.name; }
+    }
+    openCase(detail);
+    const done = Object.keys(state.uploaded).length;
+    if(done >= DOCS.length) setStep(1);
+    const jobs = runs.filter(r => r.trigger === 'job');
+    if(jobs.some(j => j.job && j.job.handler === 'compose_report' && j.status === 'completed')){
+      setStep(4);
+      $('doneCard').style.display = 'block';
+      $('citeCount').textContent = 'see LA record';
+    }
+    await poll();
+  }catch(e){
+    say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".');
+  }
+}
+hydrate();
 </script>

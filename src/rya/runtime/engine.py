@@ -203,6 +203,11 @@ class Engine:
         if result["status"] == "completed":
             job["status"] = "done"
             job["lastError"] = None
+        elif result["status"] == "waiting_approval":
+            # A human gate is a pause, not a failure - retrying would duplicate
+            # the approval request. The approval resume finishes the run.
+            job["status"] = "waiting_approval"
+            job["lastError"] = None
         else:
             job["attempts"] = job.get("attempts", 0) + 1
             job["lastError"] = (result.get("error") or {}).get("message")

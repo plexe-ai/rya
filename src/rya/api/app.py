@@ -291,6 +291,38 @@ def build_app(root: Path) -> FastAPI:
             except Exception:  # never let the sweeper kill the server
                 log.warning("turn sweep failed", exc_info=True)
 
+    # ---- background job worker -------------------------------------------
+    # ctx.jobs.schedule() enqueues durable jobs, but a bare `rya serve` had
+    # nothing running them (only `rya jobs run --due`). This loop makes served
+    # agents complete their pipelines: every RYA_JOBS_WORKER_SECONDS (default 3;
+    # 0 disables) it claims + runs every due job.
+    def _work_once() -> int:
+        total = 0
+        if mt:
+            for ws in tenancy.list_workspaces():
+                eng = engine_for(ws["id"])
+                try:
+                    total += len(eng.work_once())
+                finally:
+                    if hasattr(eng.store, "close"):
+                        eng.store.close()
+        else:
+            total += len(base_engine.work_once())
+        return total
+
+    async def _jobs_loop(interval: float):
+        import asyncio
+        import logging
+        log = logging.getLogger("rya.jobs.worker")
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                ran = await asyncio.to_thread(_work_once)
+                if ran:
+                    log.info("ran %d due job(s)", ran)
+            except Exception:  # never let the worker kill the server
+                log.warning("job worker tick failed", exc_info=True)
+
     from contextlib import AsyncExitStack, asynccontextmanager
 
     @asynccontextmanager
@@ -298,6 +330,8 @@ def build_app(root: Path) -> FastAPI:
         import asyncio
         sweep_seconds = float(os.environ.get("RYA_TURN_SWEEP_SECONDS", "30") or 0)
         task = asyncio.create_task(_sweeper_loop(sweep_seconds)) if sweep_seconds > 0 else None
+        jobs_seconds = float(os.environ.get("RYA_JOBS_WORKER_SECONDS", "3") or 0)
+        jobs_task = asyncio.create_task(_jobs_loop(jobs_seconds)) if jobs_seconds > 0 else None
         async with AsyncExitStack() as stack:
             if _mcp_sm is not None:
                 await stack.enter_async_context(_mcp_sm.run())
@@ -306,6 +340,8 @@ def build_app(root: Path) -> FastAPI:
             finally:
                 if task is not None:
                     task.cancel()
+                if jobs_task is not None:
+                    jobs_task.cancel()
 
     api = FastAPI(title="Rya Control Plane", version=manifest.version, lifespan=_lifespan)
 

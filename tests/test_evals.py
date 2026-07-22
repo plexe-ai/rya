@@ -196,3 +196,41 @@ async def gated_job(ctx, job):
     # and the approved action ACTUALLY executed (async @agent.tool handler)
     resolved = store.get_approval(approval["id"])
     assert resolved["actionResult"] == {"ok": True, "wrote": 42}
+
+
+def test_job_pausing_at_approval_is_not_retried(tmp_path):
+    """Platform regression (found by the loan-renewal demo UI): a job whose run
+    pauses at waiting_approval must not be rescheduled as a failure - retrying
+    duplicates the approval request."""
+    from rya.runtime import Engine, load_agent as _load
+    manifest, agent, store = _project(tmp_path)
+    (tmp_path / "src" / "agent.py").write_text('''
+from rya import define_agent
+agent = define_agent()
+
+@agent.tool("side.effect")
+async def side_effect(input):
+    return {"ok": True}
+
+@agent.on_event
+async def main(ctx, event):
+    await ctx.jobs.schedule("gated_job", {})
+    return {"scheduled": True}
+
+@agent.job("gated_job")
+async def gated_job(ctx, job):
+    await ctx.approvals.request(title="gate", body="b",
+                                action={"tool": "side.effect", "input": {}})
+    return {"done": True}
+''')
+    agent = _load(manifest, tmp_path)
+    engine = Engine(manifest, agent, store, tmp_path)
+    engine.run_event("message.received", {"email": "a@x.co"})
+
+    ran = engine.work_once()
+    assert ran[0]["status"] == "waiting_approval"
+    # further worker ticks must NOT re-run the paused job
+    assert engine.work_once() == [] and engine.work_once() == []
+    assert len(store.list_approvals(status="pending")) == 1
+    job = store.list_jobs()[0]
+    assert job["status"] == "waiting_approval" and job.get("attempts", 0) == 0

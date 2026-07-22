@@ -1,0 +1,238 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LA Renewal - BBG Credit</title>
+<style>
+:root{--paper:#fbfbfa;--ink:#191918;--ink2:#37352f;--mut:#787774;--line:#e3e2e0;--card:#ffffff;
+--teal:#0f7b6c;--amber:#c2691f;--slate:#37618e;--clay:#a34d43;--teal-bg:#ecf3f0;--amber-bg:#faf3eb;--slate-bg:#edf1f6}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font:14px/1.55 Inter,-apple-system,'Segoe UI',sans-serif}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;gap:12px;padding:14px 28px;border-bottom:1px solid var(--line);background:var(--card)}
+header .mark{width:30px;height:30px;border-radius:6px;background:var(--ink);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px}
+header h1{font-size:15px;font-weight:600}
+header .sub{color:var(--mut);font-size:12.5px}
+header .right{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--mut)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--teal);display:inline-block;margin-right:5px}
+main{display:grid;grid-template-columns:minmax(380px,1fr) minmax(460px,1.2fr);gap:0;height:calc(100vh - 59px)}
+/* chat */
+.chat{display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.msgs{flex:1;overflow-y:auto;padding:24px 28px;display:flex;flex-direction:column;gap:14px}
+.msg{max-width:88%;padding:10px 14px;border-radius:4px;font-size:13.5px;white-space:pre-wrap}
+.msg.user{align-self:flex-end;background:var(--ink);color:#fff}
+.msg.agent{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
+.msg.sys{align-self:center;color:var(--mut);font-size:12px;background:none;padding:2px}
+.composer{display:flex;gap:8px;padding:14px 20px;border-top:1px solid var(--line);background:var(--card)}
+.composer input{flex:1;border:1px solid var(--line);border-radius:4px;padding:9px 12px;font:inherit;background:var(--paper)}
+.composer input:focus{outline:none;border-color:var(--ink2)}
+button{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:4px;padding:8px 14px;font:600 13px Inter,sans-serif;cursor:pointer}
+button.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+button.teal{background:var(--teal);color:#fff;border-color:var(--teal)}
+button.ghost{color:var(--slate)}
+button:disabled{opacity:.45;cursor:default}
+/* case panel */
+.case{overflow-y:auto;padding:24px 28px;display:flex;flex-direction:column;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+.card h2{font-size:11.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin-bottom:12px}
+.row{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
+.row:first-of-type{border-top:none}
+.row .grow{flex:1}
+.badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:3px}
+.b-wait{background:var(--paper);color:var(--mut);border:1px solid var(--line)}
+.b-done{background:var(--teal-bg);color:var(--teal)}
+.b-run{background:var(--slate-bg);color:var(--slate)}
+.b-appr{background:var(--amber-bg);color:var(--amber)}
+.b-fail{background:#f6ebe9;color:var(--clay)}
+.report{font-size:13px;white-space:pre-wrap;background:var(--paper);border:1px solid var(--line);border-radius:4px;padding:14px;max-height:340px;overflow-y:auto}
+.report .cite{color:var(--slate)}
+.hint{color:var(--mut);font-size:12.5px}
+.approve-bar{display:flex;gap:8px;margin-top:12px;align-items:center}
+.kfig{display:flex;gap:18px;flex-wrap:wrap}
+.kfig div{min-width:110px}
+.kfig .n{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
+.kfig .l{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+</style>
+
+<header>
+  <div class="mark">R</div>
+  <div><h1>LA Renewal</h1><div class="sub">BBG credit renewal - agent on Rya</div></div>
+  <div class="right"><span><span class="dot"></span>agent live</span><span class="mono" id="model">bedrock</span></div>
+</header>
+
+<main>
+  <section class="chat">
+    <div class="msgs" id="msgs">
+      <div class="msg agent">Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".</div>
+    </div>
+    <div class="composer">
+      <input id="input" placeholder="Start an LA renewal application for CIF 884411" autocomplete="off">
+      <button class="primary" id="send">Send</button>
+    </div>
+  </section>
+
+  <section class="case">
+    <div class="card" id="caseCard" style="display:none">
+      <h2>Case</h2>
+      <div class="kfig">
+        <div><div class="n mono" id="caseId">-</div><div class="l">Case</div></div>
+        <div><div class="n mono" id="cif">-</div><div class="l">CIF</div></div>
+        <div><div class="n" id="customer">-</div><div class="l">Customer</div></div>
+        <div><div class="n" id="caseStatus">collecting</div><div class="l">Status</div></div>
+      </div>
+    </div>
+
+    <div class="card" id="docsCard" style="display:none">
+      <h2>Document checklist</h2>
+      <div id="docRows"></div>
+      <div class="hint" style="margin-top:10px">Each upload is a durable file that resumes the case. Samples are the demo bank's PDFs.</div>
+    </div>
+
+    <div class="card" id="pipeCard" style="display:none">
+      <h2>Extraction pipeline</h2>
+      <div id="pipeRows"><div class="hint">Waiting for the full document set...</div></div>
+    </div>
+
+    <div class="card" id="reportCard" style="display:none">
+      <h2>Final report - pending approval</h2>
+      <div class="report" id="reportBody"></div>
+      <div class="approve-bar">
+        <button class="teal" id="approveBtn">Approve and write to LA database</button>
+        <button id="rejectBtn">Reject</button>
+        <span class="hint" id="approveHint"></span>
+      </div>
+    </div>
+
+    <div class="card" id="doneCard" style="display:none">
+      <h2>LA database</h2>
+      <div class="row"><span class="grow">Renewal record</span><span class="badge b-done">submitted</span></div>
+      <div class="row"><span class="grow">Citations in final report</span><span class="mono" id="citeCount">-</span></div>
+      <div class="row"><span class="grow">Human approval</span><span class="badge b-done">approved</span></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const API = 'http://localhost:8931';
+const DOCS = [
+  {key:'aecb', label:'AECB credit bureau report'},
+  {key:'spread', label:'Financial spread'},
+  {key:'id', label:'Trade license and IDs'},
+  {key:'reference_report', label:'Reference report (format)'},
+];
+const state = {cif:null, caseId:null, uploaded:{}, approvalId:null, report:'', polling:null};
+const $ = id => document.getElementById(id);
+
+function say(cls, text){
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls; d.textContent = text;
+  $('msgs').appendChild(d); $('msgs').scrollTop = 1e9;
+}
+
+async function send(){
+  const text = $('input').value.trim(); if(!text) return;
+  $('input').value = ''; say('user', text); $('send').disabled = true;
+  try{
+    const r = await fetch(`${API}/agents/loan-renewal/events`, {method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({type:'message.received', payload:{text}})});
+    const {runId} = await r.json();
+    const run = await (await fetch(`${API}/runs/${runId}`)).json();
+    const out = run.output || {};
+    say('agent', out.reply || 'Done.');
+    if(out.caseId){
+      state.caseId = out.caseId; state.cif = out.caseId.split('-').pop();
+      openCase(run);
+    }
+  }catch(e){ say('sys', 'error: ' + e.message); }
+  $('send').disabled = false;
+}
+
+function openCase(run){
+  $('caseCard').style.display = $('docsCard').style.display = 'block';
+  $('caseId').textContent = state.caseId; $('cif').textContent = state.cif;
+  const lookup = (run.trace || []).find(e => e.kind === 'tool.call' && e.label === 'archive.lookup_cif');
+  const cust = lookup && lookup.data && lookup.data.result && lookup.data.result.customer;
+  $('customer').textContent = cust ? cust.customerName : 'new customer';
+  renderDocs(); startPolling();
+}
+
+function renderDocs(){
+  $('docRows').innerHTML = '';
+  for(const d of DOCS){
+    const row = document.createElement('div'); row.className = 'row';
+    const status = state.uploaded[d.key]
+      ? '<span class="badge b-done">received</span>'
+      : `<button class="ghost" onclick="uploadSample('${d.key}')">Upload sample</button>`;
+    row.innerHTML = `<span class="grow">${d.label}</span>${status}`;
+    $('docRows').appendChild(row);
+  }
+}
+
+async function uploadSample(key){
+  const pdf = await (await fetch(`samples/${key}.pdf`)).arrayBuffer();
+  const q = `name=${key}.pdf&tag.cif=${state.cif}&tag.docType=${key}`;
+  const r = await fetch(`${API}/files?${q}`, {method:'POST',
+    headers:{'content-type':'application/pdf'}, body: pdf});
+  const body = await r.json();
+  state.uploaded[key] = true; renderDocs();
+  const run = await (await fetch(`${API}/runs/${body.runId}`)).json();
+  const out = run.output || {};
+  if(out.missing && out.missing.length)
+    say('agent', `Received ${key}. Still needed: ${out.missing.join(', ')}.`);
+  else if(out.status === 'extracting'){
+    say('agent', 'Document set complete - extracting all documents now.');
+    $('caseStatus').textContent = 'extracting'; $('pipeCard').style.display = 'block';
+  }
+}
+
+async function poll(){
+  const runs = (await (await fetch(`${API}/agents/loan-renewal/runs`)).json()).runs || [];
+  const jobs = runs.filter(r => r.trigger === 'job');
+  if(jobs.length){
+    $('pipeCard').style.display = 'block';
+    $('pipeRows').innerHTML = '';
+    for(const j of jobs.slice(0, 8).reverse()){
+      const name = (j.job && j.job.handler) || 'job';
+      const doc = j.job && j.job.payload && j.job.payload.docType;
+      const cls = j.status === 'completed' ? 'b-done' : j.status === 'failed' ? 'b-fail'
+        : j.status === 'waiting_approval' ? 'b-appr' : 'b-run';
+      const row = document.createElement('div'); row.className = 'row';
+      row.innerHTML = `<span class="grow mono">${name}${doc ? ' - ' + doc : ''}</span>
+        <span class="badge ${cls}">${j.status.replace('_',' ')}</span>`;
+      $('pipeRows').appendChild(row);
+    }
+  }
+  const approvals = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+  const mine = approvals.find(a => (a.title || '').includes(state.cif));
+  if(mine && !state.approvalId){
+    state.approvalId = mine.id; state.report = mine.body || '';
+    $('caseStatus').textContent = 'awaiting approval';
+    $('reportCard').style.display = 'block';
+    $('reportBody').innerHTML = state.report
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/\[source: [^\]]+\]/g, m => `<span class="cite">${m}</span>`);
+    say('agent', 'The final report is ready and grounded - every figure cites its source document. Review and approve to write the LA record.');
+  }
+}
+
+function startPolling(){ if(!state.polling) state.polling = setInterval(poll, 2500); }
+
+$('approveBtn').onclick = async () => {
+  $('approveBtn').disabled = true; $('approveHint').textContent = 'executing gated write...';
+  const r = await fetch(`${API}/approvals/${state.approvalId}/approve`, {method:'POST'});
+  const run = await r.json();
+  $('reportCard').style.display = 'none';
+  $('doneCard').style.display = 'block';
+  $('citeCount').textContent = (state.report.match(/\[source:/g) || []).length + ' (from preview)';
+  $('caseStatus').textContent = 'submitted';
+  say('agent', 'Approved. The renewal record and final report are written to the LA database.');
+  clearInterval(state.polling);
+};
+$('rejectBtn').onclick = async () => {
+  await fetch(`${API}/approvals/${state.approvalId}/reject`, {method:'POST'});
+  $('reportCard').style.display = 'none'; $('caseStatus').textContent = 'rejected';
+  say('agent', 'Rejected - nothing was written to the LA database.');
+};
+$('send').onclick = send;
+$('input').addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
+</script>

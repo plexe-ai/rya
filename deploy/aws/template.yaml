@@ -80,7 +80,11 @@ Resources:
         SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
         GenerateStringKey: password
         PasswordLength: 32
-        ExcludeCharacters: '"@/\\'
+        # The password is interpolated into a postgresql:// URL - exclude every
+        # character with URL semantics, not just quoting hazards. A '#', '%',
+        # '[' or similar in the generated password breaks the DSN at parse time
+        # (found live: first loan-renewal-live create drew '#%[').
+        ExcludePunctuation: true
 
   AppSecret:
     Type: AWS::SecretsManager::Secret

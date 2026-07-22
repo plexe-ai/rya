@@ -41,6 +41,8 @@ def resolve_provider(provider: str = "auto") -> str:
         _adapter.assert_keyless()
         if provider in ("auto", "anthropic", "openai"):
             return "adapter"
+    if os.environ.get("RYA_FORCE_MOCK") == "1":
+        return "mock"  # CI / offline evals, regardless of manifest provider
     if provider and provider != "auto":
         return provider
     if os.environ.get("RYA_BEDROCK") == "1":

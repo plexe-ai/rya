@@ -373,7 +373,15 @@ class Engine:
                 conn = self.store.get_connection(provider)
                 secret = conn.get("secret") if conn else None
             return _http_tool(url, inp, auth_secret=secret)
-        # 3. Registry fallback (mock in the local slice).
+        # 3. The agent's own @agent.tool implementation (async or sync) - this
+        # is the normal case for in-process tools like a gated DB write.
+        fn = self.agent.tool_handler(tool) if hasattr(self.agent, "tool_handler") else None
+        if fn is not None:
+            out = fn(inp)
+            if inspect.iscoroutine(out):
+                out = asyncio.run(out)
+            return out
+        # 4. Registry fallback (mock in the local slice).
         spec = self.tools.get(tool)
         return spec.fn(inp) if spec is not None else None
 
@@ -427,8 +435,16 @@ class Engine:
         # restoring the run's identity so per-user scoping holds on resume.
         # Memoized (pre-approval) steps neither re-trace nor re-stream, so the
         # relays only carry the POST-approval continuation.
-        handler = self.agent.event_handler()
-        arg = Event.from_dict(run["event"]) if run.get("event") else None
+        # A run paused inside a JOB must resume through its job handler with its
+        # Job argument - resuming a job through the event handler replays the
+        # wrong function against the journal.
+        if run.get("trigger") == "job" and run.get("job"):
+            j = run["job"]
+            handler = self.agent.job_handler(j["handler"])
+            arg = Job(j["id"], j["handler"], j.get("payload", {}))
+        else:
+            handler = self.agent.event_handler()
+            arg = Event.from_dict(run["event"]) if run.get("event") else None
         identity = None
         if run.get("identity"):
             from ..auth import Identity

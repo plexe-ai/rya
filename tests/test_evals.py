@@ -152,3 +152,47 @@ def test_numeric_scorer_value_exports_as_numeric(tmp_path, monkeypatch):
     metric = next(i for i in flat if i["type"] == "score-create"
                   and i["body"]["name"] == "metric_case:fake_metric")
     assert metric["body"]["value"] == 0.83 and metric["body"]["dataType"] == "NUMERIC"
+
+
+def test_approval_inside_a_job_resumes_the_job_handler(tmp_path):
+    """Platform regression (found by the loan-renewal build): a run paused on an
+    approval INSIDE a @agent.job handler must resume through that job handler,
+    not the event handler."""
+    from rya.runtime import Engine
+    manifest, agent, store = _project(tmp_path)
+
+    (tmp_path / "src" / "agent.py").write_text('''
+from rya import define_agent
+agent = define_agent()
+
+@agent.tool("side.effect")
+async def side_effect(input):
+    return {"ok": True, "wrote": input.get("value")}
+
+@agent.on_event
+async def main(ctx, event):
+    await ctx.jobs.schedule("gated_job", {"value": 42})
+    return {"scheduled": True}
+
+@agent.job("gated_job")
+async def gated_job(ctx, job):
+    await ctx.approvals.request(title="write?", body="value",
+                                action={"tool": "side.effect",
+                                        "input": {"value": job.payload["value"]}})
+    return {"resumed": True, "value": job.payload["value"]}
+''')
+    from rya.runtime import load_agent as _load
+    agent = _load(manifest, tmp_path)
+    engine = Engine(manifest, agent, store, tmp_path)
+
+    engine.run_event("message.received", {"email": "a@x.co"})
+    ran = engine.work_once()
+    assert ran and ran[0]["status"] == "waiting_approval"
+
+    approval = store.list_approvals(status="pending")[0]
+    done = engine.approve(approval["id"])
+    assert done["status"] == "completed", done.get("error")
+    assert done["output"] == {"resumed": True, "value": 42}
+    # and the approved action ACTUALLY executed (async @agent.tool handler)
+    resolved = store.get_approval(approval["id"])
+    assert resolved["actionResult"] == {"ok": True, "wrote": 42}

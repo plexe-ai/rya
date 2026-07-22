@@ -1,0 +1,97 @@
+# Loan Application (LA) renewal orchestrator - the BBG credit-renewal pipeline.
+#
+# A relationship manager says "start an LA renewal for CIF 884411". The agent
+# resolves the CIF against the archive, opens (or creates) the LA case, collects
+# the required documents (AECB report, financial spread, IDs, plus a reference
+# report that defines the output format), extracts each document with a Bedrock
+# model, filters to the fields the reference report requires, composes a cited
+# final report gated by the grounding check, and - only after human approval -
+# writes the renewal record back to the LA database.
+#
+# Products beyond LA (RBL, TWC) are a product-config addition, not a new agent.
+
+name: loan-renewal
+runtime: python
+entrypoint: src/agent.py
+version: 0.1.0
+owner: bbg-credit
+instructions: >
+  Orchestrate business-banking loan application renewals end to end: intent to
+  document collection to extraction to a cited, human-approved final report.
+  Never write to the LA database without an approval. Never state a financial
+  figure that does not come from an extracted document.
+
+timeout_seconds: 600
+
+model:
+  provider: bedrock
+  default: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  temperature: 0.2
+  routes:
+    # cheap + deterministic for routing the user's sentence
+    intent:  { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.0, max_tokens: 500 }
+    # per-document extraction over PDF document blocks
+    extract: { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.0, max_tokens: 4000 }
+    # derive the required-fields schema from the reference report
+    schema:  { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.0, max_tokens: 2000 }
+    # compose the final cited report
+    compose: { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.1, max_tokens: 4000 }
+
+memory:
+  type: managed
+  collections: [cases]
+
+tools:
+  - id: archive.lookup_cif
+    description: Look up a CIF in the bank's archive database.
+    permission: allowed
+    input_schema:
+      type: object
+      properties: { cif: { type: string, description: Customer Information File number } }
+      required: [cif]
+
+  - id: la.create_file
+    description: Establish a new customer file in the LA database (new CIF).
+    permission: allowed
+    input_schema:
+      type: object
+      properties:
+        cif: { type: string }
+        customerName: { type: string }
+      required: [cif]
+
+  - id: la.create_renewal
+    description: Open a renewal case (draft) in the LA database for a CIF.
+    permission: allowed
+    input_schema:
+      type: object
+      properties:
+        cif: { type: string }
+        product: { type: string, enum: [LA, RBL, TWC] }
+      required: [cif, product]
+
+  - id: case.save_extraction
+    description: Persist one document's extracted data into the case working file.
+    permission: allowed
+
+  - id: case.load
+    description: Load the full case working file (record + all extractions).
+    permission: allowed
+    input_schema:
+      type: object
+      properties: { cif: { type: string } }
+      required: [cif]
+
+  - id: la.update_record
+    description: >
+      Write the final renewal report and data summary to the LA database.
+      The single side-effectful write of the pipeline - always approval-gated.
+    permission: approval_required
+
+triggers:
+  - { id: manual, type: manual, handler: main }
+
+approvals:
+  default: required_for_external_actions
+
+observability: { logs: true, traces: true, audit: true }

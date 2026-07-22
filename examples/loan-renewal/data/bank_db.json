@@ -1,0 +1,23 @@
+{
+  "archive": {
+    "884411": {
+      "cif": "884411",
+      "customerName": "TechnoFab Trading LLC",
+      "segment": "BBG",
+      "relationshipSince": "2019-03-12",
+      "lastFacility": { "product": "LA", "limit": 2500000, "currency": "AED", "expired": "2026-05-31" }
+    },
+    "550022": {
+      "cif": "550022",
+      "customerName": "Gulf Marine Services FZE",
+      "segment": "BBG",
+      "relationshipSince": "2021-11-02",
+      "lastFacility": { "product": "TWC", "limit": 900000, "currency": "AED", "expired": "2026-01-15" }
+    }
+  },
+  "la": {
+    "files": {},
+    "renewals": {},
+    "cases": {}
+  }
+}

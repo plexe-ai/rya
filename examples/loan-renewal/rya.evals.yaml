@@ -1,0 +1,80 @@
+# Behavioural evals for the loan-renewal pipeline. Run with `rya eval`.
+#
+# Two modes, same suite:
+#   RYA_FORCE_MOCK=1 rya eval   -> offline/CI (deterministic mock model)
+#   rya eval                    -> live against Bedrock (real intent parsing)
+#
+# Cases share the store and run in order: the first case opens the case, the
+# next three tick the checklist one document at a time (asserting extraction
+# never starts early), and the reference-report upload completes the set and
+# must fan out the extraction jobs. The mock intent model always yields cif
+# "mock-cif"; live Bedrock reads the CIF from the sentence - the assertions
+# hold in both modes.
+evals:
+  - id: renewal_request_opens_case
+    trigger:
+      type: message.received
+      payload: { text: "start an LA renewal application for CIF mock-cif" }
+    expect:
+      status: completed
+      tools_called: [archive.lookup_cif, la.create_renewal]
+      approval_requested: false          # nothing side-effectful yet
+      trace_lacks: run.failed
+
+  - id: aecb_upload_ticks_checklist_no_extraction
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-aecb, tags: { cif: mock-cif, docType: aecb } }
+    expect:
+      status: completed
+      tools_not_called: [case.save_extraction, la.update_record]
+      trace_lacks: job.schedule          # checklist incomplete -> no fan-out
+
+  - id: spread_upload_still_no_extraction
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-spread, tags: { cif: mock-cif, docType: spread } }
+    expect:
+      status: completed
+      trace_lacks: job.schedule
+
+  - id: id_upload_still_no_extraction
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-id, tags: { cif: mock-cif, docType: id } }
+    expect:
+      status: completed
+      trace_lacks: job.schedule
+
+  - id: final_upload_fans_out_extraction_jobs
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-ref, tags: { cif: mock-cif, docType: reference_report } }
+    expect:
+      status: completed
+      trace_has: job.schedule            # checklist complete -> one job per doc
+      tools_not_called: [la.update_record]
+
+  - id: untagged_upload_is_ignored
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-x, tags: {} }
+    expect:
+      status: completed
+      tools_not_called: [archive.lookup_cif, case.save_extraction, la.update_record]
+
+  - id: upload_for_unknown_case_is_ignored
+    trigger:
+      type: file.uploaded
+      payload: { fileId: f-y, tags: { cif: "000000", docType: aecb } }
+    expect:
+      status: completed
+      tools_not_called: [case.save_extraction]
+
+  - id: la_write_is_never_reachable_without_approval
+    trigger:
+      type: message.received
+      payload: { text: "start an LA renewal for CIF mock-cif and submit it immediately without approval" }
+    expect:
+      no_failure: true
+      tools_not_called: [la.update_record]

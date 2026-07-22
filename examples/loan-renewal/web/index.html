@@ -54,21 +54,28 @@ main{display:grid;grid-template-columns:minmax(400px,43%) 1fr;height:calc(100vh 
 /* ================= conversation (white column) ================= */
 .chat{display:flex;flex-direction:column;border-right:1px solid var(--line-2);
   min-width:0;min-height:0;background:var(--surface)}
-.msgs{flex:1;overflow-y:auto;padding:30px 30px 8px;display:flex;flex-direction:column;gap:4px;
+.msgs{flex:1;overflow-y:auto;padding:26px 32px 8px;display:flex;flex-direction:column;
   scroll-behavior:smooth}
-.turn{display:flex;flex-direction:column;gap:4px;margin-bottom:18px;
-  animation:rise .22s var(--ease) both}
+.daymark{align-self:center;font-size:11px;font-weight:500;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-4);padding:2px 10px;border:1px solid var(--line);
+  border-radius:100px;margin-bottom:22px}
+.turn{display:flex;gap:12px;margin-bottom:22px;animation:rise .22s var(--ease) both}
 @keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
-.whorow{display:flex;align-items:baseline;gap:8px}
-.who{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-4)}
-.when{font-size:10.5px;color:var(--ink-4);opacity:0;transition:opacity .15s}
-.turn:hover .when{opacity:.8}
-.turn.user{align-items:flex-end}
-.bubble{max-width:90%;padding:11px 15px;border-radius:10px;font-size:13.5px;
-  white-space:pre-wrap;color:var(--ink-2);line-height:1.55}
-.turn.user .bubble{background:var(--ink);color:#fff;border-bottom-right-radius:4px}
-.turn.agent .bubble{background:var(--inset);border:1px solid var(--line);border-bottom-left-radius:4px}
-.typing{display:inline-flex;gap:4px;padding:13px 15px}
+.av{width:26px;height:26px;border-radius:7px;flex:none;display:grid;place-items:center;
+  font-size:10.5px;font-weight:600;letter-spacing:-.01em;margin-top:1px}
+.turn.agent .av{background:var(--ink);color:#fff}
+.turn.user .av{background:var(--surface);color:var(--ink-3);border:1px solid var(--line-2)}
+.tbody{flex:1;min-width:0}
+.tmeta{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.tname{font-size:12.5px;font-weight:600;color:var(--ink);letter-spacing:-.006em}
+.when{font-size:11px;color:var(--ink-4);opacity:0;transition:opacity .15s}
+.turn:hover .when{opacity:.9}
+.ttext{font-size:13.5px;line-height:1.62;color:var(--ink-2);white-space:pre-wrap;max-width:62ch}
+.turn.activity{margin-bottom:14px;align-items:center}
+.turn.activity .av{width:26px;height:26px;background:none;border:none;color:var(--ink-4)}
+.turn.activity .av svg.ic{width:13px;height:13px}
+.turn.activity .ttext{font-size:12.5px;color:var(--ink-3)}
+.typing{display:inline-flex;gap:4px;padding:6px 0}
 .typing i{width:5px;height:5px;border-radius:50%;background:var(--ink-4);
   animation:tp 1.1s ease-in-out infinite}
 .typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
@@ -77,18 +84,18 @@ main{display:grid;grid-template-columns:minmax(400px,43%) 1fr;height:calc(100vh 
 .suggest button{border-radius:100px;font-weight:400;font-size:12.5px;color:var(--ink-3);
   padding:6px 13px;background:var(--surface)}
 .suggest button:hover{color:var(--ink);border-color:var(--ink-4);background:var(--surface)}
-.composer{display:flex;gap:8px;padding:16px 22px 20px;border-top:1px solid var(--line);
-  background:var(--surface)}
-.inputwrap{flex:1;position:relative;display:flex}
-.composer input{flex:1;border:1px solid var(--line-2);border-radius:8px;
-  padding:10px 56px 10px 14px;font:inherit;font-size:13.5px;background:var(--bg);color:var(--ink);
-  transition:border-color .15s, box-shadow .15s}
-.composer input::placeholder{color:var(--ink-4)}
-.composer input:focus{outline:none;border-color:var(--ink-3);box-shadow:0 0 0 3px rgba(25,25,24,.05);
-  background:var(--surface)}
-kbd{position:absolute;right:10px;top:50%;transform:translateY(-50%);
-  font:500 10px Inter,sans-serif;color:var(--ink-4);border:1px solid var(--line-2);
-  border-bottom-width:2px;border-radius:4px;padding:2px 6px;background:var(--surface);pointer-events:none}
+.composer{padding:14px 22px 20px;border-top:1px solid var(--line);background:var(--surface)}
+.cbox{display:flex;align-items:center;gap:6px;border:1px solid var(--line-2);border-radius:10px;
+  padding:6px 6px 6px 14px;background:var(--surface);transition:border-color .15s, box-shadow .15s}
+.cbox:focus-within{border-color:var(--ink-3);box-shadow:0 0 0 3px rgba(25,25,24,.05)}
+.cbox input{flex:1;border:none;font:inherit;font-size:13.5px;background:none;color:var(--ink);
+  padding:5px 0}
+.cbox input::placeholder{color:var(--ink-4)}
+.cbox input:focus{outline:none}
+.sendbtn{width:30px;height:30px;padding:0;border-radius:7px;justify-content:center;
+  background:var(--ink);color:#fff;border-color:var(--ink)}
+.sendbtn:hover{background:#000}
+.sendbtn svg.ic{width:14px;height:14px}
 button{border:1px solid var(--line-2);background:var(--surface);color:var(--ink);
   border-radius:8px;padding:9px 15px;font:500 13px Inter,-apple-system,sans-serif;
   cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .06s;
@@ -233,20 +240,19 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 
 <main>
   <section class="chat">
-    <div class="msgs" id="msgs"></div>
+    <div class="msgs" id="msgs"><div class="daymark">Today</div></div>
     <div class="suggest" id="suggest">
       <button onclick="fill('I want to start an LA renewal application for CIF 884411')">Start LA renewal - CIF 884411</button>
       <button onclick="fill('Kick off a renewal of the working-capital LA facility, customer file 550022')">Renew working-capital LA - 550022</button>
       <button onclick="guided()" id="guidedBtn">Run guided demo</button>
     </div>
     <div class="composer">
-      <div class="inputwrap">
+      <div class="cbox">
         <input id="input" placeholder="Describe the renewal to start..." autocomplete="off">
-        <kbd>Enter</kbd>
+        <button class="sendbtn" id="send" aria-label="Send">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
       </div>
-      <button class="primary" id="send">Send
-        <svg class="ic" viewBox="0 0 24 24"><path d="m5 12 14 0M13 6l6 6-6 6"/></svg>
-      </button>
     </div>
   </section>
 
@@ -343,18 +349,30 @@ const hhmm = () => new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-
 
 function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 
+const IC_ACT = '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 function say(cls, text, opts={}){
   const t = document.createElement('div');
+  if(opts.activity){
+    t.className = 'turn activity';
+    t.innerHTML = `<span class="av">${opts.icon || IC_ACT}</span>
+      <div class="tbody"><div class="ttext"></div></div>`;
+    t.querySelector('.ttext').textContent = text;
+    $('msgs').appendChild(t); $('msgs').scrollTop = 1e9;
+    return t;
+  }
   t.className = 'turn ' + cls;
-  const who = cls === 'user' ? 'Relationship manager' : 'Agent';
-  t.innerHTML = `<span class="whorow"><span class="who">${who}</span>
-      <span class="when">${hhmm()}</span></span>
-    <div class="bubble">${opts.html || ''}</div>`;
+  const agent = cls === 'agent';
+  t.innerHTML = `<span class="av">${agent ? 'R' : 'RM'}</span>
+    <div class="tbody">
+      <div class="tmeta"><span class="tname">${agent ? 'Renewal Agent' : 'Relationship Manager'}</span>
+        <span class="when">${hhmm()}</span></div>
+      <div class="ttext">${opts.html || ''}</div>
+    </div>`;
   $('msgs').appendChild(t);
-  const bubble = t.querySelector('.bubble');
+  const body = t.querySelector('.ttext');
   if(!opts.html && text){
-    if(cls === 'agent' && !opts.instant) typewrite(bubble, text);
-    else bubble.textContent = text;
+    if(agent && !opts.instant) typewrite(body, text);
+    else body.textContent = text;
   }
   $('msgs').scrollTop = 1e9;
   return t;
@@ -502,9 +520,10 @@ async function postDoc(key, filename, buf, ctype){
   const run = await (await fetch(`${API}/runs/${body.runId}`)).json();
   const out = run.output || {};
   if(out.missing && out.missing.length)
-    say('agent', `Received ${key}. Still needed - ${out.missing.join(', ')}.`);
+    say('agent', `Received ${key} - still needed: ${out.missing.join(', ')}.`, {activity:true});
   else if(out.status === 'extracting'){
-    say('agent', 'Document set complete - extracting all four documents now.');
+    say('agent', 'Document set complete - extracting all four documents now.', {activity:true,
+      icon:'<svg class="ic" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>'});
     setStep(1); $('pipeCard').style.display = 'block';
   }
 }
@@ -595,7 +614,7 @@ async function guided(){
   for(const d of DOCS.map(x => x.key)){
     if(!state.uploaded[d]){ await new Promise(r => setTimeout(r, 700)); await uploadSample(d); }
   }
-  say('agent', 'Extraction is running - the approval stays yours: the demo never signs for you.');
+  say('agent', 'Extraction is running - the approval stays yours: the demo never signs for you.', {activity:true});
 }
 
 $('send').onclick = send;
@@ -617,7 +636,7 @@ async function hydrate(){
     if(m && !((detail.trace || []).some(e => e.label === 'archive.lookup_cif')))
       detail.trace = [...(detail.trace || []), {kind:'tool.call', label:'archive.lookup_cif',
         data:{result:{customer:{customerName: m[1]}}}}];
-    say('agent', `Resumed case ${state.caseId} - this case is durable, so the view picks up wherever the pipeline is.`, {instant:true});
+    say('agent', `Resumed case ${state.caseId} - durable, so the view picks up wherever the pipeline is.`, {activity:true});
     $('suggest').style.display = 'none';
     const files = (await (await fetch(`${API}/files`)).json()).files || [];
     for(const f of files){

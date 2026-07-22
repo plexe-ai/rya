@@ -1,7 +1,7 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LA Renewal - BBG Credit</title>
+<title>Renewals - BBG Credit</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -28,18 +28,6 @@ body{background:var(--bg);color:var(--ink-2);
 .tnum{font-variant-numeric:tabular-nums}
 svg.ic{width:15px;height:15px;stroke:currentColor;stroke-width:1.8;fill:none;
   stroke-linecap:round;stroke-linejoin:round;flex:none;vertical-align:-2.5px}
-
-/* ================= shell ================= */
-header{display:flex;align-items:center;gap:14px;height:58px;padding:0 26px;
-  border-bottom:1px solid var(--line-2);background:var(--surface);position:relative;z-index:2}
-.mark{width:30px;height:30px;border-radius:8px;background:var(--ink);color:#fff;
-  display:grid;place-items:center;font-weight:600;font-size:14px;letter-spacing:-.02em;
-  box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
-.crumbs{display:flex;align-items:baseline;gap:9px;font-size:13.5px;letter-spacing:-.004em}
-.crumbs .root{color:var(--ink-4)}
-.crumbs .sep{color:var(--line-2)}
-.crumbs .here{color:var(--ink);font-weight:600}
-header .right{margin-left:auto;display:flex;align-items:center;gap:8px}
 .chip{display:inline-flex;align-items:center;gap:6px;height:25px;padding:0 11px;
   border:1px solid var(--line-2);border-radius:100px;background:var(--surface);
   font-size:11.5px;font-weight:500;color:var(--ink-3);white-space:nowrap;letter-spacing:.01em}
@@ -48,54 +36,6 @@ header .right{margin-left:auto;display:flex;align-items:center;gap:8px}
 .chip .pulse::after{content:'';position:absolute;inset:-3px;border-radius:50%;
   border:1px solid var(--pos);opacity:0;animation:ring 2.4s ease-out infinite}
 @keyframes ring{0%{transform:scale(.5);opacity:.5}70%{transform:scale(1.4);opacity:0}100%{opacity:0}}
-
-main{display:grid;grid-template-columns:minmax(400px,43%) 1fr;height:calc(100vh - 58px)}
-
-/* ================= conversation (white column) ================= */
-.chat{display:flex;flex-direction:column;border-right:1px solid var(--line-2);
-  min-width:0;min-height:0;background:var(--surface)}
-.msgs{flex:1;overflow-y:auto;padding:26px 32px 8px;display:flex;flex-direction:column;
-  scroll-behavior:smooth}
-.daymark{align-self:center;font-size:11px;font-weight:500;letter-spacing:.06em;
-  text-transform:uppercase;color:var(--ink-4);padding:2px 10px;border:1px solid var(--line);
-  border-radius:100px;margin-bottom:22px}
-.turn{display:flex;gap:12px;margin-bottom:22px;animation:rise .22s var(--ease) both}
-@keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
-.av{width:26px;height:26px;border-radius:7px;flex:none;display:grid;place-items:center;
-  font-size:10.5px;font-weight:600;letter-spacing:-.01em;margin-top:1px}
-.turn.agent .av{background:var(--ink);color:#fff}
-.turn.user .av{background:var(--surface);color:var(--ink-3);border:1px solid var(--line-2)}
-.tbody{flex:1;min-width:0}
-.tmeta{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
-.tname{font-size:12.5px;font-weight:600;color:var(--ink);letter-spacing:-.006em}
-.when{font-size:11px;color:var(--ink-4);opacity:0;transition:opacity .15s}
-.turn:hover .when{opacity:.9}
-.ttext{font-size:13.5px;line-height:1.62;color:var(--ink-2);white-space:pre-wrap;max-width:62ch}
-.turn.activity{margin-bottom:14px;align-items:center}
-.turn.activity .av{width:26px;height:26px;background:none;border:none;color:var(--ink-4)}
-.turn.activity .av svg.ic{width:13px;height:13px}
-.turn.activity .ttext{font-size:12.5px;color:var(--ink-3)}
-.typing{display:inline-flex;gap:4px;padding:6px 0}
-.typing i{width:5px;height:5px;border-radius:50%;background:var(--ink-4);
-  animation:tp 1.1s ease-in-out infinite}
-.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
-@keyframes tp{0%,60%,100%{opacity:.25;transform:none}30%{opacity:1;transform:translateY(-2px)}}
-.suggest{display:flex;gap:6px;flex-wrap:wrap;padding:0 24px 12px}
-.suggest button{border-radius:100px;font-weight:400;font-size:12.5px;color:var(--ink-3);
-  padding:6px 13px;background:var(--surface)}
-.suggest button:hover{color:var(--ink);border-color:var(--ink-4);background:var(--surface)}
-.composer{padding:14px 22px 20px;border-top:1px solid var(--line);background:var(--surface)}
-.cbox{display:flex;align-items:center;gap:6px;border:1px solid var(--line-2);border-radius:10px;
-  padding:6px 6px 6px 14px;background:var(--surface);transition:border-color .15s, box-shadow .15s}
-.cbox:focus-within{border-color:var(--ink-3);box-shadow:0 0 0 3px rgba(25,25,24,.05)}
-.cbox input{flex:1;border:none;font:inherit;font-size:13.5px;background:none;color:var(--ink);
-  padding:5px 0}
-.cbox input::placeholder{color:var(--ink-4)}
-.cbox input:focus{outline:none}
-.sendbtn{width:30px;height:30px;padding:0;border-radius:7px;justify-content:center;
-  background:var(--ink);color:#fff;border-color:var(--ink)}
-.sendbtn:hover{background:#000}
-.sendbtn svg.ic{width:14px;height:14px}
 button{border:1px solid var(--line-2);background:var(--surface);color:var(--ink);
   border-radius:8px;padding:9px 15px;font:500 13px Inter,-apple-system,sans-serif;
   cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .06s;
@@ -110,32 +50,141 @@ button.quiet{border-color:transparent;color:var(--blue);padding:6px 10px;border-
 button.quiet:hover{background:var(--blue-bg);border-color:transparent}
 button:disabled{opacity:.4;cursor:default;pointer-events:none}
 button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:1px}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
+  padding:3px 10px;border-radius:100px;transition:all .25s var(--ease);letter-spacing:.01em}
+.b-done{background:var(--pos-bg);color:var(--pos)}
+.b-run{background:var(--blue-bg);color:var(--blue)}
+.b-appr{background:var(--warn-bg);color:var(--warn)}
+.b-fail{background:var(--clay-bg);color:var(--clay)}
+.b-wait{background:var(--surface);color:var(--ink-4);border:1px solid var(--line-2)}
+.spin{width:10px;height:10px;border:1.5px solid var(--blue);border-top-color:transparent;
+  border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+@keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 
-/* ================= case file (paper column) ================= */
-.case{overflow-y:auto;padding:28px 34px 56px;display:flex;flex-direction:column;gap:16px;min-height:0}
+/* ================= app shell ================= */
+.app{display:grid;grid-template-columns:224px 1fr;height:100vh}
+aside{background:var(--surface);border-right:1px solid var(--line-2);display:flex;
+  flex-direction:column;padding:14px 10px}
+.brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--ink);color:#fff;
+  display:grid;place-items:center;font-weight:600;font-size:13px;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+.brand .bt{font-size:13.5px;font-weight:600;color:var(--ink);letter-spacing:-.008em}
+.brand .bs{font-size:11px;color:var(--ink-4)}
+.navlbl{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-4);padding:10px 10px 6px}
+.navitem{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:6px;
+  font-size:13.5px;color:var(--ink-2);cursor:pointer;transition:background .12s;
+  border:none;background:none;width:100%;text-align:left;font-weight:500}
+.navitem svg.ic{color:var(--ink-3)}
+.navitem:hover{background:var(--inset);border:none}
+.navitem.on{background:var(--blue-bg);color:var(--ink)}
+.navitem.on svg.ic{color:var(--blue)}
+.navitem .cnt{margin-left:auto;font-size:11px;font-weight:600;color:var(--warn);
+  background:var(--warn-bg);border-radius:100px;padding:1px 8px;font-variant-numeric:tabular-nums}
+.navitem .cnt.zero{display:none}
+aside .foot{margin-top:auto;display:flex;flex-direction:column;gap:6px;padding:10px}
+aside .foot .chip{justify-content:flex-start}
+.view{min-width:0;min-height:0;display:flex;flex-direction:column}
+
+/* ================= list views (cases / approvals) ================= */
+.page{max-width:960px;width:100%;margin:0 auto;padding:40px 40px 60px;overflow-y:auto}
+.pagehead{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+.pagehead h1{font-size:22px;font-weight:700;letter-spacing:-.018em;color:var(--ink)}
+.pagehead .sub{font-size:13px;color:var(--ink-4);margin-top:3px}
+.pagehead .spacer{flex:1}
+.listcard{background:var(--surface);border:1px solid var(--line-2);border-radius:var(--r-card);
+  overflow:hidden;animation:rise .24s var(--ease) both}
+.lrow{display:flex;align-items:center;gap:16px;padding:14px 20px;border-top:1px solid var(--line);
+  cursor:pointer;transition:background .12s}
+.lrow:first-child{border-top:none}
+.lrow:hover{background:var(--inset)}
+.lrow .cid{font-size:14px;font-weight:600;color:var(--ink);width:110px;flex:none}
+.lrow .cust{flex:1;min-width:0}
+.lrow .cust .cn{font-size:13.5px;font-weight:500;color:var(--ink)}
+.lrow .cust .cm{font-size:12px;color:var(--ink-4)}
+.lrow .meta{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--ink-4)}
+.lrow .chev{color:var(--ink-4)}
+.listempty{padding:48px 20px;text-align:center;color:var(--ink-4);font-size:13px}
+.apr-row{display:flex;gap:16px;padding:18px 20px;border-top:1px solid var(--line);align-items:flex-start}
+.apr-row:first-child{border-top:none}
+.apr-row .body{flex:1;min-width:0}
+.apr-row .t{font-size:14px;font-weight:600;color:var(--ink);letter-spacing:-.006em}
+.apr-row .prev{font-size:12.5px;color:var(--ink-3);margin-top:4px;display:-webkit-box;
+  -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.5}
+.apr-row .acts{display:flex;gap:6px;flex:none;align-items:center}
+
+/* ================= case workspace ================= */
+.work{display:grid;grid-template-columns:minmax(380px,43%) 1fr;height:100%;min-height:0}
+.workhead{grid-column:1/-1;display:flex;align-items:center;gap:12px;height:52px;
+  padding:0 22px;border-bottom:1px solid var(--line-2);background:var(--surface)}
+.workhead .back{padding:6px;border-radius:6px;border-color:transparent;color:var(--ink-3)}
+.workhead .back:hover{background:var(--inset);border-color:transparent}
+.workhead .wt{font-size:14px;font-weight:600;color:var(--ink);letter-spacing:-.008em}
+.workhead .ws{font-size:12px;color:var(--ink-4)}
+.workhead .right{margin-left:auto;display:flex;gap:8px}
+.work-grid{display:contents}
+.chat{display:flex;flex-direction:column;border-right:1px solid var(--line-2);
+  min-width:0;min-height:0;background:var(--surface)}
+.msgs{flex:1;overflow-y:auto;padding:26px 30px 8px;display:flex;flex-direction:column;
+  scroll-behavior:smooth}
+.daymark{align-self:center;font-size:11px;font-weight:500;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-4);padding:2px 10px;border:1px solid var(--line);
+  border-radius:100px;margin-bottom:22px}
+.turn{display:flex;gap:12px;margin-bottom:22px;animation:rise .22s var(--ease) both}
+.av{width:26px;height:26px;border-radius:7px;flex:none;display:grid;place-items:center;
+  font-size:10.5px;font-weight:600;margin-top:1px}
+.turn.agent .av{background:var(--ink);color:#fff}
+.turn.user .av{background:var(--surface);color:var(--ink-3);border:1px solid var(--line-2)}
+.tbody{flex:1;min-width:0}
+.tmeta{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.tname{font-size:12.5px;font-weight:600;color:var(--ink);letter-spacing:-.006em}
+.when{font-size:11px;color:var(--ink-4);opacity:0;transition:opacity .15s}
+.turn:hover .when{opacity:.9}
+.ttext{font-size:13.5px;line-height:1.62;color:var(--ink-2);white-space:pre-wrap;max-width:62ch}
+.turn.activity{margin-bottom:14px;align-items:center}
+.turn.activity .av{background:none;border:none;color:var(--ink-4)}
+.turn.activity .av svg.ic{width:13px;height:13px}
+.turn.activity .ttext{font-size:12.5px;color:var(--ink-3)}
+.typing{display:inline-flex;gap:4px;padding:6px 0}
+.typing i{width:5px;height:5px;border-radius:50%;background:var(--ink-4);
+  animation:tp 1.1s ease-in-out infinite}
+.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+@keyframes tp{0%,60%,100%{opacity:.25;transform:none}30%{opacity:1;transform:translateY(-2px)}}
+.suggest{display:flex;gap:6px;flex-wrap:wrap;padding:0 24px 12px}
+.suggest button{border-radius:100px;font-weight:400;font-size:12.5px;color:var(--ink-3);
+  padding:6px 13px}
+.suggest button:hover{color:var(--ink);border-color:var(--ink-4);background:var(--surface)}
+.composer{padding:14px 22px 20px;border-top:1px solid var(--line);background:var(--surface)}
+.cbox{display:flex;align-items:center;gap:6px;border:1px solid var(--line-2);border-radius:10px;
+  padding:6px 6px 6px 14px;background:var(--surface);transition:border-color .15s, box-shadow .15s}
+.cbox:focus-within{border-color:var(--ink-3);box-shadow:0 0 0 3px rgba(25,25,24,.05)}
+.cbox input{flex:1;border:none;font:inherit;font-size:13.5px;background:none;color:var(--ink);padding:5px 0}
+.cbox input::placeholder{color:var(--ink-4)}
+.cbox input:focus{outline:none}
+.sendbtn{width:30px;height:30px;padding:0;border-radius:7px;justify-content:center;
+  background:var(--ink);color:#fff;border-color:var(--ink)}
+.sendbtn:hover{background:#000}
+.sendbtn svg.ic{width:14px;height:14px}
+
+.case{overflow-y:auto;padding:26px 32px 56px;display:flex;flex-direction:column;gap:16px;min-height:0}
 .empty{margin:auto;text-align:center;color:var(--ink-4);display:flex;flex-direction:column;
   align-items:center;gap:14px;max-width:380px}
-.empty .art{color:var(--ink-4)}
-.empty .t{font-size:15px;font-weight:600;color:var(--ink-2);letter-spacing:-.008em}
+.empty .t{font-size:15px;font-weight:600;color:var(--ink-2)}
 .empty .s{font-size:13px;line-height:1.6}
 .card{background:var(--surface);border:1px solid var(--line-2);border-radius:var(--r-card);
   padding:20px 22px;animation:rise .26s var(--ease) both}
-.card:nth-child(2){animation-delay:.04s}.card:nth-child(3){animation-delay:.08s}
-.card:nth-child(4){animation-delay:.12s}.card:nth-child(5){animation-delay:.16s}
 .card h2{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;
   letter-spacing:.08em;text-transform:uppercase;color:var(--ink-4);margin-bottom:16px}
 .card h2 svg.ic{width:14px;height:14px;color:var(--ink-4)}
 .card h2 .tail{margin-left:auto;display:flex;gap:6px;text-transform:none;letter-spacing:0;font-weight:400}
-
-/* case hero */
 .kgrid{display:grid;grid-template-columns:repeat(4,auto) 1fr;gap:8px 40px;align-items:baseline}
 .kgrid .n{font-size:24px;font-weight:700;color:var(--ink);letter-spacing:-.022em;line-height:1.15}
 .kgrid .n.name{font-size:20px;font-weight:600;letter-spacing:-.014em}
 .kgrid .l{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-4);margin-top:4px}
-/* step rail */
 .steps{display:flex;align-items:center;margin-top:18px;padding-top:16px;border-top:1px solid var(--line)}
-.step{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-4);white-space:nowrap;
-  transition:color .3s;letter-spacing:.01em}
+.step{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-4);white-space:nowrap;transition:color .3s}
 .step .dt{width:9px;height:9px;border-radius:50%;border:1.5px solid var(--line-2);
   background:var(--surface);transition:all .35s var(--ease)}
 .step.on{color:var(--ink);font-weight:600}
@@ -146,8 +195,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 .step-line i{position:absolute;inset:0;background:var(--pos);transform:scaleX(0);
   transform-origin:left;transition:transform .5s var(--ease)}
 .step-line.fill i{transform:scaleX(1)}
-
-/* checklist rows */
 .row{display:flex;align-items:center;gap:11px;padding:10px 10px;margin:0 -10px;
   border-top:1px solid var(--line);font-size:13.5px;color:var(--ink-2);border-radius:6px;
   transition:background .15s}
@@ -160,23 +207,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 .row .grow .lbl{font-weight:500;color:var(--ink);letter-spacing:-.004em}
 .row .grow .meta{display:flex;gap:8px;font-size:11.5px;color:var(--ink-4)}
 .row .dur{font-size:11.5px;color:var(--ink-4);margin-right:2px}
-.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
-  padding:3px 10px;border-radius:100px;transition:all .25s var(--ease);letter-spacing:.01em}
-.b-done{background:var(--pos-bg);color:var(--pos)}
-.b-run{background:var(--blue-bg);color:var(--blue)}
-.b-appr{background:var(--warn-bg);color:var(--warn)}
-.b-fail{background:var(--clay-bg);color:var(--clay)}
-.spin{width:10px;height:10px;border:1.5px solid var(--blue);border-top-color:transparent;
-  border-radius:50%;animation:sp .7s linear infinite}
-@keyframes sp{to{transform:rotate(360deg)}}
 .hint{color:var(--ink-4);font-size:12px;margin-top:14px;line-height:1.6}
 .row.dragover{background:var(--blue-bg);box-shadow:inset 0 0 0 1.5px var(--blue)}
 .up-actions{display:flex;gap:2px;align-items:center}
-
-/* pipeline timeline */
 .tl{position:relative;padding-left:4px}
-.tlrow{position:relative;display:flex;align-items:center;gap:12px;padding:9px 0 9px 24px;
-  font-size:13px}
+.tlrow{position:relative;display:flex;align-items:center;gap:12px;padding:9px 0 9px 24px;font-size:13px}
 .tlrow::before{content:'';position:absolute;left:7px;top:0;bottom:0;width:1.5px;background:var(--line)}
 .tlrow:first-child::before{top:50%}
 .tlrow:last-child::before{bottom:50%}
@@ -189,8 +224,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 .tldot.appr{border-color:var(--warn);background:var(--warn)}
 .tldot.fail{border-color:var(--clay);background:var(--clay)}
 .tlrow .grow{flex:1;min-width:0}
-
-/* report sheet - the document artifact */
 .meta-strip{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
 .sheetwrap{max-height:420px;overflow-y:auto;border-radius:6px;background:var(--inset);
   border:1px solid var(--line);padding:18px}
@@ -209,14 +242,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 .sheet .cite{display:inline-block;font:500 10px ui-monospace,Menlo,monospace;
   color:var(--blue);background:var(--blue-bg);border-radius:3px;padding:1px 5px;margin:0 2px;
   white-space:nowrap;vertical-align:1px}
-.approve-bar{display:flex;gap:8px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line);
-  align-items:center}
+.approve-bar{display:flex;gap:8px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line);align-items:center}
 .approve-bar .hint{margin:0;flex:1;text-align:right}
-
-/* success */
 .callout{display:flex;gap:12px;border:1px solid var(--line-2);border-left:2.5px solid var(--pos);
-  background:var(--pos-bg);border-radius:6px;padding:14px 16px;font-size:13px;color:var(--ink-2);
-  line-height:1.55}
+  background:var(--pos-bg);border-radius:6px;padding:14px 16px;font-size:13px;color:var(--ink-2);line-height:1.55}
 .callout b{color:var(--ink)}
 .checkdraw{width:19px;height:19px;flex:none;margin-top:1px}
 .checkdraw circle{stroke:var(--pos);stroke-width:1.6;fill:none;stroke-dasharray:57;
@@ -224,21 +253,199 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
 .checkdraw path{stroke:var(--pos);stroke-width:2;fill:none;stroke-linecap:round;
   stroke-linejoin:round;stroke-dasharray:14;stroke-dashoffset:14;animation:draw .3s var(--ease) .55s forwards}
 @keyframes draw{to{stroke-dashoffset:0}}
-
-@media (max-width:960px){main{grid-template-columns:1fr}.case{display:none}}
+@media (max-width:960px){.app{grid-template-columns:1fr}aside{display:none}.work{grid-template-columns:1fr}.case{display:none}}
 </style>
 
-<header>
-  <div class="mark">R</div>
-  <nav class="crumbs"><span class="root">BBG Credit</span><span class="sep">/</span>
-    <span class="here">LA Renewal</span></nav>
-  <div class="right">
-    <span class="chip"><span class="pulse"></span>agent live</span>
-    <span class="chip mono">bedrock</span>
-  </div>
-</header>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <div class="mark">R</div>
+      <div><div class="bt">BBG Credit</div><div class="bs">Renewals workspace</div></div>
+    </div>
+    <div class="navlbl">Workspace</div>
+    <button class="navitem" id="nav-cases" onclick="location.hash='#/cases'">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+      Cases</button>
+    <button class="navitem" id="nav-approvals" onclick="location.hash='#/approvals'">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      Approvals<span class="cnt zero" id="aprCount">0</span></button>
+    <div class="navlbl">Actions</div>
+    <button class="navitem" onclick="location.hash='#/case/new'">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      New renewal</button>
+    <div class="foot">
+      <span class="chip"><span class="pulse"></span>agent live</span>
+      <span class="chip mono">bedrock</span>
+    </div>
+  </aside>
+  <div class="view" id="view"></div>
+</div>
 
-<main>
+<input type="file" id="filePick" accept=".pdf,.csv,.txt,.doc,.docx,.xls,.xlsx" style="display:none">
+<script>
+const API = 'http://localhost:8931';
+const DOC_ICONS = {
+  aecb: '<svg class="ic" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+  spread: '<svg class="ic" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>',
+  id: '<svg class="ic" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8.5" cy="11" r="2"/><path d="M14 9h5M14 13h5M6 17c.5-1.5 1.5-2 2.5-2s2 .5 2.5 2"/></svg>',
+  reference_report: '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8"/></svg>',
+};
+const IC_FILE = '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+const IC_EXTRACT = '<svg class="ic" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>';
+const DOCS = [
+  {key:'aecb', label:'AECB credit bureau report'},
+  {key:'spread', label:'Financial spread'},
+  {key:'id', label:'Trade license and IDs'},
+  {key:'reference_report', label:'Reference report (format)'},
+];
+const STEPS = ['collecting','extracting','review','submitted'];
+let state = null;           // active case workspace state
+let listTimer = null;       // approvals badge poll
+const $ = id => document.getElementById(id);
+const fmtKb = n => n > 1048576 ? (n/1048576).toFixed(1) + ' MB' : (n/1024).toFixed(1) + ' KB';
+const hhmm = ts => (ts ? new Date(ts) : new Date()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const rel = ts => {
+  const s = Math.round((Date.now() - new Date(ts)) / 1000);
+  if(s < 60) return 'just now';
+  if(s < 3600) return Math.round(s/60) + 'm ago';
+  if(s < 86400) return Math.round(s/3600) + 'h ago';
+  return Math.round(s/86400) + 'd ago';
+};
+function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+/* ================= server-derived model ================= */
+async function fetchAll(){
+  const [runsR, aprR, filesR] = await Promise.all([
+    fetch(`${API}/agents/loan-renewal/runs`), fetch(`${API}/approvals?status=pending`),
+    fetch(`${API}/files`)]);
+  return {runs: (await runsR.json()).runs || [],
+          approvals: (await aprR.json()).approvals || [],
+          files: (await filesR.json()).files || []};
+}
+function buildCases({runs, approvals, files}){
+  const cases = new Map();
+  for(const r of [...runs].reverse()){
+    const out = r.output || {};
+    if(out.caseId && out.reply){
+      const cif = out.caseId.split('-').pop();
+      const m = (out.reply || '').match(/\(([^)]+)\)/);
+      cases.set(out.caseId, {caseId: out.caseId, cif, product: out.caseId.split('-')[0],
+        customer: m ? m[1] : 'New customer', opened: r.createdAt, updated: r.createdAt,
+        docs: 0, status: 'collecting'});
+    }
+  }
+  for(const c of cases.values()){
+    c.docs = new Set(files.filter(f => (f.tags||{}).cif === c.cif && (f.tags||{}).docType)
+                          .map(f => f.tags.docType)).size;
+    const caseJobs = runs.filter(r => r.trigger === 'job' && r.job
+      && String((r.job.payload||{}).cif) === String(c.cif));
+    const compose = caseJobs.find(r => r.job.handler === 'compose_report');
+    for(const r of caseJobs) if(r.createdAt > c.updated) c.updated = r.createdAt;
+    if(compose && compose.status === 'completed') c.status = 'submitted';
+    else if(approvals.some(a => (a.title||'').includes(c.cif))) c.status = 'review';
+    else if(caseJobs.length) c.status = 'extracting';
+    else if(c.docs >= 4) c.status = 'extracting';
+  }
+  return [...cases.values()].sort((a,b) => (b.updated||'').localeCompare(a.updated||''));
+}
+const STATUS_BADGE = {collecting:'b-wait', extracting:'b-run', review:'b-appr', submitted:'b-done'};
+
+/* ================= router ================= */
+function nav(active){
+  for(const id of ['nav-cases','nav-approvals'])
+    $(id).classList.toggle('on', id === active);
+}
+async function route(){
+  if(state && state.polling){ clearInterval(state.polling); }
+  state = null;
+  const h = location.hash || '#/cases';
+  if(h.startsWith('#/case/')) return caseView(decodeURIComponent(h.slice(7)));
+  if(h === '#/approvals') return approvalsView();
+  return casesView();
+}
+window.addEventListener('hashchange', route);
+
+async function refreshBadge(){
+  try{
+    const a = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+    const el = $('aprCount');
+    el.textContent = a.length; el.classList.toggle('zero', !a.length);
+  }catch(e){}
+}
+
+/* ================= cases view ================= */
+async function casesView(){
+  nav('nav-cases');
+  $('view').innerHTML = `<div class="page"><div class="pagehead">
+      <div><h1>Cases</h1><div class="sub">Every renewal is a durable case - close the tab, it keeps going.</div></div>
+      <div class="spacer"></div>
+      <button class="primary" onclick="location.hash='#/case/new'">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>New renewal</button>
+    </div><div class="listcard" id="caseList"><div class="listempty">Loading...</div></div></div>`;
+  try{
+    const data = await fetchAll();
+    const cases = buildCases(data);
+    if(!cases.length){
+      $('caseList').innerHTML = `<div class="listempty">No cases yet - start one with New renewal.</div>`;
+      return;
+    }
+    $('caseList').innerHTML = cases.map(c => `
+      <div class="lrow" onclick="location.hash='#/case/${c.caseId}'">
+        <span class="cid mono tnum">${c.caseId}</span>
+        <span class="cust"><span class="cn">${escapeHtml(c.customer)}</span><br>
+          <span class="cm">CIF ${c.cif} · ${c.product}</span></span>
+        <span class="meta"><span class="tnum">${c.docs} of 4 docs</span>
+          <span>${rel(c.updated)}</span></span>
+        <span class="badge ${STATUS_BADGE[c.status]}">${c.status}</span>
+        <span class="chev"><svg class="ic" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+      </div>`).join('');
+  }catch(e){
+    $('caseList').innerHTML = `<div class="listempty">Could not reach the agent - is rya serve running?</div>`;
+  }
+}
+
+/* ================= approvals view ================= */
+async function approvalsView(){
+  nav('nav-approvals');
+  $('view').innerHTML = `<div class="page"><div class="pagehead">
+      <div><h1>Approvals</h1><div class="sub">Human gates - nothing writes to the LA database until signed here or in the case.</div></div>
+    </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div></div>`;
+  const render = async () => {
+    try{
+      const a = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+      refreshBadge();
+      if(!a.length){ $('aprList').innerHTML =
+        `<div class="listempty">Nothing pending - every submitted report has been signed.</div>`; return; }
+      $('aprList').innerHTML = a.map(x => `
+        <div class="apr-row">
+          <div class="body"><div class="t">${escapeHtml(x.title)}</div>
+            <div class="prev">${escapeHtml((x.body||'').replace(/[#|*-]/g,' ').slice(0, 220))}</div></div>
+          <div class="acts">
+            <button class="quiet" onclick="location.hash='#/case/LA-${(x.title.match(/CIF (\w+)/)||[])[1]||''}'">Open case</button>
+            <button class="pos" onclick="aprAct('${x.id}','approve')">Approve</button>
+            <button onclick="aprAct('${x.id}','reject')">Reject</button>
+          </div>
+        </div>`).join('');
+    }catch(e){ $('aprList').innerHTML = `<div class="listempty">Could not reach the agent.</div>`; }
+  };
+  await render();
+}
+async function aprAct(id, act){
+  await fetch(`${API}/approvals/${id}/${act}`, {method:'POST'});
+  approvalsView();
+}
+
+/* ================= case workspace ================= */
+function workspaceHtml(){
+  return `
+  <div class="workhead">
+    <button class="back" onclick="location.hash='#/cases'" aria-label="Back to cases">
+      <svg class="ic" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+    <span class="wt" id="whTitle">New renewal</span>
+    <span class="ws" id="whSub"></span>
+    <div class="right"><span class="chip mono" id="whChip" style="display:none"></span></div>
+  </div>
+  <div class="work-grid">
   <section class="chat">
     <div class="msgs" id="msgs"><div class="daymark">Today</div></div>
     <div class="suggest" id="suggest">
@@ -246,37 +453,19 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
       <button onclick="fill('Kick off a renewal of the working-capital LA facility, customer file 550022')">Renew working-capital LA - 550022</button>
       <button onclick="guided()" id="guidedBtn">Run guided demo</button>
     </div>
-    <div class="composer">
-      <div class="cbox">
-        <input id="input" placeholder="Describe the renewal to start..." autocomplete="off">
-        <button class="sendbtn" id="send" aria-label="Send">
-          <svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
-        </button>
-      </div>
-    </div>
+    <div class="composer"><div class="cbox">
+      <input id="input" placeholder="Describe the renewal to start..." autocomplete="off">
+      <button class="sendbtn" id="send" aria-label="Send">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+    </div></div>
   </section>
-
   <section class="case" id="casePanel">
     <div class="empty" id="emptyState">
-      <svg class="art" width="150" height="84" viewBox="0 0 150 84" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="8" y="14" width="34" height="44" rx="3"/>
-        <path d="M15 24h20M15 31h20M15 38h13"/>
-        <rect x="16" y="22" width="34" height="44" rx="3" fill="#fbfbfa"/>
-        <path d="M23 32h20M23 39h20M23 46h13"/>
-        <path d="M58 44h22M74 38l6 6-6 6"/>
-        <rect x="92" y="8" width="50" height="68" rx="4" fill="#fbfbfa"/>
-        <path d="M100 20h34M100 28h34M100 36h22"/>
-        <circle cx="117" cy="56" r="9"/>
-        <path d="m113 56 3 3 5.5-6"/>
-      </svg>
       <div class="t">No active case</div>
-      <div class="s">Start a renewal in the conversation - the case file, document checklist, and extraction pipeline appear here. Or run the guided demo to watch the whole flow.</div>
-      <button class="primary" onclick="guided()">Run guided demo</button>
+      <div class="s">Start a renewal in the conversation - the case file, document checklist, and extraction pipeline appear here.</div>
     </div>
-
     <div class="card" id="caseCard" style="display:none">
-      <h2><svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>Case file
-        <span class="tail" id="caseTail"></span></h2>
+      <h2>${IC_FILE}Case file<span class="tail" id="caseTail"></span></h2>
       <div class="kgrid">
         <div><div class="n mono tnum" id="caseId">-</div><div class="l">Case</div></div>
         <div><div class="n mono tnum" id="cif">-</div><div class="l">CIF</div></div>
@@ -285,20 +474,17 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
       </div>
       <div class="steps" id="steps"></div>
     </div>
-
     <div class="card" id="docsCard" style="display:none">
-      <h2><svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>Document checklist
+      <h2>${IC_FILE}Document checklist
         <span class="tail"><span class="chip tnum" id="docCount">0 of 4</span></span></h2>
       <div id="docRows"></div>
       <div class="hint">Upload your own PDF - the button or drag and drop onto a row - or use the demo bank's sample. Each upload is a durable file: the case resumes the moment it arrives, even across restarts.</div>
     </div>
-
     <div class="card" id="pipeCard" style="display:none">
-      <h2><svg class="ic" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>Extraction pipeline</h2>
+      <h2>${IC_EXTRACT}Extraction pipeline</h2>
       <div class="tl" id="pipeRows"></div>
-      <div class="hint">One retryable job per document - each reads its PDF through the model and lands structured data in the case working file. Failures retry with backoff; three strikes go to the dead-letter for replay.</div>
+      <div class="hint">One retryable job per document. Failures retry with backoff; three strikes go to the dead-letter for replay.</div>
     </div>
-
     <div class="card" id="reportCard" style="display:none">
       <h2><svg class="ic" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Final report - pending approval</h2>
       <div class="meta-strip" id="metaStrip"></div>
@@ -311,7 +497,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
         <span class="hint" id="approveHint">Unsourced figures are blocked before this point.</span>
       </div>
     </div>
-
     <div class="card" id="doneCard" style="display:none">
       <h2><svg class="ic" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>LA database</h2>
       <div class="callout" style="margin-bottom:12px">
@@ -322,39 +507,103 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
       <div class="row"><span class="grow"><span class="lbl" style="font-weight:400">Citations in final report</span></span><span class="mono tnum" id="citeCount">0</span></div>
       <div class="row"><span class="grow"><span class="lbl" style="font-weight:400">Human approval</span></span><span class="badge b-done">approved</span></div>
     </div>
-  </section>
-</main>
+  </section></div>`;
+}
 
-<input type="file" id="filePick" accept=".pdf,.csv,.txt,.doc,.docx,.xls,.xlsx" style="display:none">
-<script>
-const API = 'http://localhost:8931';
-const DOC_ICONS = {
-  aecb: '<svg class="ic" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
-  spread: '<svg class="ic" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>',
-  id: '<svg class="ic" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8.5" cy="11" r="2"/><path d="M14 9h5M14 13h5M6 17c.5-1.5 1.5-2 2.5-2s2 .5 2.5 2"/></svg>',
-  reference_report: '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8"/></svg>',
-};
-const DOCS = [
-  {key:'aecb', label:'AECB credit bureau report'},
-  {key:'spread', label:'Financial spread'},
-  {key:'id', label:'Trade license and IDs'},
-  {key:'reference_report', label:'Reference report (format)'},
-];
-const STEPS = ['collecting','extracting','review','submitted'];
-const state = {cif:null, caseId:null, uploaded:{}, filenames:{}, sizes:{}, approvalId:null,
-               report:'', polling:null, step:0};
-const $ = id => document.getElementById(id);
-const fmtKb = n => n > 1048576 ? (n/1048576).toFixed(1) + ' MB' : (n/1024).toFixed(1) + ' KB';
-const hhmm = () => new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+async function caseView(caseId){
+  nav(null);
+  $('view').innerHTML = `<div class="work">${workspaceHtml()}</div>`;
+  state = {cif:null, caseId:null, uploaded:{}, filenames:{}, sizes:{}, approvalId:null,
+           report:'', polling:null, step:0};
+  wireWorkspace();
+  if(caseId === 'new'){
+    say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".', {instant:true});
+    return;
+  }
+  state.caseId = caseId; state.cif = caseId.split('-').pop();
+  $('whTitle').textContent = caseId;
+  $('suggest').style.display = 'none';
+  await rebuildThread();
+  startPolling();
+}
 
-function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+/* thread reconstruction: the server is the source of truth */
+async function rebuildThread(){
+  try{
+    const data = await fetchAll();
+    const {runs, approvals, files} = data;
+    const mine = runs.filter(r => {
+      const out = r.output || {}, ev = r.event || {};
+      if(out.caseId === state.caseId) return true;
+      return ev.type === 'file.uploaded' && ((ev.payload||{}).tags||{}).cif === state.cif;
+    }).sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
 
-const IC_ACT = '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+    let opener = null;
+    for(const r of mine){
+      const ev = r.event || {}, out = r.output || {};
+      if(ev.type === 'message.received'){
+        if((ev.payload||{}).text) say('user', ev.payload.text, {instant:true, ts:r.createdAt});
+        if(out.reply){ say('agent', out.reply, {instant:true, ts:r.createdAt}); opener = opener || r; }
+      }else if(ev.type === 'file.uploaded'){
+        const tg = (ev.payload||{}).tags||{};
+        say('agent', `Received ${tg.docType}${(out.missing||[]).length ? ' - still needed: ' + out.missing.join(', ') : ''}.`,
+            {activity:true, ts:r.createdAt});
+        if((out.status||'') === 'extracting')
+          say('agent', 'Document set complete - extracting all four documents.', {activity:true, icon:IC_EXTRACT, ts:r.createdAt});
+      }
+    }
+    for(const f of files){
+      const tg = f.tags || {};
+      if(tg.cif === state.cif && tg.docType){
+        state.uploaded[tg.docType] = true; state.filenames[tg.docType] = f.name; state.sizes[tg.docType] = f.size;
+      }
+    }
+    const detail = opener ? await (await fetch(`${API}/runs/${opener.id}`)).json() : {trace: []};
+    const m = opener && (opener.output.reply || '').match(/\(([^)]+)\)/);
+    if(m && !((detail.trace||[]).some(e => e.label === 'archive.lookup_cif')))
+      detail.trace = [...(detail.trace||[]), {kind:'tool.call', label:'archive.lookup_cif',
+        data:{result:{customer:{customerName: m[1]}}}}];
+    openCase(detail);
+    if(Object.keys(state.uploaded).length >= DOCS.length) setStep(1);
+    const caseJobs = runs.filter(r => r.trigger === 'job' && r.job
+      && String((r.job.payload||{}).cif) === String(state.cif));
+    const compose = caseJobs.find(r => r.job.handler === 'compose_report');
+    if(compose && compose.status === 'completed'){
+      setStep(4); $('doneCard').style.display = 'block';
+      say('agent', 'Approved - the renewal record and final report are written to the LA database.', {activity:true, ts:compose.updatedAt});
+    }
+    await poll();
+  }catch(e){
+    say('agent', 'Could not load this case - is the agent running?', {instant:true});
+  }
+}
+
+function wireWorkspace(){
+  $('send').onclick = send;
+  $('input').addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
+  $('approveBtn').onclick = async () => {
+    $('approveBtn').disabled = $('rejectBtn').disabled = true;
+    $('approveHint').textContent = 'Executing the gated write...';
+    await fetch(`${API}/approvals/${state.approvalId}/approve`, {method:'POST'});
+    $('reportCard').style.display = 'none';
+    $('doneCard').style.display = 'block';
+    countUp($('citeCount'), (state.report.match(/\[source:/g) || []).length);
+    setStep(4); refreshBadge();
+    say('agent', 'Approved. The renewal record and final report are written to the LA database.');
+  };
+  $('rejectBtn').onclick = async () => {
+    await fetch(`${API}/approvals/${state.approvalId}/reject`, {method:'POST'});
+    $('reportCard').style.display = 'none'; refreshBadge();
+    say('agent', 'Rejected - nothing was written to the LA database.');
+  };
+}
+
+/* ================= chat primitives ================= */
 function say(cls, text, opts={}){
   const t = document.createElement('div');
   if(opts.activity){
     t.className = 'turn activity';
-    t.innerHTML = `<span class="av">${opts.icon || IC_ACT}</span>
+    t.innerHTML = `<span class="av">${opts.icon || IC_FILE}</span>
       <div class="tbody"><div class="ttext"></div></div>`;
     t.querySelector('.ttext').textContent = text;
     $('msgs').appendChild(t); $('msgs').scrollTop = 1e9;
@@ -365,7 +614,7 @@ function say(cls, text, opts={}){
   t.innerHTML = `<span class="av">${agent ? 'R' : 'RM'}</span>
     <div class="tbody">
       <div class="tmeta"><span class="tname">${agent ? 'Renewal Agent' : 'Relationship Manager'}</span>
-        <span class="when">${hhmm()}</span></div>
+        <span class="when">${hhmm(opts.ts)}</span></div>
       <div class="ttext">${opts.html || ''}</div>
     </div>`;
   $('msgs').appendChild(t);
@@ -408,8 +657,6 @@ function setStep(n){
       (i < STEPS.length - 1 ? `<span class="step-line ${i < state.step ? 'fill' : ''}"><i></i></span>` : '');
   }).join('');
 }
-
-/* minimal markdown: headings, tables, bold, [source:] chips */
 function renderMd(md){
   const cite = s => s.replace(/\[source: ?([^\]]+)\]/g, '<span class="cite">$1</span>');
   const inline = s => cite(escapeHtml(s)).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
@@ -432,8 +679,8 @@ function renderMd(md){
   flush(); return out.join('');
 }
 
+/* ================= workspace behavior ================= */
 function fill(text){ $('input').value = text; send(); }
-
 async function send(){
   const text = $('input').value.trim(); if(!text) return;
   $('input').value = ''; $('suggest').style.display = 'none';
@@ -447,14 +694,15 @@ async function send(){
     const run = await (await fetch(`${API}/runs/${runId}`)).json();
     const out = run.output || {};
     tp.remove(); say('agent', out.reply || 'Done.');
-    if(out.caseId){
+    if(out.caseId && !state.caseId){
       state.caseId = out.caseId; state.cif = out.caseId.split('-').pop();
-      openCase(run);
+      history.replaceState(null, '', '#/case/' + out.caseId);
+      $('whTitle').textContent = out.caseId;
+      openCase(run); startPolling();
     }
   }catch(e){ tp.remove(); say('agent', 'Something went wrong - ' + e.message, {instant:true}); }
   $('send').disabled = false;
 }
-
 function openCase(run){
   $('emptyState').style.display = 'none';
   $('caseCard').style.display = $('docsCard').style.display = 'block';
@@ -463,9 +711,10 @@ function openCase(run){
   const lookup = (run.trace || []).find(e => e.kind === 'tool.call' && e.label === 'archive.lookup_cif');
   const cust = lookup && lookup.data && lookup.data.result && lookup.data.result.customer;
   $('customer').textContent = cust ? cust.customerName : 'New customer';
-  setStep(0); renderDocs(); startPolling();
+  $('whTitle').textContent = state.caseId;
+  $('whSub').textContent = cust ? cust.customerName : '';
+  setStep(0); renderDocs();
 }
-
 function renderDocs(){
   $('docRows').innerHTML = '';
   const got = Object.keys(state.uploaded).length;
@@ -496,7 +745,6 @@ function renderDocs(){
     $('docRows').appendChild(row);
   }
 }
-
 function pickFile(key){
   const inp = $('filePick');
   inp.onchange = () => { if(inp.files[0]) uploadFile(key, inp.files[0]); inp.value = ''; };
@@ -522,12 +770,10 @@ async function postDoc(key, filename, buf, ctype){
   if(out.missing && out.missing.length)
     say('agent', `Received ${key} - still needed: ${out.missing.join(', ')}.`, {activity:true});
   else if(out.status === 'extracting'){
-    say('agent', 'Document set complete - extracting all four documents now.', {activity:true,
-      icon:'<svg class="ic" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>'});
+    say('agent', 'Document set complete - extracting all four documents now.', {activity:true, icon:IC_EXTRACT});
     setStep(1); $('pipeCard').style.display = 'block';
   }
 }
-
 function jobDur(j){
   try{
     const a = new Date(j.createdAt), b = new Date(j.updatedAt || j.createdAt);
@@ -535,8 +781,8 @@ function jobDur(j){
     return s ? `${s}s` : '';
   }catch(e){ return ''; }
 }
-
 async function poll(){
+  if(!state || !state.cif) return;
   try{
     const runs = (await (await fetch(`${API}/agents/loan-renewal/runs`)).json()).runs || [];
     const jobs = runs.filter(r => r.trigger === 'job'
@@ -566,7 +812,7 @@ async function poll(){
       $('reportCard').style.display = 'block';
       $('reportBody').innerHTML = renderMd(state.report);
       metaChips(runs);
-      say('agent', 'The final report is ready and grounded - every figure cites its source document. Review it on the right and approve to write the LA record.');
+      say('agent', 'The final report is ready and grounded - every figure cites its source document. Review it and approve to write the LA record.');
     }
   }catch(e){ /* transient */ }
 }
@@ -586,26 +832,8 @@ async function metaChips(runs){
     $('metaStrip').innerHTML = chips.join('');
   }catch(e){ /* cosmetic */ }
 }
-function startPolling(){ if(!state.polling) state.polling = setInterval(poll, 2500); }
+function startPolling(){ if(state && !state.polling) state.polling = setInterval(poll, 2500); }
 
-$('approveBtn').onclick = async () => {
-  $('approveBtn').disabled = $('rejectBtn').disabled = true;
-  $('approveHint').textContent = 'Executing the gated write...';
-  await fetch(`${API}/approvals/${state.approvalId}/approve`, {method:'POST'});
-  $('reportCard').style.display = 'none';
-  $('doneCard').style.display = 'block';
-  countUp($('citeCount'), (state.report.match(/\[source:/g) || []).length);
-  setStep(4);
-  say('agent', 'Approved. The renewal record and final report are written to the LA database.');
-  clearInterval(state.polling); state.polling = null; poll();
-};
-$('rejectBtn').onclick = async () => {
-  await fetch(`${API}/approvals/${state.approvalId}/reject`, {method:'POST'});
-  $('reportCard').style.display = 'none';
-  say('agent', 'Rejected - nothing was written to the LA database.');
-};
-
-/* Guided demo: the full flow, self-driving up to the human gate. */
 async function guided(){
   const b = $('guidedBtn'); if(b) b.disabled = true;
   $('input').value = 'I want to start an LA renewal application for CIF 884411';
@@ -617,46 +845,8 @@ async function guided(){
   say('agent', 'Extraction is running - the approval stays yours: the demo never signs for you.', {activity:true});
 }
 
-$('send').onclick = send;
-$('input').addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
-
-/* Hydrate: an application, not a demo - a reload rejoins the live case. */
-async function hydrate(){
-  try{
-    const runs = (await (await fetch(`${API}/agents/loan-renewal/runs`)).json()).runs || [];
-    const opener = runs.find(r => r.output && r.output.caseId && r.output.reply)
-      || runs.find(r => r.output && r.output.caseId);
-    if(!opener){
-      say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".', {instant:true});
-      return;
-    }
-    state.caseId = opener.output.caseId; state.cif = state.caseId.split('-').pop();
-    const detail = await (await fetch(`${API}/runs/${opener.id}`)).json();
-    const m = (opener.output.reply || '').match(/\(([^)]+)\)/);
-    if(m && !((detail.trace || []).some(e => e.label === 'archive.lookup_cif')))
-      detail.trace = [...(detail.trace || []), {kind:'tool.call', label:'archive.lookup_cif',
-        data:{result:{customer:{customerName: m[1]}}}}];
-    say('agent', `Resumed case ${state.caseId} - durable, so the view picks up wherever the pipeline is.`, {activity:true});
-    $('suggest').style.display = 'none';
-    const files = (await (await fetch(`${API}/files`)).json()).files || [];
-    for(const f of files){
-      const tg = f.tags || {};
-      if(tg.cif === state.cif && tg.docType){
-        state.uploaded[tg.docType] = true; state.filenames[tg.docType] = f.name;
-        state.sizes[tg.docType] = f.size;
-      }
-    }
-    openCase(detail);
-    if(Object.keys(state.uploaded).length >= DOCS.length) setStep(1);
-    const jobs = runs.filter(r => r.trigger === 'job');
-    if(jobs.some(j => j.job && j.job.handler === 'compose_report'
-        && String((j.job.payload || {}).cif) === String(state.cif) && j.status === 'completed')){
-      setStep(4); $('doneCard').style.display = 'block';
-    }
-    await poll();
-  }catch(e){
-    say('agent', 'Tell me which renewal to start - for example: "I want to start an LA renewal application for CIF 884411".', {instant:true});
-  }
-}
-hydrate();
+/* ================= boot ================= */
+refreshBadge();
+listTimer = setInterval(refreshBadge, 6000);
+route();
 </script>

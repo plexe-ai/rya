@@ -284,7 +284,7 @@ aside .foot .chip{justify-content:flex-start}
 
 <input type="file" id="filePick" accept=".pdf,.csv,.txt,.doc,.docx,.xls,.xlsx" style="display:none">
 <script>
-const API = 'http://localhost:8931';
+const API = location.port === '8932' ? 'http://localhost:8931' : '';
 let auth = JSON.parse(localStorage.getItem('rya.auth') || 'null');
 function saveAuth(a){ auth = a;
   if(a) localStorage.setItem('rya.auth', JSON.stringify(a));

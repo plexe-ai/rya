@@ -377,6 +377,13 @@ def build_app(root: Path) -> FastAPI:
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
         return resp
 
+    # Project-shipped product UI: if the baked project has a web/ dir, serve it
+    # at /app - same origin as the API, so the app needs no CORS and no config.
+    _webdir = root / "web"
+    if _webdir.is_dir():
+        from fastapi.staticfiles import StaticFiles
+        api.mount("/app", StaticFiles(directory=str(_webdir), html=True), name="app")
+
     @api.get("/", response_class=HTMLResponse)
     @api.get("/console.html", response_class=HTMLResponse)
     def console_page():

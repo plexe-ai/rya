@@ -125,6 +125,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
   border-radius:50%;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .hint{color:var(--ink-4);font-size:12px;margin-top:12px;line-height:1.5}
+.row.droppable{border-radius:var(--r);margin:0 -8px;padding-left:8px;padding-right:8px;
+  transition:background .15s,box-shadow .15s}
+.row.dragover{background:var(--blue-bg);box-shadow:inset 0 0 0 1px var(--blue)}
+.up-actions{display:flex;gap:2px;align-items:center}
 
 /* report */
 .report{font-size:13px;background:var(--bg);border:1px solid var(--line);
@@ -194,7 +198,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
     <div class="card" id="docsCard" style="display:none">
       <h2><svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>Document checklist</h2>
       <div id="docRows"></div>
-      <div class="hint">Each upload is a durable file - the case resumes the moment it arrives, even across restarts. Samples are the demo bank's PDFs.</div>
+      <div class="hint">Upload your own PDF - the button or drag and drop onto a row - or use the demo bank's sample. Each upload is a durable file: the case resumes the moment it arrives, even across restarts.</div>
     </div>
 
     <div class="card" id="pipeCard" style="display:none">
@@ -228,6 +232,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-o
   </section>
 </main>
 
+<input type="file" id="filePick" accept=".pdf,.csv,.txt,.doc,.docx,.xls,.xlsx" style="display:none">
 <script>
 const API = 'http://localhost:8931';
 const DOCS = [
@@ -237,7 +242,7 @@ const DOCS = [
   {key:'reference_report', label:'Reference report (format)'},
 ];
 const STEPS = ['collecting','extracting','review','submitted'];
-const state = {cif:null, caseId:null, uploaded:{}, approvalId:null, report:'', polling:null, step:0};
+const state = {cif:null, caseId:null, uploaded:{}, filenames:{}, approvalId:null, report:'', polling:null, step:0};
 const $ = id => document.getElementById(id);
 const icFile = '<svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 
@@ -319,23 +324,50 @@ function openCase(run){
 function renderDocs(){
   $('docRows').innerHTML = '';
   for(const d of DOCS){
-    const row = document.createElement('div'); row.className = 'row';
+    const row = document.createElement('div'); row.className = 'row droppable';
     const right = state.uploaded[d.key]
       ? `<span class="badge b-done"><svg class="ic" style="width:10px;height:10px" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>received</span>`
-      : `<button class="quiet" onclick="uploadSample('${d.key}')">Upload sample</button>`;
+      : `<span class="up-actions">
+           <button class="quiet" onclick="pickFile('${d.key}')">
+             <svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+             Upload</button>
+           <button class="quiet" onclick="uploadSample('${d.key}')">Use sample</button>
+         </span>`;
     row.innerHTML = `<span class="grow">${icFile}${d.label}
-      <span class="sub mono">${d.key}.pdf</span></span>${right}`;
+      <span class="sub mono">${state.filenames[d.key] || ''}</span></span>${right}`;
+    row.addEventListener('dragover', e => { e.preventDefault(); row.classList.add('dragover'); });
+    row.addEventListener('dragleave', () => row.classList.remove('dragover'));
+    row.addEventListener('drop', e => {
+      e.preventDefault(); row.classList.remove('dragover');
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if(f) uploadFile(d.key, f);
+    });
     $('docRows').appendChild(row);
   }
 }
 
+function pickFile(key){
+  const inp = $('filePick');
+  inp.onchange = () => { if(inp.files[0]) uploadFile(key, inp.files[0]); inp.value = ''; };
+  inp.click();
+}
+
+async function uploadFile(key, file){
+  const buf = await file.arrayBuffer();
+  await postDoc(key, file.name, buf, file.type || 'application/octet-stream');
+}
+
 async function uploadSample(key){
   const pdf = await (await fetch(`samples/${key}.pdf`)).arrayBuffer();
-  const q = `name=${key}.pdf&tag.cif=${state.cif}&tag.docType=${key}`;
+  await postDoc(key, `${key}.pdf`, pdf, 'application/pdf');
+}
+
+async function postDoc(key, filename, buf, ctype){
+  const q = `name=${encodeURIComponent(filename)}&tag.cif=${state.cif}&tag.docType=${key}`;
   const r = await fetch(`${API}/files?${q}`, {method:'POST',
-    headers:{'content-type':'application/pdf'}, body: pdf});
+    headers:{'content-type': ctype}, body: buf});
   const body = await r.json();
-  state.uploaded[key] = true; renderDocs();
+  state.uploaded[key] = true; state.filenames[key] = filename; renderDocs();
   const run = await (await fetch(`${API}/runs/${body.runId}`)).json();
   const out = run.output || {};
   if(out.missing && out.missing.length)

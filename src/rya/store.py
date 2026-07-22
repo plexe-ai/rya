@@ -121,6 +121,7 @@ class FileStore:
                 "contentType": content_type or "application/octet-stream",
                 "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
                 "tags": tags or {}, "createdAt": now_iso()}
+        self.files_dir.mkdir(parents=True, exist_ok=True)
         (self.files_dir / meta["id"]).write_bytes(content)
         self._write(self.files_dir / f"{meta['id']}.json", meta)
         return meta

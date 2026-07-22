@@ -276,6 +276,7 @@ aside .foot .chip{justify-content:flex-start}
     <div class="foot">
       <span class="chip"><span class="pulse"></span>agent live</span>
       <span class="chip mono">bedrock</span>
+      <div id="userFoot"></div>
     </div>
   </aside>
   <div class="view" id="view"></div>
@@ -284,6 +285,19 @@ aside .foot .chip{justify-content:flex-start}
 <input type="file" id="filePick" accept=".pdf,.csv,.txt,.doc,.docx,.xls,.xlsx" style="display:none">
 <script>
 const API = 'http://localhost:8931';
+let auth = JSON.parse(localStorage.getItem('rya.auth') || 'null');
+function saveAuth(a){ auth = a;
+  if(a) localStorage.setItem('rya.auth', JSON.stringify(a));
+  else localStorage.removeItem('rya.auth'); }
+async function apiFetch(path, opts = {}){
+  opts.headers = Object.assign({}, opts.headers || {},
+    auth && auth.wsKey ? {'authorization': 'Bearer ' + auth.wsKey} : {});
+  const r = await fetch(API + path, opts);
+  if(r.status === 401){ saveAuth(null); location.hash = '#/login'; throw new Error('unauthorized'); }
+  return r;
+}
+const emailName = e => (e || '').split('@')[0].replace(/^./, c => c.toUpperCase());
+const initials = e => (e || '?').slice(0, 2).toUpperCase();
 const DOC_ICONS = {
   aecb: '<svg class="ic" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
   spread: '<svg class="ic" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>',
@@ -316,8 +330,8 @@ function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'
 /* ================= server-derived model ================= */
 async function fetchAll(){
   const [runsR, aprR, filesR] = await Promise.all([
-    fetch(`${API}/agents/loan-renewal/runs`), fetch(`${API}/approvals?status=pending`),
-    fetch(`${API}/files`)]);
+    apiFetch(`/agents/loan-renewal/runs`), apiFetch(`/approvals?status=pending`),
+    apiFetch(`/files`)]);
   return {runs: (await runsR.json()).runs || [],
           approvals: (await aprR.json()).approvals || [],
           files: (await filesR.json()).files || []};
@@ -359,6 +373,8 @@ async function route(){
   if(state && state.polling){ clearInterval(state.polling); }
   state = null;
   const h = location.hash || '#/cases';
+  if(!auth && h !== '#/login'){ location.hash = '#/login'; return loginView(); }
+  if(h === '#/login') return loginView();
   if(h.startsWith('#/case/')) return caseView(decodeURIComponent(h.slice(7)));
   if(h === '#/approvals') return approvalsView();
   return casesView();
@@ -367,10 +383,66 @@ window.addEventListener('hashchange', route);
 
 async function refreshBadge(){
   try{
-    const a = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+    const a = (await (await apiFetch(`/approvals?status=pending`)).json()).approvals || [];
     const el = $('aprCount');
     el.textContent = a.length; el.classList.toggle('zero', !a.length);
   }catch(e){}
+}
+
+/* ================= sign in ================= */
+async function v1(path, body, token){
+  const r = await fetch(API + '/v1' + path, {method: body ? 'POST' : 'GET',
+    headers: Object.assign({'content-type': 'application/json'},
+      token ? {'authorization': 'Bearer ' + token} : {}),
+    body: body ? JSON.stringify(body) : undefined});
+  const j = await r.json();
+  if(!r.ok) throw new Error((j.message || j.detail && j.detail.message) || 'request failed');
+  return j;
+}
+function loginView(){
+  nav(null);
+  $('view').innerHTML = `<div class="page" style="max-width:420px;display:flex;flex-direction:column;justify-content:center">
+    <div class="card" style="padding:28px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <div class="mark">R</div>
+        <div style="font-size:16px;font-weight:700;letter-spacing:-.014em;color:var(--ink)">BBG Credit</div>
+      </div>
+      <div class="hint" style="margin:0 0 18px">Sign in to your renewals workspace.</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="cbox"><input id="lemail" placeholder="work email" autocomplete="username"></div>
+        <div class="cbox"><input id="lpass" type="password" placeholder="password" autocomplete="current-password"></div>
+        <button class="primary" id="loginBtn" style="justify-content:center">Sign in</button>
+        <div class="hint" id="loginErr" style="margin:2px 0 0;text-align:center"></div>
+      </div>
+    </div></div>`;
+  $('loginBtn').onclick = doLogin;
+  $('lpass').addEventListener('keydown', e => { if(e.key === 'Enter') doLogin(); });
+}
+async function doLogin(){
+  $('loginBtn').disabled = true; $('loginErr').textContent = '';
+  try{
+    const res = await v1('/login', {email: $('lemail').value.trim(), password: $('lpass').value});
+    const ws = res.workspaces[0];
+    if(!ws) throw new Error('no workspace for this account');
+    const key = await v1(`/workspaces/${ws.id}/keys`, {label: res.user.email}, res.token);
+    saveAuth({token: res.token, email: res.user.email, userId: res.user.id,
+              wsId: ws.id, wsName: ws.name, wsKey: key.apiKey});
+    renderUserFoot();
+    location.hash = '#/cases';
+  }catch(e){ $('loginErr').textContent = e.message; $('loginBtn').disabled = false; }
+}
+function signOut(){ saveAuth(null); renderUserFoot(); location.hash = '#/login'; }
+function renderUserFoot(){
+  const el = $('userFoot');
+  if(!auth){ el.innerHTML = ''; return; }
+  el.innerHTML = `<div style="display:flex;align-items:center;gap:9px;padding:8px 10px;border-top:1px solid var(--line);margin-top:6px">
+    <span class="av" style="background:var(--blue-bg);color:var(--blue);border:none">${initials(auth.email)}</span>
+    <span style="flex:1;min-width:0"><span style="display:block;font-size:12.5px;font-weight:600;color:var(--ink);
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${emailName(auth.email)}</span>
+      <span style="font-size:11px;color:var(--ink-4)">${escapeHtml(auth.wsName)}</span></span>
+    <button class="quiet" style="padding:4px 8px" onclick="signOut()" title="Sign out">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+    </button></div>`;
 }
 
 /* ================= cases view ================= */
@@ -412,7 +484,7 @@ async function approvalsView(){
     </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div></div>`;
   const render = async () => {
     try{
-      const a = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+      const a = (await (await apiFetch(`/approvals?status=pending`)).json()).approvals || [];
       refreshBadge();
       if(!a.length){ $('aprList').innerHTML =
         `<div class="listempty">Nothing pending - every submitted report has been signed.</div>`; return; }
@@ -431,7 +503,7 @@ async function approvalsView(){
   await render();
 }
 async function aprAct(id, act){
-  await fetch(`${API}/approvals/${id}/${act}`, {method:'POST'});
+  await apiFetch(`/approvals/${id}/${act}`, {method:'POST'});
   approvalsView();
 }
 
@@ -542,7 +614,7 @@ async function rebuildThread(){
     for(const r of mine){
       const ev = r.event || {}, out = r.output || {};
       if(ev.type === 'message.received'){
-        if((ev.payload||{}).text) say('user', ev.payload.text, {instant:true, ts:r.createdAt});
+        if((ev.payload||{}).text) say('user', ev.payload.text, {instant:true, ts:r.createdAt, generic:true});
         if(out.reply){ say('agent', out.reply, {instant:true, ts:r.createdAt}); opener = opener || r; }
       }else if(ev.type === 'file.uploaded'){
         const tg = (ev.payload||{}).tags||{};
@@ -558,7 +630,7 @@ async function rebuildThread(){
         state.uploaded[tg.docType] = true; state.filenames[tg.docType] = f.name; state.sizes[tg.docType] = f.size;
       }
     }
-    const detail = opener ? await (await fetch(`${API}/runs/${opener.id}`)).json() : {trace: []};
+    const detail = opener ? await (await apiFetch(`/runs/${opener.id}`)).json() : {trace: []};
     const m = opener && (opener.output.reply || '').match(/\(([^)]+)\)/);
     if(m && !((detail.trace||[]).some(e => e.label === 'archive.lookup_cif')))
       detail.trace = [...(detail.trace||[]), {kind:'tool.call', label:'archive.lookup_cif',
@@ -584,7 +656,7 @@ function wireWorkspace(){
   $('approveBtn').onclick = async () => {
     $('approveBtn').disabled = $('rejectBtn').disabled = true;
     $('approveHint').textContent = 'Executing the gated write...';
-    await fetch(`${API}/approvals/${state.approvalId}/approve`, {method:'POST'});
+    await apiFetch(`/approvals/${state.approvalId}/approve`, {method:'POST'});
     $('reportCard').style.display = 'none';
     $('doneCard').style.display = 'block';
     countUp($('citeCount'), (state.report.match(/\[source:/g) || []).length);
@@ -592,7 +664,7 @@ function wireWorkspace(){
     say('agent', 'Approved. The renewal record and final report are written to the LA database.');
   };
   $('rejectBtn').onclick = async () => {
-    await fetch(`${API}/approvals/${state.approvalId}/reject`, {method:'POST'});
+    await apiFetch(`/approvals/${state.approvalId}/reject`, {method:'POST'});
     $('reportCard').style.display = 'none'; refreshBadge();
     say('agent', 'Rejected - nothing was written to the LA database.');
   };
@@ -611,9 +683,9 @@ function say(cls, text, opts={}){
   }
   t.className = 'turn ' + cls;
   const agent = cls === 'agent';
-  t.innerHTML = `<span class="av">${agent ? 'R' : 'RM'}</span>
+  t.innerHTML = `<span class="av">${agent ? 'R' : (opts.generic ? 'RM' : initials(auth && auth.email))}</span>
     <div class="tbody">
-      <div class="tmeta"><span class="tname">${agent ? 'Renewal Agent' : 'Relationship Manager'}</span>
+      <div class="tmeta"><span class="tname">${agent ? 'Renewal Agent' : (opts.generic || !auth ? 'Relationship Manager' : emailName(auth.email))}</span>
         <span class="when">${hhmm(opts.ts)}</span></div>
       <div class="ttext">${opts.html || ''}</div>
     </div>`;
@@ -687,11 +759,11 @@ async function send(){
   say('user', text); $('send').disabled = true;
   const tp = typing();
   try{
-    const r = await fetch(`${API}/agents/loan-renewal/events`, {method:'POST',
+    const r = await apiFetch(`/agents/loan-renewal/events`, {method:'POST',
       headers:{'content-type':'application/json'},
       body: JSON.stringify({type:'message.received', payload:{text}})});
     const {runId} = await r.json();
-    const run = await (await fetch(`${API}/runs/${runId}`)).json();
+    const run = await (await apiFetch(`/runs/${runId}`)).json();
     const out = run.output || {};
     tp.remove(); say('agent', out.reply || 'Done.');
     if(out.caseId && !state.caseId){
@@ -760,12 +832,12 @@ async function uploadSample(key){
 }
 async function postDoc(key, filename, buf, ctype){
   const q = `name=${encodeURIComponent(filename)}&tag.cif=${state.cif}&tag.docType=${key}`;
-  const r = await fetch(`${API}/files?${q}`, {method:'POST',
+  const r = await apiFetch(`/files?${q}`, {method:'POST',
     headers:{'content-type': ctype}, body: buf});
   const body = await r.json();
   state.uploaded[key] = true; state.filenames[key] = filename;
   state.sizes[key] = (body.file || {}).size; renderDocs();
-  const run = await (await fetch(`${API}/runs/${body.runId}`)).json();
+  const run = await (await apiFetch(`/runs/${body.runId}`)).json();
   const out = run.output || {};
   if(out.missing && out.missing.length)
     say('agent', `Received ${key} - still needed: ${out.missing.join(', ')}.`, {activity:true});
@@ -784,7 +856,7 @@ function jobDur(j){
 async function poll(){
   if(!state || !state.cif) return;
   try{
-    const runs = (await (await fetch(`${API}/agents/loan-renewal/runs`)).json()).runs || [];
+    const runs = (await (await apiFetch(`/agents/loan-renewal/runs`)).json()).runs || [];
     const jobs = runs.filter(r => r.trigger === 'job'
       && r.job && r.job.payload && String(r.job.payload.cif) === String(state.cif));
     if(jobs.length){
@@ -804,7 +876,7 @@ async function poll(){
         $('pipeRows').appendChild(row);
       }
     }
-    const approvals = (await (await fetch(`${API}/approvals?status=pending`)).json()).approvals || [];
+    const approvals = (await (await apiFetch(`/approvals?status=pending`)).json()).approvals || [];
     const mine = approvals.find(a => (a.title || '').includes(state.cif));
     if(mine && !state.approvalId){
       state.approvalId = mine.id; state.report = mine.body || '';
@@ -821,7 +893,7 @@ async function metaChips(runs){
     const compose = runs.find(r => r.trigger === 'job' && r.job
       && r.job.handler === 'compose_report' && String(r.job.payload.cif) === String(state.cif));
     if(!compose) return;
-    const detail = await (await fetch(`${API}/runs/${compose.id}`)).json();
+    const detail = await (await apiFetch(`/runs/${compose.id}`)).json();
     const llm = (detail.trace || []).filter(e => e.kind === 'llm.respond').pop();
     const res = llm && llm.data && llm.data.result;
     const cites = (state.report.match(/\[source:/g) || []).length;
@@ -846,6 +918,7 @@ async function guided(){
 }
 
 /* ================= boot ================= */
+renderUserFoot();
 refreshBadge();
 listTimer = setInterval(refreshBadge, 6000);
 route();

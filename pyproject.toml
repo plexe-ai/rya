@@ -37,6 +37,7 @@ api = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0"]
 mcp = ["mcp>=1.2.0"]
 postgres = ["psycopg[binary]>=3.1"]
 llm = ["anthropic>=0.40"]
+bedrock = ["boto3>=1.34"]     # AWS Bedrock provider (Converse API, IAM-signed - no API key)
 deepeval = ["deepeval>=1.0"]  # LLM-output-quality eval metrics (`deepeval` scorer); needs a
                               # judge key (OPENAI_API_KEY, or ANTHROPIC_API_KEY + the `anthropic` pkg via rya[llm])
 dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27"]

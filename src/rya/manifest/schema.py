@@ -36,6 +36,9 @@ class ModelBlock(BaseModel):
     # deterministic stub; "anthropic"/"openai" require the matching API key.
     # "adapter" is the keyless Governance Adapter path: no provider key, only a
     # governance-minted Platform Token; fails closed (see providers/adapter.py).
+    # "bedrock" calls AWS Bedrock's Converse API via the ambient IAM identity
+    # (no API key at all) - model names are inference profile ids, e.g.
+    # us.anthropic.claude-haiku-4-5. Needs boto3: pip install 'rya[bedrock]'.
     provider: str = "auto"
     default: str = "mock-llm"  # model name (e.g. claude-haiku-4-5-20251001, gpt-4.1-mini)
     fallback: Optional[str] = None
@@ -48,7 +51,7 @@ class ModelBlock(BaseModel):
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, v):
-        allowed = {"auto", "mock", "anthropic", "openai", "adapter"}
+        allowed = {"auto", "mock", "anthropic", "openai", "adapter", "bedrock"}
         if v not in allowed:
             raise ValueError(f"model.provider must be one of {sorted(allowed)}")
         return v

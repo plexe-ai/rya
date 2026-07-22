@@ -411,25 +411,39 @@ class _LLM:
                 r.max_tokens or mb.max_tokens, f"{route}:{r.model}")
 
     async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None,
-                      route: Optional[str] = None) -> LLMResponse:
+                      route: Optional[str] = None,
+                      documents: Optional[list] = None) -> LLMResponse:
         """Call the model. Pass ``schema`` (a JSON Schema) for first-class
         **structured output** — the result's ``.json`` is the parsed, validated
         object. Pass ``route`` to use a named per-purpose model from
         ``model.routes``. When the run has a token subscriber (WebSocket turns),
-        the response is streamed chunk by chunk as it is generated."""
+        the response is streamed chunk by chunk as it is generated.
+
+        ``documents`` grounds the call in files (extraction over PDFs): a list of
+        ``{name, format, path|bytes|b64}``; relative paths resolve against the
+        project root. Supported on the bedrock provider (Converse document
+        blocks); the mock provider ignores them."""
         from ..providers import respond as provider_respond
 
         mb = self._ctx.manifest.model
         model, provider, temperature, max_tokens, label = self._params(route)
         on_token = self._ctx._on_token
+        docs = None
+        if documents:
+            docs = []
+            for d in documents:
+                d = dict(d)
+                if d.get("path") and not os.path.isabs(d["path"]):
+                    d["path"] = str(self._ctx.project_root / d["path"])
+                docs.append(d)
 
         def run():
-            # Provider chosen by manifest model.provider (auto/mock/anthropic/openai).
+            # Provider chosen by manifest model.provider (auto/mock/anthropic/openai/bedrock).
             try:
                 return provider_respond(
                     system=system, input=input, model_default=model, provider=provider,
                     temperature=temperature, max_tokens=max_tokens, schema=schema,
-                    on_token=on_token,
+                    on_token=on_token, documents=docs,
                 )
             except RyaError:
                 # Fall back to the manifest's fallback model on provider failure
@@ -438,13 +452,18 @@ class _LLM:
                     out = provider_respond(
                         system=system, input=input, model_default=mb.fallback, provider=provider,
                         temperature=temperature, max_tokens=max_tokens, schema=schema,
-                        on_token=on_token,
+                        on_token=on_token, documents=docs,
                     )
                     out["fellBackFrom"] = mb.default
                     return out
                 raise
 
-        res = self._ctx._step("llm.respond", label, run, {"system": system})
+        # Journal document names only - never raw bytes (the journal is replayed
+        # and shipped to observability backends).
+        step_data = {"system": system}
+        if documents:
+            step_data["documents"] = [d.get("name") or d.get("path") for d in documents]
+        res = self._ctx._step("llm.respond", label, run, step_data)
         return LLMResponse(text=res["text"], model=res["model"], json=res.get("json"),
                            provider=res.get("provider"))
 

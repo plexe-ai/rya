@@ -43,6 +43,8 @@ def resolve_provider(provider: str = "auto") -> str:
             return "adapter"
     if provider and provider != "auto":
         return provider
+    if os.environ.get("RYA_BEDROCK") == "1":
+        return "bedrock"
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
     if os.environ.get("OPENAI_API_KEY"):
@@ -268,7 +270,7 @@ def _mock_stream(system: str, input: dict, on_token) -> str:
 
 def respond(*, system: str, input: dict, model_default: str = "mock-llm", provider: str = "auto",
             temperature: Optional[float] = None, max_tokens: Optional[int] = None,
-            schema: Optional[dict] = None, on_token=None) -> dict:
+            schema: Optional[dict] = None, on_token=None, documents: Optional[list] = None) -> dict:
     """Return ``{text, model, provider, usage[, json]}``. Mock path never raises.
 
     When ``schema`` (a JSON Schema) is given, the model is asked for JSON and the
@@ -282,7 +284,16 @@ def respond(*, system: str, input: dict, model_default: str = "mock-llm", provid
         sys = (system + "\n\nRespond with ONLY a JSON object matching this JSON Schema "
                "(no prose, no code fences):\n" + json.dumps(schema))
     content = _stringify(input)
-    if effective == "anthropic":
+    if documents and effective not in ("bedrock", "mock"):
+        raise RyaError("E_VALIDATION", f"documents are not supported on the '{effective}' provider yet.",
+                       hint="Use model.provider: bedrock for document-grounded calls.")
+    if effective == "bedrock":
+        out = (_bedrock_stream(model_default, sys, content, temperature,
+                               max_tokens or (1024 if schema else None), on_token, documents)
+               if on_token else
+               _bedrock(model_default, sys, content, temperature,
+                        max_tokens or (1024 if schema else None), documents))
+    elif effective == "anthropic":
         out = (_anthropic_stream(model_default, sys, content, temperature,
                                  max_tokens or (1024 if schema else None), on_token)
                if on_token else
@@ -307,6 +318,179 @@ def respond(*, system: str, input: dict, model_default: str = "mock-llm", provid
         _validate(obj, schema)
         out["json"] = obj
     return out
+
+
+# ---- AWS Bedrock (Converse API, IAM-signed via boto3) -----------------------
+# No API key: auth is the ambient AWS identity (IAM role / profile), which is
+# what banks and other keyless-by-policy environments require. The model name
+# is a Bedrock inference profile id (e.g. ``us.anthropic.claude-haiku-4-5``).
+_DEFAULT_BEDROCK = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def _bedrock_client():
+    try:
+        import boto3  # optional dep: pip install 'rya[bedrock]'
+    except ImportError:
+        raise RyaError("E_VALIDATION", "model.provider is 'bedrock' but boto3 is not installed.",
+                       hint="pip install 'rya[bedrock]' (or add boto3 to the project).")
+    region = (os.environ.get("RYA_BEDROCK_REGION") or os.environ.get("AWS_REGION")
+              or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
+def _bedrock_model(name):
+    return name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_BEDROCK_MODEL", _DEFAULT_BEDROCK)
+
+
+def _bedrock_error(e) -> RyaError:
+    return RyaError("E_RUNTIME", f"Bedrock call failed: {e}",
+                    hint="Check AWS credentials, RYA_BEDROCK_REGION, and Bedrock model access.")
+
+
+def _doc_blocks(documents) -> list:
+    """[{name, format, bytes|b64|path}] -> Converse document blocks. Bedrock
+    rejects names with characters outside [A-Za-z0-9 ()\\[\\]-], so sanitize."""
+    import base64
+    import re
+    blocks = []
+    for d in documents or []:
+        raw = d.get("bytes")
+        if raw is None and d.get("b64"):
+            raw = base64.b64decode(d["b64"])
+        if raw is None and d.get("path"):
+            with open(d["path"], "rb") as f:
+                raw = f.read()
+        if raw is None:
+            raise RyaError("E_VALIDATION", "document needs one of: bytes, b64, path.")
+        name = re.sub(r"[^A-Za-z0-9 \-\(\)\[\]]", "-", str(d.get("name") or "document"))[:60] or "document"
+        blocks.append({"document": {"format": d.get("format", "pdf"), "name": name,
+                                    "source": {"bytes": raw}}})
+    return blocks
+
+
+def _bedrock(name, system, content, temperature, max_tokens, documents=None) -> dict:
+    client = _bedrock_client()
+    model = _bedrock_model(name)
+    inference = {"maxTokens": max_tokens or 1024}
+    if temperature is not None:
+        inference["temperature"] = temperature
+    try:
+        j = client.converse(
+            modelId=model,
+            system=[{"text": system}] if system else [],
+            messages=[{"role": "user", "content": _doc_blocks(documents) + [{"text": content}]}],
+            inferenceConfig=inference,
+        )
+    except RyaError:
+        raise
+    except Exception as e:
+        raise _bedrock_error(e)
+    text = "".join(b.get("text", "") for b in j["output"]["message"]["content"] if "text" in b)
+    u = j.get("usage") or {}
+    return {"text": text, "model": model, "provider": "bedrock",
+            "usage": {"input": u.get("inputTokens"), "output": u.get("outputTokens")} if u else None}
+
+
+def _bedrock_stream(name, system, content, temperature, max_tokens, on_token, documents=None) -> dict:
+    client = _bedrock_client()
+    model = _bedrock_model(name)
+    inference = {"maxTokens": max_tokens or 1024}
+    if temperature is not None:
+        inference["temperature"] = temperature
+    try:
+        resp = client.converse_stream(
+            modelId=model,
+            system=[{"text": system}] if system else [],
+            messages=[{"role": "user", "content": _doc_blocks(documents) + [{"text": content}]}],
+            inferenceConfig=inference,
+        )
+        parts, usage = [], None
+        for ev in resp["stream"]:
+            if "contentBlockDelta" in ev:
+                chunk = ev["contentBlockDelta"].get("delta", {}).get("text", "")
+                if chunk:
+                    parts.append(chunk)
+                    on_token(chunk)
+            elif "metadata" in ev:
+                u = ev["metadata"].get("usage") or {}
+                usage = {"input": u.get("inputTokens"), "output": u.get("outputTokens")}
+    except RyaError:
+        raise
+    except Exception as e:
+        raise _bedrock_error(e)
+    return {"text": "".join(parts), "model": model, "provider": "bedrock", "usage": usage}
+
+
+def _merge_adjacent_roles(msgs: list) -> list:
+    """Converse requires strict role alternation; a multi-tool turn produces
+    consecutive user messages (one toolResult each). Merge their content lists."""
+    merged = []
+    for m in msgs:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"].extend(m["content"])
+        else:
+            merged.append(m)
+    return merged
+
+
+def _bedrock_chat(name, system, messages, tools, temperature, max_tokens) -> dict:
+    import re
+
+    client = _bedrock_client()
+    model = _bedrock_model(name)
+    # Bedrock tool names must match [a-zA-Z0-9_-]+ but Rya tool ids are dotted
+    # (crm.lookup). Sanitize outbound, translate back on the returned calls.
+    name_map = {}
+
+    def _safe(n):
+        s = re.sub(r"[^A-Za-z0-9_-]", "_", str(n))
+        name_map[s] = n
+        return s
+
+    bmsgs = []
+    for m in messages:
+        if m["role"] == "tool":
+            bmsgs.append({"role": "user", "content": [{"toolResult": {
+                "toolUseId": m.get("toolUseId", "call_1"),
+                "content": [{"text": _stringify(m["content"])}]}}]})
+        elif m["role"] == "assistant" and m.get("toolCalls"):
+            content = []
+            if m.get("content"):
+                content.append({"text": m["content"] if isinstance(m["content"], str)
+                                else _stringify(m["content"])})
+            for c in m["toolCalls"]:
+                content.append({"toolUse": {"toolUseId": c.get("id", "call_1"),
+                                            "name": _safe(c.get("name")),
+                                            "input": c.get("input") or {}}})
+            bmsgs.append({"role": "assistant", "content": content})
+        else:
+            bmsgs.append({"role": m["role"], "content": [{"text": m["content"] if isinstance(m["content"], str)
+                                                          else _stringify(m["content"])}]})
+    kwargs = {
+        "modelId": model,
+        "system": [{"text": system}] if system else [],
+        "messages": _merge_adjacent_roles(bmsgs),
+        "inferenceConfig": {"maxTokens": max_tokens or 1024,
+                            **({"temperature": temperature} if temperature is not None else {})},
+    }
+    if tools:
+        kwargs["toolConfig"] = {"tools": [{"toolSpec": {
+            "name": _safe(t["name"]), "description": t.get("description") or t["name"],
+            "inputSchema": {"json": t.get("input_schema") or {"type": "object"}}}} for t in tools]}
+    try:
+        j = client.converse(**kwargs)
+    except RyaError:
+        raise
+    except Exception as e:
+        raise _bedrock_error(e)
+    blocks = j["output"]["message"]["content"]
+    text = "".join(b.get("text", "") for b in blocks if "text" in b)
+    calls = [{"id": b["toolUse"].get("toolUseId"),
+              "name": name_map.get(b["toolUse"].get("name"), b["toolUse"].get("name")),
+              "input": b["toolUse"].get("input", {})} for b in blocks if "toolUse" in b]
+    u = j.get("usage") or {}
+    return {"text": text, "toolCalls": calls, "model": model, "provider": "bedrock",
+            "usage": {"input": u.get("inputTokens"), "output": u.get("outputTokens")} if u else None}
 
 
 # ---- tool-calling chat (the governed agent loop's model step) --------------
@@ -336,6 +520,8 @@ def chat(*, messages: list, tools: Optional[list] = None, system: str = "",
     The mock provider drives a deterministic call-one-tool-then-answer loop;
     real providers use the native tool-use / function-calling format."""
     effective = resolve_provider(provider)
+    if effective == "bedrock":
+        return _bedrock_chat(model_default, system, messages, tools, temperature, max_tokens)
     if effective == "anthropic":
         return _anthropic_chat(model_default, system, messages, tools, temperature, max_tokens)
     if effective == "openai":

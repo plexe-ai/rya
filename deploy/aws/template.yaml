@@ -9,6 +9,14 @@ Description: >
   radius. Deploy: `sam build && sam deploy --guided`.
 
 Parameters:
+  AnthropicKeyEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Inject ANTHROPIC_API_KEY from the AppSecret (operator adds the key out of
+      band). Bedrock deployments leave this false - the task role IAM identity
+      is the model credential and no API key exists anywhere.
   ContainerImage:
     Type: String
     Description: ECR image URI for the Rya runtime (built from the repo Dockerfile).
@@ -38,6 +46,9 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Admin token gating self-serve project provisioning (RYA_ADMIN_TOKEN).
+
+Conditions:
+  UseAnthropicKey: !Equals [!Ref AnthropicKeyEnabled, "true"]
 
 Resources:
 
@@ -227,8 +238,11 @@ Resources:
             # README "model keys populated post-deploy") - CloudFormation never
             # sees the value. The task fails to start if the JSON key is absent,
             # so populate the secret BEFORE deploying this reference.
-            - Name: ANTHROPIC_API_KEY
-              ValueFrom: !Sub "${AppSecret}:ANTHROPIC_API_KEY::"
+            - !If
+              - UseAnthropicKey
+              - Name: ANTHROPIC_API_KEY
+                ValueFrom: !Sub "${AppSecret}:ANTHROPIC_API_KEY::"
+              - !Ref "AWS::NoValue"
           LogConfiguration:
             LogDriver: awslogs
             Options:

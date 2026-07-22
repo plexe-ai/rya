@@ -105,6 +105,18 @@ CREATE TABLE IF NOT EXISTS rya_connections (
     status TEXT NOT NULL DEFAULT 'active',
     data JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rya_files (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    content_type TEXT,
+    size BIGINT,
+    sha256 TEXT,
+    tags JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content BYTEA NOT NULL,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_files_ws ON rya_files (workspace_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conn_lookup ON rya_connections (workspace_id, provider, status);
 CREATE INDEX IF NOT EXISTS idx_runs_ws ON rya_runs (workspace_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_ws ON rya_approvals (workspace_id, status);
@@ -150,6 +162,52 @@ class PostgresStore:
     @property
     def _ws(self) -> str:
         return self.workspace_id
+
+    # ---- files (uploaded documents; immutable once saved) ---------------
+    def save_file(self, name: str, content: bytes, content_type: Optional[str] = None,
+                  tags: Optional[dict] = None) -> dict:
+        import hashlib
+        meta = {"id": _new_id("file"), "name": name,
+                "contentType": content_type or "application/octet-stream",
+                "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+                "tags": tags or {}, "createdAt": now_iso()}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rya_files (id, workspace_id, name, content_type, size, sha256, tags, content, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (meta["id"], self._ws, name, meta["contentType"], meta["size"],
+                 meta["sha256"], Json(meta["tags"]), content, meta["createdAt"]))
+        return meta
+
+    def _file_meta_row(self, r) -> dict:
+        return {"id": r[0], "name": r[1], "contentType": r[2], "size": r[3],
+                "sha256": r[4], "tags": r[5], "createdAt": r[6]}
+
+    def get_file(self, file_id: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id, name, content_type, size, sha256, tags, created_at "
+                        "FROM rya_files WHERE id=%s AND workspace_id=%s", (file_id, self._ws))
+            r = cur.fetchone()
+        return self._file_meta_row(r) if r else None
+
+    def read_file(self, file_id: str) -> Optional[bytes]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT content FROM rya_files WHERE id=%s AND workspace_id=%s",
+                        (file_id, self._ws))
+            r = cur.fetchone()
+        return bytes(r[0]) if r else None
+
+    def list_files(self, tags: Optional[dict] = None) -> List[dict]:
+        with self._conn.cursor() as cur:
+            if tags:
+                cur.execute("SELECT id, name, content_type, size, sha256, tags, created_at "
+                            "FROM rya_files WHERE workspace_id=%s AND tags @> %s::jsonb "
+                            "ORDER BY created_at DESC", (self._ws, Json(tags)))
+            else:
+                cur.execute("SELECT id, name, content_type, size, sha256, tags, created_at "
+                            "FROM rya_files WHERE workspace_id=%s ORDER BY created_at DESC", (self._ws,))
+            rows = cur.fetchall()
+        return [self._file_meta_row(r) for r in rows]
 
     # ---- runs ----------------------------------------------------------
     def new_run_id(self) -> str:

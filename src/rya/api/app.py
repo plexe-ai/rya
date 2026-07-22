@@ -849,6 +849,53 @@ def build_app(root: Path) -> FastAPI:
                 pass
         return {"ok": True, "runId": run["id"], "events": len(trace)}
 
+    # ---- files (uploaded documents) -------------------------------------
+    @api.post("/files")
+    async def upload_file(request: Request, engine: Engine = Depends(get_engine)):
+        """Store a file (raw request body) and, by default, fire a
+        ``file.uploaded`` event at the agent so a waiting workflow can resume.
+
+        Query params: ``name`` (required), ``tag.<key>=<value>`` (repeatable,
+        becomes the file's tags), ``event=false`` to store without notifying.
+        """
+        name = request.query_params.get("name")
+        if not name:
+            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
+                                                         "message": "query param 'name' is required"})
+        content = await request.body()
+        if not content:
+            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
+                                                         "message": "request body is empty"})
+        max_bytes = int(os.environ.get("RYA_MAX_FILE_BYTES", str(20 * 1024 * 1024)))
+        if len(content) > max_bytes:
+            raise HTTPException(status_code=413, detail={"code": "E_VALIDATION",
+                                                         "message": f"file exceeds {max_bytes} bytes"})
+        tags = {k[4:]: v for k, v in request.query_params.items() if k.startswith("tag.")}
+        meta = engine.store.save_file(name, content,
+                                      content_type=request.headers.get("content-type"),
+                                      tags=tags)
+        out = {"ok": True, "file": meta}
+        if request.query_params.get("event", "true").lower() != "false":
+            run = engine.run_event("file.uploaded",
+                                   {"fileId": meta["id"], "name": meta["name"],
+                                    "tags": meta["tags"], "size": meta["size"],
+                                    "contentType": meta["contentType"]},
+                                   source="upload")
+            out["runId"] = run["id"]
+            out["runStatus"] = run["status"]
+        return out
+
+    @api.get("/files")
+    def list_files(engine: Engine = Depends(get_engine)):
+        return {"files": engine.store.list_files()}
+
+    @api.get("/files/{file_id}")
+    def get_file(file_id: str, engine: Engine = Depends(get_engine)):
+        meta = engine.store.get_file(file_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail={"code": "E_NOT_FOUND"})
+        return meta
+
     @api.get("/runs/{run_id}")
     def get_run(run_id: str, engine: Engine = Depends(get_engine)):
         run = engine.store.get_run(run_id)

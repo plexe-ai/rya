@@ -168,6 +168,7 @@ class RuntimeContext:
         self.cron = _Cron(self)
         self.approvals = _Approvals(self)
         self.sessions = _Sessions(self)
+        self.files = _Files(self)
         self.connections = _Connections(self)
         self.logs = _Logs(self)
         self.traces = _Traces(self)
@@ -1044,6 +1045,51 @@ class _Sessions:
             return hits[:limit]
 
         return self._ctx._step("session.search", session_id, run, {"query": query})
+
+
+class _Files:
+    """Uploaded files (``POST /files`` / ``rya files upload``). Files are
+    immutable once stored, so replays can re-read bytes and get identical
+    content - only metadata is ever journaled, bytes never enter the journal."""
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self._ctx = ctx
+
+    async def get(self, file_id: str) -> Optional[dict]:
+        def run():
+            return self._ctx.store.get_file(file_id)
+
+        return self._ctx._step("file.get", file_id, run)
+
+    async def list(self, tags: Optional[dict] = None) -> List[dict]:
+        def run():
+            return self._ctx.store.list_files(tags)
+
+        label = ",".join(f"{k}={v}" for k, v in sorted((tags or {}).items())) or "all"
+        return self._ctx._step("file.list", label, run, {"tags": tags})
+
+    async def read(self, file_id: str) -> bytes:
+        def run():
+            meta = self._ctx.store.get_file(file_id)
+            if meta is None:
+                raise RyaError("E_NOT_FOUND", f"file '{file_id}' not found.")
+            return meta  # journal carries metadata (name/sha/size), never bytes
+
+        self._ctx._step("file.read", file_id, run)
+        data = self._ctx.store.read_file(file_id)
+        if data is None:
+            raise RyaError("E_NOT_FOUND", f"file '{file_id}' has no stored content.")
+        return data
+
+    async def as_document(self, file_id: str) -> dict:
+        """Shape a stored file for ``ctx.llm.respond(documents=[...])``."""
+        meta = await self.get(file_id)
+        if meta is None:
+            raise RyaError("E_NOT_FOUND", f"file '{file_id}' not found.")
+        name = meta.get("name") or file_id
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        fmt = ext if ext in ("pdf", "csv", "txt", "md", "html", "doc", "docx", "xls", "xlsx") else "pdf"
+        return {"name": name, "format": fmt, "bytes": await self.read(file_id)}
 
 
 class _Connections:

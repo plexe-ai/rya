@@ -71,10 +71,12 @@ class FileStore:
         self.memory_dir = self.dir / "memory"
         self.sessions_dir = self.dir / "sessions"
         self.connections_dir = self.dir / "connections"
+        self.files_dir = self.dir / "files"
 
     def ensure(self) -> None:
         for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.queue_dir,
-                  self.streams_dir, self.memory_dir, self.sessions_dir, self.connections_dir):
+                  self.streams_dir, self.memory_dir, self.sessions_dir, self.connections_dir,
+                  self.files_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # ---- low level -----------------------------------------------------
@@ -108,6 +110,36 @@ class FileStore:
                 runs.append(data)
         runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
         return runs
+
+    # ---- files (uploaded documents) ------------------------------------
+    # Files are immutable once saved: handlers may re-read them on replay and
+    # get identical bytes, so reads do not need to be journaled.
+    def save_file(self, name: str, content: bytes, content_type: Optional[str] = None,
+                  tags: Optional[dict] = None) -> dict:
+        import hashlib
+        meta = {"id": _new_id("file"), "name": name,
+                "contentType": content_type or "application/octet-stream",
+                "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+                "tags": tags or {}, "createdAt": now_iso()}
+        (self.files_dir / meta["id"]).write_bytes(content)
+        self._write(self.files_dir / f"{meta['id']}.json", meta)
+        return meta
+
+    def get_file(self, file_id: str) -> Optional[dict]:
+        return self._read(self.files_dir / f"{file_id}.json")
+
+    def read_file(self, file_id: str) -> Optional[bytes]:
+        p = self.files_dir / file_id
+        return p.read_bytes() if p.is_file() and self.get_file(file_id) else None
+
+    def list_files(self, tags: Optional[dict] = None) -> List[dict]:
+        out = []
+        for p in sorted(self.files_dir.glob("file_*.json")):
+            meta = self._read(p)
+            if meta and (not tags or all((meta.get("tags") or {}).get(k) == v for k, v in tags.items())):
+                out.append(meta)
+        out.sort(key=lambda m: m.get("createdAt", ""), reverse=True)
+        return out
 
     # ---- approvals -----------------------------------------------------
     def create_approval(self, run_id: str, title: str, body: str, action: dict) -> dict:

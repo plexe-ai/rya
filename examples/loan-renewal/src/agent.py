@@ -62,7 +62,10 @@ _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS la_renewals (case_id TEXT PRIMARY KEY, cif TEXT NOT NULL,
        product TEXT, status TEXT, final_report TEXT, data_summary TEXT, updated_at TEXT)""",
     """CREATE TABLE IF NOT EXISTS la_cases (case_id TEXT PRIMARY KEY, cif TEXT NOT NULL,
-       extractions TEXT DEFAULT '{}', report_schema TEXT)""",
+       extractions TEXT DEFAULT '{}', report_schema TEXT,
+       compose_scheduled INTEGER DEFAULT 0)""",
+    """CREATE TABLE IF NOT EXISTS la_extractions (case_id TEXT NOT NULL, doc_type TEXT NOT NULL,
+       data TEXT NOT NULL, PRIMARY KEY (case_id, doc_type))""",
 ]
 _ready = False
 
@@ -135,12 +138,17 @@ async def case_save_extraction(input: dict) -> dict:
     if input.get("docType") == "reference_report":
         _exec("UPDATE la_cases SET report_schema = %s WHERE case_id = %s",
               (json.dumps(input["data"]), input["caseId"]))
+    if DB_URL:
+        _exec("INSERT INTO la_extractions (case_id, doc_type, data) VALUES (%s, %s, %s) "
+              "ON CONFLICT (case_id, doc_type) DO UPDATE SET data = EXCLUDED.data",
+              (input["caseId"], input["docType"], json.dumps(input["data"])))
     else:
-        ext = json.loads(rows[0][0] or "{}")
-        ext[input["docType"]] = input["data"]
-        _exec("UPDATE la_cases SET extractions = %s WHERE case_id = %s",
-              (json.dumps(ext), input["caseId"]))
-    return {"ok": True, "caseId": input["caseId"], "docType": input.get("docType")}
+        _exec("INSERT OR REPLACE INTO la_extractions (case_id, doc_type, data) VALUES (%s, %s, %s)",
+              (input["caseId"], input["docType"], json.dumps(input["data"])))
+    n = _exec("SELECT COUNT(*) FROM la_extractions WHERE case_id = %s",
+              (input["caseId"],), fetch=True)[0][0]
+    return {"ok": True, "caseId": input["caseId"], "docType": input.get("docType"),
+            "extractedCount": n}
 
 
 @agent.tool("case.load")
@@ -150,7 +158,10 @@ async def case_load(input: dict) -> dict:
                  (cif,), fetch=True)
     if not rows:
         return {"found": False, "cif": cif}
-    case_id, ext, schema = rows[0]
+    case_id, _unused, schema = rows[0]
+    ext_rows = _exec("SELECT doc_type, data FROM la_extractions WHERE case_id = %s "
+                     "AND doc_type != 'reference_report'", (case_id,), fetch=True)
+    ext = json.dumps({d: json.loads(v) for d, v in ext_rows})
     ren = _exec("SELECT product, status FROM la_renewals WHERE case_id = %s", (case_id,), fetch=True)
     arch = _exec("SELECT data FROM la_archive WHERE cif = %s", (cif,), fetch=True)
     return {"found": True,
@@ -159,6 +170,19 @@ async def case_load(input: dict) -> dict:
                      "reportSchema": json.loads(schema) if schema else None},
             "renewal": {"caseId": case_id, "product": ren[0][0], "status": ren[0][1]} if ren else {},
             "archive": json.loads(arch[0][0]) if arch else None}
+
+
+@agent.tool("case.claim_compose")
+async def case_claim_compose(input: dict) -> dict:
+    """Atomic fan-in: exactly one caller wins the right to schedule compose."""
+    conn, ph = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE la_cases SET compose_scheduled = 1 "
+                    f"WHERE case_id = {ph} AND compose_scheduled = 0", (input["caseId"],))
+        return {"won": cur.rowcount == 1}
+    finally:
+        conn.close()
 
 
 @agent.tool("la.update_record")
@@ -281,18 +305,18 @@ async def extract_document(ctx, job):
         )
         data = res.json
 
-    await ctx.tools.call("case.save_extraction",
-                         {"caseId": p["caseId"], "docType": p["docType"], "data": data})
+    saved = await ctx.tools.call("case.save_extraction",
+                                 {"caseId": p["caseId"], "docType": p["docType"], "data": data})
 
-    # Fan-in: the job that completes the set schedules the compose step.
-    case = await ctx.memory.get(f"case:{p['cif']}", scope="agent")
-    done = set((case or {}).get("extracted", [])) | {p["docType"]}
-    case["extracted"] = sorted(done)
-    await ctx.memory.set(f"case:{p['cif']}", case, scope="agent")
-    if done >= set(case["required"]):
-        await ctx.jobs.schedule("compose_report", {"cif": p["cif"], "caseId": p["caseId"]})
-        return {"docType": p["docType"], "complete": True}
-    return {"docType": p["docType"], "extractedSoFar": sorted(done)}
+    # Fan-in, race-free: the atomic count says whether the set is complete, and
+    # the compose claim guarantees exactly ONE worker schedules it - safe under
+    # any number of parallel workers.
+    if saved.get("extractedCount", 0) >= len(REQUIRED_DOCS):
+        claim = await ctx.tools.call("case.claim_compose", {"caseId": p["caseId"]})
+        if claim.get("won"):
+            await ctx.jobs.schedule("compose_report", {"cif": p["cif"], "caseId": p["caseId"]})
+            return {"docType": p["docType"], "complete": True}
+    return {"docType": p["docType"], "extractedCount": saved.get("extractedCount")}
 
 
 # ---- step 6-8: filter -> cited compose -> grounding -> approval -------------

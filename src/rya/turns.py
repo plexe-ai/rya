@@ -108,7 +108,8 @@ def _append_session_replies(engine, turn_id: str, payload: dict, run: dict) -> N
                     store.stream_append(turn_id, [{"kind": "message", "data": m}])
 
 
-def resolve_on_stream(engine, approval_id: str, approve: bool = True) -> dict:
+def resolve_on_stream(engine, approval_id: str, approve: bool = True,
+                      actor: Optional[dict] = None) -> dict:
     """Approve/reject an approval; if its run belongs to a turn, stream the
     POST-approval continuation onto that turn's buffer, ending with a NEW
     terminal run frame. Memoized pre-approval steps don't re-stream. Falls back
@@ -119,16 +120,18 @@ def resolve_on_stream(engine, approval_id: str, approve: bool = True) -> dict:
     turn_id = (run or {}).get("turnId")
 
     if not turn_id:
-        return engine.approve(approval_id) if approve else engine.reject(approval_id)
+        return (engine.approve(approval_id, actor=actor) if approve
+                else engine.reject(approval_id, actor=actor))
 
     store.stream_append(turn_id, [{
         "kind": "trace",
         "data": {"kind": "approval.approved" if approve else "approval.rejected",
-                 "label": (approval or {}).get("title"), "data": {"approvalId": approval_id}},
+                 "label": (approval or {}).get("title"),
+                 "data": {"approvalId": approval_id, "actor": actor}},
     }])
     if approve:
         resumed = engine.approve(
-            approval_id,
+            approval_id, actor=actor,
             on_trace=lambda ev: store.stream_append(turn_id, [{"kind": "trace", "data": ev}]),
             on_token=lambda ch: store.stream_append(turn_id, [{"kind": "token", "data": {"text": ch}}]),
             on_ui=lambda frame: store.stream_append(turn_id, [{"kind": "ui", "data": frame}]),
@@ -136,7 +139,7 @@ def resolve_on_stream(engine, approval_id: str, approve: bool = True) -> dict:
         ev = resumed.get("event") or {}
         _append_session_replies(engine, turn_id, ev.get("payload") or {}, resumed)
     else:
-        resumed = engine.reject(approval_id)
+        resumed = engine.reject(approval_id, actor=actor)
     store.stream_append(turn_id, [{"kind": "run", "data": _summary(resumed)}])
     return resumed
 

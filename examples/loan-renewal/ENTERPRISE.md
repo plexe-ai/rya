@@ -13,8 +13,11 @@ ordered. Each item is scoped and independent.
 
 ## P0 - security and identity
 - [ ] HTTPS: CloudFront + ACM in front of the ALB; HTTP disabled. ~0.5d
-- [ ] Session-to-JWT bridge (X-Rya-User-Token) so every run and approval
-      records WHO acted - "approved by sarah@bbg.bank" in the audit trail. ~1d
+- [x] Session-to-JWT bridge: POST /v1/token exchanges a session for a
+      short-lived HS256 user JWT; the app sends it as X-Rya-User-Token, and
+      approvals record resolvedBy ("approved by sarah@bbg.bank") on the row,
+      the trace event, and the Approvals UI. RYA_REQUIRE_APPROVER_IDENTITY=1
+      (on in the production template) refuses anonymous key-only approvals.
 - [ ] Private subnets for tasks + VPC endpoints (Bedrock, S3, Secrets
       Manager) - document bytes never traverse public internet. ~1d
 - [ ] Bank IdP SSO (SAML/OIDC in front of /v1 auth). ~2d, needs bank input

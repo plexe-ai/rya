@@ -445,7 +445,8 @@ class Engine:
         spec = self.tools.get(tool)
         return spec.fn(inp) if spec is not None else None
 
-    def approve(self, approval_id: str, on_trace=None, on_token=None, on_ui=None) -> dict:
+    def approve(self, approval_id: str, on_trace=None, on_token=None, on_ui=None,
+                actor: Optional[dict] = None) -> dict:
         approval = self.store.get_approval(approval_id)
         if approval is None:
             raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
@@ -472,6 +473,7 @@ class Engine:
 
         approval["status"] = "approved"
         approval["resolvedAt"] = now_iso()
+        approval["resolvedBy"] = actor
         approval["actionResult"] = action_result
         self.store.save_approval(approval)
 
@@ -485,7 +487,8 @@ class Engine:
             }
         run["trace"].append({
             "seq": len(run["trace"]), "ts": now_iso(), "kind": "approval.approved",
-            "label": approval["title"], "data": {"approvalId": approval_id, "actionResult": action_result},
+            "label": approval["title"],
+            "data": {"approvalId": approval_id, "actionResult": action_result, "actor": actor},
         })
         run["status"] = "running"
         run["pendingApproval"] = None
@@ -513,7 +516,7 @@ class Engine:
         return self._execute(run, handler, arg, identity=identity,
                              on_trace=on_trace, on_token=on_token, on_ui=on_ui)
 
-    def reject(self, approval_id: str) -> dict:
+    def reject(self, approval_id: str, actor: Optional[dict] = None) -> dict:
         approval = self.store.get_approval(approval_id)
         if approval is None:
             raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
@@ -528,6 +531,7 @@ class Engine:
 
         approval["status"] = "rejected"
         approval["resolvedAt"] = now_iso()
+        approval["resolvedBy"] = actor
         self.store.save_approval(approval)
 
         entry = self._find_approval_entry(run, approval_id)
@@ -538,7 +542,7 @@ class Engine:
         run["pendingApproval"] = None
         run["trace"].append({
             "seq": len(run["trace"]), "ts": now_iso(), "kind": "approval.rejected",
-            "label": approval["title"], "data": {"approvalId": approval_id},
+            "label": approval["title"], "data": {"approvalId": approval_id, "actor": actor},
         })
         self.store.save_run(run)
         return run

@@ -225,6 +225,33 @@ def build_app(root: Path) -> FastAPI:
         except RyaError as e:
             raise HTTPException(status_code=401, detail=e.to_dict()["error"])
 
+    def _actor_from(authorization, x_rya_token, x_rya_user_token) -> Optional[dict]:
+        """Who is acting - {sub, email} from a verified user JWT, or None.
+
+        MT: the workspace key authenticates the CALLER; X-Rya-User-Token (minted
+        by POST /v1/token from a session) authenticates the USER. Single-tenant:
+        the bearer JWT itself is the user. RYA_REQUIRE_APPROVER_IDENTITY=1 turns
+        anonymous approval resolution into a 401 (bank mode: every approval must
+        record who approved)."""
+        actor = None
+        if jwt_configured():
+            try:
+                if x_rya_user_token:
+                    ident = verify_jwt(x_rya_user_token)
+                    actor = {"sub": ident.sub, "email": ident.email}
+                elif not mt:
+                    ident = _identity_from(authorization, x_rya_token, required=False)
+                    if ident:
+                        actor = {"sub": ident.sub, "email": ident.email}
+            except RyaError as e:
+                raise HTTPException(status_code=401, detail=e.to_dict()["error"])
+        if actor is None and os.environ.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1":
+            raise HTTPException(status_code=401, detail={
+                "code": "E_APPROVER_IDENTITY_REQUIRED",
+                "message": "This deployment requires a user identity to resolve approvals.",
+                "hint": "POST /v1/token with your session, then send X-Rya-User-Token."})
+        return actor
+
     async def get_engine(authorization: Optional[str] = Header(None),
                          x_rya_token: Optional[str] = Header(None),
                          x_rya_user_token: Optional[str] = Header(None)) -> Engine:
@@ -1063,25 +1090,35 @@ def build_app(root: Path) -> FastAPI:
         return {"approvals": engine.store.list_approvals(status)}
 
     @api.post("/approvals/{approval_id}/approve")
-    def approve(approval_id: str, engine: Engine = Depends(get_engine)):
+    def approve(approval_id: str, engine: Engine = Depends(get_engine),
+                authorization: Optional[str] = Header(None),
+                x_rya_token: Optional[str] = Header(None),
+                x_rya_user_token: Optional[str] = Header(None)):
         # Turn-bound runs stream their post-approval continuation onto the
         # original turn's durable buffer (resolve_on_stream); plain runs approve
-        # exactly as before.
+        # exactly as before. The resolved actor is recorded on the approval.
+        actor = _actor_from(authorization, x_rya_token, x_rya_user_token)
         try:
-            run = _turns.resolve_on_stream(engine, approval_id, approve=True)
+            run = _turns.resolve_on_stream(engine, approval_id, approve=True, actor=actor)
         except RyaError as e:
             raise HTTPException(status_code=409, detail=e.to_dict()["error"])
         return {"approvalId": approval_id, "runStatus": run["status"],
-                "turnId": run.get("turnId")}
+                "turnId": run.get("turnId"),
+                "resolvedBy": actor}
 
     @api.post("/approvals/{approval_id}/reject")
-    def reject(approval_id: str, engine: Engine = Depends(get_engine)):
+    def reject(approval_id: str, engine: Engine = Depends(get_engine),
+               authorization: Optional[str] = Header(None),
+               x_rya_token: Optional[str] = Header(None),
+               x_rya_user_token: Optional[str] = Header(None)):
+        actor = _actor_from(authorization, x_rya_token, x_rya_user_token)
         try:
-            run = _turns.resolve_on_stream(engine, approval_id, approve=False)
+            run = _turns.resolve_on_stream(engine, approval_id, approve=False, actor=actor)
         except RyaError as e:
             raise HTTPException(status_code=409, detail=e.to_dict()["error"])
         return {"approvalId": approval_id, "runStatus": run["status"],
-                "turnId": run.get("turnId")}
+                "turnId": run.get("turnId"),
+                "resolvedBy": actor}
 
     # ---- queue: durable jobs for external workers (Sim et al.) -----------
     from .. import queue as q
@@ -1350,6 +1387,21 @@ def build_app(root: Path) -> FastAPI:
         tenancy.claim_invites(user["email"], user["id"])
         return {"ok": True, "token": token, "user": user,
                 "workspaces": tenancy.list_user_workspaces(user["id"])}
+
+    @api.post("/v1/token")
+    def mint_user_token(authorization: Optional[str] = Header(None),
+                        x_rya_session: Optional[str] = Header(None)):
+        """The session-to-JWT bridge: exchange a valid session for a short-lived
+        HS256 user JWT the data plane verifies (X-Rya-User-Token), so every run
+        and approval records WHO acted."""
+        from ..auth import issue_jwt
+        _require_mt()
+        s = _session(authorization, x_rya_session)
+        try:
+            token = issue_jwt(s["sub"], email=s.get("email"))
+        except RyaError as e:
+            raise HTTPException(status_code=409, detail=e.to_dict()["error"])
+        return {"userToken": token, "expiresInSeconds": 12 * 3600}
 
     @api.get("/v1/me")
     def whoami_account(authorization: Optional[str] = Header(None),

@@ -275,6 +275,11 @@ Resources:
           Environment:
             - Name: RYA_MULTITENANT
               Value: "1"
+            # Bank mode: approvals must carry a verified user identity
+            # (X-Rya-User-Token from POST /v1/token) - anonymous key-only
+            # resolution is refused, so the audit trail always says WHO.
+            - Name: RYA_REQUIRE_APPROVER_IDENTITY
+              Value: "1"
             - Name: RYA_FILES_S3_BUCKET
               Value: !Ref FilesBucket
             - Name: RYA_JWKS_URL

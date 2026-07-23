@@ -302,7 +302,8 @@ function saveAuth(a){ auth = a;
   else localStorage.removeItem('rya.auth'); }
 async function apiFetch(path, opts = {}){
   opts.headers = Object.assign({}, opts.headers || {},
-    auth && auth.wsKey ? {'authorization': 'Bearer ' + auth.wsKey} : {});
+    auth && auth.wsKey ? {'authorization': 'Bearer ' + auth.wsKey} : {},
+    auth && auth.userToken ? {'x-rya-user-token': auth.userToken} : {});
   const r = await fetch(API + path, opts);
   if(r.status === 401){ saveAuth(null); location.hash = '#/login'; throw new Error('unauthorized'); }
   return r;
@@ -438,8 +439,10 @@ async function doLogin(){
     const ws = res.workspaces[0];
     if(!ws) throw new Error('no workspace for this account');
     const key = await v1(`/workspaces/${ws.id}/keys`, {label: res.user.email}, res.token);
+    const ut = await v1('/token', {}, res.token).catch(() => null);
     saveAuth({token: res.token, email: res.user.email, userId: res.user.id,
-              wsId: ws.id, wsName: ws.name, wsKey: key.apiKey});
+              wsId: ws.id, wsName: ws.name, wsKey: key.apiKey,
+              userToken: ut ? ut.userToken : null});
     renderUserFoot();
     location.hash = '#/cases';
   }catch(e){ $('loginErr').textContent = e.message; $('loginBtn').disabled = false; }
@@ -494,7 +497,7 @@ async function approvalsView(){
   nav('nav-approvals');
   $('view').innerHTML = `<div class="page"><div class="pagehead">
       <div><h1>Approvals</h1><div class="sub">Human gates - nothing writes to the LA database until signed here or in the case.</div></div>
-    </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div></div>`;
+    </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div><div id="aprSigned"></div></div>`;
   const render = async () => {
     try{
       const a = (await (await apiFetch(`/approvals?status=pending`)).json()).approvals || [];
@@ -512,6 +515,22 @@ async function approvalsView(){
           </div>
         </div>`).join('');
     }catch(e){ $('aprList').innerHTML = `<div class="listempty">Could not reach the agent.</div>`; }
+    try{
+      const done = [];
+      for(const s of ['approved', 'rejected'])
+        done.push(...((await (await apiFetch(`/approvals?status=${s}`)).json()).approvals || []));
+      done.sort((a, b) => (b.resolvedAt || '').localeCompare(a.resolvedAt || ''));
+      const rows = done.slice(0, 8).map(x => `
+        <div class="apr-row">
+          <div class="body"><div class="t">${escapeHtml(x.title)}</div>
+            <div class="prev">${x.status === 'approved' ? 'Approved' : 'Rejected'} by
+              ${escapeHtml(x.resolvedBy && x.resolvedBy.email ? x.resolvedBy.email : 'workspace key (pre-identity)')}
+              ${x.resolvedAt ? ' - ' + new Date(x.resolvedAt).toLocaleString() : ''}</div></div>
+          <div class="acts"><span class="badge ${x.status === 'approved' ? 'b-done' : 'b-fail'}">${x.status}</span></div>
+        </div>`).join('');
+      if(rows) $('aprSigned').innerHTML = `<h2 style="margin:22px 4px 10px">Signed</h2>
+        <div class="listcard">${rows}</div>`;
+    }catch(e){ /* audit strip is best-effort */ }
   };
   await render();
 }
@@ -944,6 +963,10 @@ async function guided(){
 }
 
 /* ================= boot ================= */
+if(auth && auth.token)
+  v1('/token', {}, auth.token)
+    .then(r => saveAuth(Object.assign({}, auth, {userToken: r.userToken})))
+    .catch(() => {});
 renderUserFoot();
 refreshBadge();
 listTimer = setInterval(refreshBadge, 6000);

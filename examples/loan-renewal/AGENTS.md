@@ -127,14 +127,18 @@ workspace.
   but keep manifest tool names clean anyway.
 - **The ALB is HTTP.** Front it with CloudFront + ACM before real users; the
   deploy command prints this reminder.
+- **Approvals require identity in production.** The template sets
+  RYA_REQUIRE_APPROVER_IDENTITY=1, so a raw POST to /approvals/{id}/approve
+  with only a workspace key gets a 401 - exchange the session for a user JWT
+  via POST /v1/token and send it as X-Rya-User-Token (the web app does this
+  automatically at login and on boot).
 
 ## What remains (see ENTERPRISE.md for the full list)
 
-Open items, priority order: HTTPS via CloudFront + ACM; session-to-JWT
-identity bridge so approvals record who acted; private subnets + VPC
-endpoints (Bedrock, S3, Secrets Manager); bank IdP SSO; 500-case load test
-with honestly reported numbers; CloudWatch dashboard on the existing alarms;
-Langfuse in the VPC for prod traces; DR runbook; and the real integration -
+Open items, priority order: HTTPS via CloudFront + ACM; private subnets +
+VPC endpoints (Bedrock, S3, Secrets Manager); bank IdP SSO; 500-case load
+test with honestly reported numbers; CloudWatch dashboard on the existing
+alarms; DR runbook; and the real integration -
 swapping the `data/bank_db.json` leaf tools for `url:` HTTP tools against the
 bank's archive/LA systems (the pipeline code does not change, only the
 manifest tool definitions).

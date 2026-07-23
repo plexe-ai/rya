@@ -34,30 +34,58 @@ memory:
 
 tools:
   # ---- student lookup + profile (CAMS) ------------------------------------
+  # A3 (Phase 5): the Crizac-backed tools declare `provider: crizac` + `scopes` +
+  # `require_user` + a live `url:`. Offline the local @agent.tool handler WINS over
+  # the url (context.py precedence), so the suite stays deterministic and no
+  # connection is required; a real deploy (handler removed) routes to Crizac with
+  # the per-counsellor bearer injected, the scope-intersection enforced, and a 401
+  # surfaced as E_CONNECTION_EXPIRED → needs_reconnect.
   - id: cams_lookup_student
     permission: allowed
     description: Look up a student record in CAMS by id.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/students/lookup
   - id: cams_update_profile
     permission: approval_required
     description: Write profile fields back to CAMS. Production gates this behind a human form; here the runtime enforces the gate.
-    pin: {camsId: event.payload.camsId}
+    # A5 adoption: the active student is the one create_lead last adopted (or the
+    # session's seeded student), NOT a model-supplied id.
+    pin: {camsId: memory.student_state.camsId}
+    # Governance metadata only: prod writes local student_state, not Crizac — so no
+    # `url:` (the approved action runs the local handler via engine._execute_action).
+    provider: crizac
+    scopes: [crm:write]
   - id: collect_profile
     permission: allowed
     description: Render the inline profile-collection form to the counsellor.
   - id: duplicates_check
     permission: read_only
     description: Check CAMS for duplicate student records.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/students/duplicates
 
   # ---- discovery (Crizac catalogue) ---------------------------------------
   - id: course_catalogue
     permission: allowed
     description: The ONLY discovery tool the agent may use - Crizac's server-side catalogue search.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/catalogue/search
   - id: present_recommendations
     permission: allowed
     description: Render curated recommendation cards (8-15, rich detail).
   - id: programme_detail
     permission: read_only
     description: Full detail for one programme.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/catalogue/programme
   - id: university_search
     permission: read_only
     description: Search universities.
@@ -70,6 +98,10 @@ tools:
   - id: crizac_filters
     permission: read_only
     description: Available eligibility filters.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/options
   - id: visa_requirements
     permission: read_only
     description: Visa requirements per destination.
@@ -89,15 +121,38 @@ tools:
   - id: create_lead
     permission: allowed
     description: Create a lead in Crizac (agent retries once on 5xx in production).
+    # A1: retry a transient upstream failure (prod retries once on 5xx). Combined
+    # with the handler's passport-idempotency, a timeout-then-success never
+    # double-creates: the retry re-runs create_lead, which finds the passport
+    # already on file and returns the existing lead.
+    retry: {max_attempts: 2, backoff: exponential, "on": [timeout, 5xx]}
+    # A5: on success, adopt the new numeric camsId as the session's active student,
+    # so the pinned workspace tools (below) target it for the rest of the turn.
+    adopt: {camsId: student_state.camsId}
+    provider: crizac
+    scopes: [crm:write]
+    require_user: true
+    url: https://crizac-api.example/v1/api/leads
   - id: create_leads_bulk
     permission: allowed
     description: Bulk lead creation.
+    retry: {max_attempts: 2, backoff: exponential, "on": [timeout, 5xx]}
+    provider: crizac
+    scopes: [crm:write]
+    require_user: true
+    url: https://crizac-api.example/v1/api/leads/bulk
   - id: crizac_update_application
     permission: approval_required
     description: Write visa history / application updates. Confirm-gated by prompt in production; runtime-gated here.
+    # Governance metadata only (no `url:`): the approved action runs the local
+    # handler via engine._execute_action, matching the port's local CAMS store.
+    provider: crizac
+    scopes: [crm:write]
   - id: submit_scholarship_enquiry
     permission: approval_required
     description: Submit a scholarship enquiry on the student's behalf.
+    provider: crizac
+    scopes: [crm:write]
   - id: loan_apply_for_student
     permission: approval_required
     description: Start a loan application for the student.
@@ -106,21 +161,30 @@ tools:
     description: Send email to a student. Production uses a preview->confirm convention; here the run pauses durably for a human.
 
   # ---- student workspace (pinned: model can never target another student) --
+  # A5: pins now read the ADOPTED student (memory.student_state.camsId), which the
+  # event handler seeds from the session and create_lead updates on success — so a
+  # shortlist_add before the lead exists resolves an empty pin and rejects, and
+  # every call after create_lead targets the new student. Order-independent, and
+  # the model still can never target another student.
   - id: shortlist_add
     permission: allowed
-    pin: {camsId: event.payload.camsId}
+    pin: {camsId: memory.student_state.camsId}
     description: Add a programme to this student's shortlist.
   - id: shortlist_remove
     permission: allowed
-    pin: {camsId: event.payload.camsId}
+    pin: {camsId: memory.student_state.camsId}
     description: Remove from this student's shortlist.
   - id: compare_programmes
     permission: allowed
-    pin: {camsId: event.payload.camsId}
+    pin: {camsId: memory.student_state.camsId}
     description: Generate the comparison PDF for this student's shortlist.
   - id: application_activity
     permission: read_only
     description: Timeline of application activity.
+    provider: crizac
+    scopes: [crm:read]
+    require_user: true
+    url: https://crizac-api.example/v1/api/applications/activity
 
   # ---- drafting + prediction ----------------------------------------------
   - id: draft_sop

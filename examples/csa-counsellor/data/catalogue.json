@@ -1,0 +1,71 @@
+{
+  "_note": "Local seed for the Crizac catalogue, so Phase-1 discovery runs offline. Each university carries the (country,intake,courseType) it is offered under plus its eligibility-checked courses. Swap course_catalogue for a `url:` tool (Phase 3) to hit the live Crizac endpoints; the return shapes below mirror mapCrizacUniversityFilter / mapCrizacEligibleCourse.",
+  "countries": [
+    {"id": "uk", "name": "United Kingdom"},
+    {"id": "us", "name": "United States"},
+    {"id": "ca", "name": "Canada"},
+    {"id": "au", "name": "Australia"}
+  ],
+  "intakes": [
+    {"id": "sep-2026", "name": "September 2026"},
+    {"id": "jan-2027", "name": "January 2027"}
+  ],
+  "courseTypes": [
+    {"id": "pg", "name": "Postgraduate"},
+    {"id": "ug", "name": "Undergraduate"}
+  ],
+  "universities": [
+    {
+      "universityId": "uni-ucl",
+      "university": "University College London",
+      "country": "uk",
+      "intakes": ["sep-2026", "jan-2027"],
+      "courseTypes": ["Postgraduate"],
+      "currencyCode": "GBP",
+      "rating": 4.7,
+      "courses": [
+        {"programmeId": "ucl-msc-cs", "name": "MSc Computer Science", "annualTuition": 38000, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "London", "applicationFee": 0, "isAppliable": true},
+        {"programmeId": "ucl-msc-ds", "name": "MSc Data Science", "annualTuition": 39500, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "London", "applicationFee": 0, "isAppliable": true},
+        {"programmeId": "ucl-msc-fin", "name": "MSc Finance", "annualTuition": 42000, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "London", "applicationFee": 90, "isAppliable": false}
+      ]
+    },
+    {
+      "universityId": "uni-manchester",
+      "university": "University of Manchester",
+      "country": "uk",
+      "intakes": ["sep-2026"],
+      "courseTypes": ["Postgraduate"],
+      "currencyCode": "GBP",
+      "rating": 4.4,
+      "courses": [
+        {"programmeId": "man-msc-cs", "name": "MSc Advanced Computer Science", "annualTuition": 29500, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "Manchester", "applicationFee": 0, "isAppliable": true},
+        {"programmeId": "man-msc-ba", "name": "MSc Business Analytics", "annualTuition": 31000, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "Manchester", "applicationFee": 0, "isAppliable": true}
+      ]
+    },
+    {
+      "universityId": "uni-leeds",
+      "university": "University of Leeds",
+      "country": "uk",
+      "intakes": ["sep-2026", "jan-2027"],
+      "courseTypes": ["Postgraduate", "Undergraduate"],
+      "currencyCode": "GBP",
+      "rating": 4.2,
+      "courses": [
+        {"programmeId": "leeds-msc-ds", "name": "MSc Data Science and Analytics", "annualTuition": 27500, "currencyCode": "GBP", "durationMonths": 12, "courseLevel": "Postgraduate", "city": "Leeds", "applicationFee": 0, "isAppliable": true},
+        {"programmeId": "leeds-bsc-cs", "name": "BSc Computer Science", "annualTuition": 24000, "currencyCode": "GBP", "durationMonths": 36, "courseLevel": "Undergraduate", "city": "Leeds", "applicationFee": 0, "isAppliable": true}
+      ]
+    },
+    {
+      "universityId": "uni-nyu",
+      "university": "New York University",
+      "country": "us",
+      "intakes": ["sep-2026"],
+      "courseTypes": ["Postgraduate"],
+      "currencyCode": "USD",
+      "rating": 4.5,
+      "courses": [
+        {"programmeId": "nyu-ms-cs", "name": "MS in Computer Science", "annualTuition": 58000, "currencyCode": "USD", "durationMonths": 18, "courseLevel": "Postgraduate", "city": "New York", "applicationFee": 120, "isAppliable": true}
+      ]
+    }
+  ]
+}

@@ -10,10 +10,31 @@ policy: >
   approved hosts.
 grounding:
   enabled: true   # money figures in outbound messages must come from tool output
+secrecy:
+  # Id-secrecy scrub (the runtime form of production's scrubMasterIds). Applied
+  # to every tool result BEFORE the model sees it, and to outbound messages
+  # BEFORE they leave. A match is REWRITTEN (not blocked): the model keeps
+  # working with the redacted value. Exact production pattern (utils.ts:135):
+  # 3-8 leading letters + 8+ digits = a Crizac master id. This deliberately
+  # PRESERVES passports (e.g. Z1234567, MEGHA1234), numeric CAMS ids
+  # (e.g. 1472802), phones, years, and money.
+  enabled: true
+  apply_on: [tool_result, outbound]
+  action: scrub
+  patterns:
+    - id: crizac_master_id
+      kind: regex
+      pattern: "\\b[A-Za-z]{3,8}\\d{8,}\\b"
+      replacement: "(id hidden)"
+      note: "Crizac internal alphanumeric master id must never surface as/near a numeric CAMS id."
 rules:
   - {action: allow, kind: glob, pattern: "https://api.anthropic.com/*", note: Claude inference}
-  # Set this pattern to your CRIZAC_BASE_URL host when wiring live tools:
+  # Phase 5: the Crizac tools now declare a live `url:` on this host (the local
+  # handler wins offline, so no egress happens in the suite). Set this pattern to
+  # your real CRIZAC_BASE_URL host on deploy; the login-mint POSTs here too.
   - {action: allow, kind: glob, pattern: "https://crizac-api.example/*", note: "Crizac API (placeholder - set to CRIZAC_BASE_URL host)"}
+  # Plexe offer-prediction (Phase 5). x-api-key auth, not a Bearer url: tool.
+  - {action: allow, kind: glob, pattern: "https://api.plexe.ai/*", note: "Plexe offer-prediction inference"}
   - {action: deny, kind: glob, pattern: "https://webhook.site/*", note: exfiltration host}
   - {action: deny, kind: glob, pattern: "https://hooks.slack.com/*", note: no outbound chat webhooks}
   - {action: deny, kind: glob, pattern: "https://api.stripe.com/*", note: no direct card charges}

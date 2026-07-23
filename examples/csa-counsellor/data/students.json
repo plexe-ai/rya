@@ -1,0 +1,41 @@
+{
+  "_note": "Local seed for the CAMS student store, so Phase-2 lookups/workspace tools run offline. Each student is keyed by its Crizac masterId (the alphanumeric grouping key the A2 id-secrecy guard scrubs on output); numeric CAMS ids live under `applications[].camsId` and are the ONLY id ever surfaced. Swap the store helpers for Crizac `url:` tools (Phase 3) to hit live CAMS; shapes below mirror mapCrizacStudentDetails / mapCrizacDuplicates / mapCrizacActivity.",
+  "students": [
+    {
+      "masterId": "IjmQ1782803306",
+      "name": "Ada Kumar",
+      "passport": "Z1234567",
+      "email": "ada@student.test",
+      "mobile": "9903105259",
+      "destination": "United Kingdom",
+      "target": "MSc Computer Science",
+      "applications": [
+        {"camsId": "1472802", "programme": "MSc Computer Science", "university": "University College London", "status": "Application Pending"}
+      ],
+      "shortlist": [],
+      "profile": {
+        "budgetCapUsd": 45000,
+        "intakeUrgency": "Fall",
+        "preferredCity": "London"
+      },
+      "duplicates": [
+        {"agency": "EduPath Mumbai", "counselor": "A. Mehta", "createdAt": "2026-05-14T09:20:00Z", "status": "active"}
+      ]
+    },
+    {
+      "masterId": "YKHw1782723298",
+      "name": "Rahul Nair",
+      "passport": "M8899221",
+      "email": "rahul@student.test",
+      "mobile": "9812003456",
+      "destination": "United Kingdom",
+      "target": "MSc Data Science",
+      "applications": [
+        {"camsId": "1583991", "programme": "MSc Data Science and Analytics", "university": "University of Leeds", "status": "Enquiry"}
+      ],
+      "shortlist": [],
+      "profile": {},
+      "duplicates": []
+    }
+  ]
+}

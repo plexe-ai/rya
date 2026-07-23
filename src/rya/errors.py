@@ -43,7 +43,13 @@ _CODE_EXIT = {
     "E_NOT_PRODUCTION_READY": EXIT_VALIDATION,
     "E_UNAUTHORIZED": EXIT_PERMISSION,
     "E_BAD_SIGNATURE": EXIT_PERMISSION,
+    "E_NO_CONNECTION": EXIT_PERMISSION,
+    "E_SCOPE_DENIED": EXIT_PERMISSION,
+    "E_NO_IDENTITY": EXIT_PERMISSION,
+    "E_CONNECTION_EXPIRED": EXIT_PERMISSION,
     "E_TIMEOUT": EXIT_GENERIC,
+    "E_TOOL_UPSTREAM": EXIT_GENERIC,
+    "E_TOOL_RECOVERABLE": EXIT_GENERIC,
     "E_RUNTIME": EXIT_GENERIC,
 }
 
@@ -62,12 +68,16 @@ class RyaError(Exception):
         hint: Optional[str] = None,
         *,
         exit_code: Optional[int] = None,
+        http_status: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
         self.exit_code = exit_code if exit_code is not None else _CODE_EXIT.get(code, EXIT_GENERIC)
+        # Upstream HTTP status (set by HTTP tools) so the retry primitive can
+        # classify a failure as a transient 5xx without scraping the message.
+        self.http_status = http_status
 
     def to_dict(self) -> dict:
         return {
@@ -83,3 +93,24 @@ class RyaError(Exception):
     def __str__(self) -> str:  # pragma: no cover - cosmetic
         base = f"[{self.code}] {self.message}"
         return f"{base} | next: {self.hint}" if self.hint else base
+
+
+class RyaRecoverableToolError(RyaError):
+    """A tool failure the agent can *self-heal* rather than surface.
+
+    A handler raises this when the upstream rejected the input for a reason a
+    registered ``@agent.repair("<tool>")`` callback can fix and retry — e.g. an
+    unrecognised destination country the repair can snap to the closest valid one,
+    or a misspelled home state. It carries a machine-readable ``reason`` (the
+    repair callback switches on it) plus the upstream ``detail`` for observability.
+
+    The runtime invokes the repair callback ONCE with ``(input, error)``; the
+    callback returns a patched input and the tool is retried. If no repair is
+    registered, or the repair re-raises, the error surfaces like any other.
+    """
+
+    def __init__(self, reason: str, message: Optional[str] = None,
+                 detail: Optional[object] = None, hint: Optional[str] = None) -> None:
+        super().__init__("E_TOOL_RECOVERABLE", message or reason, hint=hint)
+        self.reason = reason
+        self.detail = detail

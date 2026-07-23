@@ -20,6 +20,8 @@ deterministic mocks.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -105,9 +107,26 @@ def _http_tool(url: str, input: dict, auth_secret: Optional[str] = None) -> dict
         with urllib.request.urlopen(req, timeout=30) as resp:
             return _json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        raise RyaError("E_RUNTIME", f"tool HTTP {e.code}: {e.read().decode(errors='replace')[:200]}",
-                       hint="Check the tool URL / payload.")
+        body = e.read().decode(errors="replace")[:200]
+        # A 401 on a request we authenticated means the injected connection
+        # credential is expired/invalid: surface a typed reconnect signal (the
+        # runtime maps it to a `needs_reconnect` outcome), mirroring prod's
+        # CrizacAuthError → "please reconnect". No auto-refresh. A 401 with no
+        # credential is just a plain upstream error.
+        if e.code == 401 and auth_secret:
+            raise RyaError("E_CONNECTION_EXPIRED", f"upstream rejected the credential (HTTP 401): {body}",
+                           hint="The connection has expired — reconnect (log in again) and retry.",
+                           http_status=401)
+        # Carry the status so the retry primitive can classify a 5xx as transient.
+        raise RyaError("E_TOOL_UPSTREAM", f"tool HTTP {e.code}: {body}",
+                       hint="Check the tool URL / payload.", http_status=e.code)
     except urllib.error.URLError as e:
+        # A socket timeout surfaces here as URLError(reason=timeout); tag it as a
+        # timeout class so a retry policy that lists `timeout` re-tries it.
+        import socket
+        if isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError)):
+            raise RyaError("E_TIMEOUT", f"tool request timed out: {e.reason}",
+                           hint="Upstream did not respond in time.")
         raise RyaError("E_RUNTIME", f"tool request failed: {e.reason}", hint="Check network egress.")
 
 
@@ -312,6 +331,17 @@ class RuntimeContext:
         if not provider:
             return None
         owner = self.identity.sub if self.identity is not None else None
+        # Fail closed on missing identity: a `require_user` tool must resolve a
+        # per-user connection. Without a verified `sub`, get_connection would fall
+        # through to a workspace-shared credential — a silent attribution leak (one
+        # counsellor acting under another's Crizac token). Refuse instead.
+        if getattr(decl, "require_user", False) and not owner:
+            raise RyaError(
+                "E_NO_IDENTITY",
+                f"Tool needs a verified user to use its '{provider}' connection, "
+                "but no user identity was presented.",
+                hint="Forward the signed X-Rya-User-Token so the per-user credential resolves.",
+            )
         conn = self.store.get_connection(provider, owner) if hasattr(self.store, "get_connection") else None
         if conn is None or conn.get("status") != "active":
             raise RyaError(
@@ -879,12 +909,18 @@ class _Tools:
                 f"Tool '{tool_id}' requires approval and cannot be called directly.",
                 hint="Use `ctx.approvals.request(action={'tool': '%s', 'input': {...}})` instead." % tool_id,
             )
-        # Resolve the manifest decl once, then enforce scoped connected credentials
-        # BEFORE any implementation runs: the tool's required scopes must be within
-        # (connection scopes ∩ requesting-user scopes). Returns the secret to inject.
+        # Resolve the manifest decl and backend once. Scoped connected credentials
+        # are enforced BEFORE the implementation runs — the tool's required scopes
+        # must be within (connection scopes ∩ requesting-user scopes) — but ONLY for
+        # tools that actually egress with the credential (url/mock backends). A local
+        # @agent.tool handler never receives the secret, so a `provider:` on it is
+        # governance metadata: resolving a credential there is pointless and would
+        # wrongly require a live connection for an offline leaf.
         decl = next((t for t in self._ctx.manifest.tools if t.id == tool_id), None)
-        secret = self._ctx._authorize_connection(decl)
         provider = getattr(decl, "provider", None) if decl is not None else None
+        handler = self._ctx._agent.tool_handler(tool_id) if self._ctx._agent else None
+        url = getattr(decl, "url", None)
+        secret = self._ctx._authorize_connection(decl) if (handler is None and provider) else None
         meta = {"provider": provider, "scopes": getattr(decl, "scopes", []) or []} if provider else {}
 
         # Server-side arg pinning: pinned fields come from trusted state (event,
@@ -895,36 +931,141 @@ class _Tools:
             input = {**(input or {}), **{k: self._ctx._resolve_pin(v) for k, v in pins.items()}}
             meta["pinnedArgs"] = sorted(pins)
 
-        # 1) Real tool defined in the agent via @agent.tool — async leaf handler.
-        handler = self._ctx._agent.tool_handler(tool_id) if self._ctx._agent else None
+        # The id-secrecy scrub runs on the result INSIDE the journaled fn below,
+        # AFTER the implementation produces it: so the scrubbed value is what the
+        # loop sees, what the journal memoizes on replay, and what the trace
+        # records (a secret id never lands in observability). Running it after the
+        # body — not before — lets a handler still act on the raw id it received
+        # before the redacted form propagates.
+        scrub = self._ctx.guard.scrub
+
+        # Resolve the backend (agent handler / HTTP / mock) into one async callable
+        # over a (possibly repaired) input, so the retry+repair loop is backend-
+        # agnostic. All three flow through a single journaled step, so a replay
+        # after an approval pause returns the memoized final result — retries and
+        # repairs never re-run.
         if handler is not None:
-            async def run_handler():
-                return await handler(input)
-            return await self._ctx._astep("tool.call", tool_id, run_handler,
-                                          {"input": input, "permission": perm.value, "impl": "agent", **meta})
+            impl = "agent"
 
-        # 2) HTTP tool — manifest declares a url to POST the input to.
-        url = getattr(decl, "url", None)
-        if url:
-            async def run_http():
-                return _http_tool(url, input, auth_secret=secret)
-            return await self._ctx._astep("tool.call", tool_id, run_http,
-                                          {"input": input, "permission": perm.value, "impl": "http", **meta})
+            async def backend(cur):
+                return await handler(cur)
+        elif url:
+            impl = "http"
 
-        # 3) Mock registry fallback.
-        spec = self._ctx._tools.get(tool_id)
-        if spec is None:
-            raise RyaError(
-                "E_TOOL_NOT_FOUND",
-                f"Tool '{tool_id}' is declared but has no implementation.",
-                hint="Define it with @agent.tool, add a `url:` in the manifest, or register a mock.",
-            )
+            async def backend(cur):
+                return _http_tool(url, cur, auth_secret=secret)
+        else:
+            spec = self._ctx._tools.get(tool_id)
+            if spec is None:
+                raise RyaError(
+                    "E_TOOL_NOT_FOUND",
+                    f"Tool '{tool_id}' is declared but has no implementation.",
+                    hint="Define it with @agent.tool, add a `url:` in the manifest, or register a mock.",
+                )
+            impl = "mock"
 
-        def run():
-            return spec.fn(input)
+            async def backend(cur):
+                return spec.fn(cur)
 
-        return self._ctx._step("tool.call", tool_id, run,
-                               {"input": input, "permission": perm.value, **meta})
+        retry = getattr(decl, "retry", None)
+        repair = self._ctx._agent.repair_handler(tool_id) if self._ctx._agent else None
+
+        async def run_tool():
+            result = scrub(await self._invoke_with_recovery(tool_id, backend, input, retry, repair))
+            self._apply_adoption(decl, result)
+            return result
+
+        return await self._ctx._astep("tool.call", tool_id, run_tool,
+                                      {"input": input, "permission": perm.value, "impl": impl, **meta})
+
+    @staticmethod
+    def _error_class(exc) -> Optional[str]:
+        """Classify a raised error into a retry class token, or None if it is not
+        a transiently-retryable failure."""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return "timeout"
+        if isinstance(exc, RyaError):
+            if exc.code == "E_TIMEOUT":
+                return "timeout"
+            status = getattr(exc, "http_status", None)
+            if isinstance(status, int) and 500 <= status < 600:
+                return "5xx"
+        return None
+
+    @staticmethod
+    async def _backoff_sleep(backoff: str, attempt: int) -> None:
+        # Kept small for the local slice — real, but sub-second so tests stay fast.
+        if backoff == "none":
+            return
+        base = 0.02
+        delay = base if backoff == "fixed" else base * (2 ** (attempt - 1))
+        await asyncio.sleep(min(delay, 0.2))
+
+    async def _invoke_with_recovery(self, tool_id, backend, input, retry, repair):
+        """Run ``backend(input)`` with A1 semantics: self-heal a recoverable error
+        once via the registered repair callback, and retry a transient failure per
+        the declared ``retry`` policy. Repair (domain) and retry (transient) are
+        orthogonal — a repair does not consume a transient-retry budget."""
+        from ..errors import RyaRecoverableToolError
+
+        max_attempts = retry.max_attempts if retry else 1
+        on = set(retry.on) if retry else set()
+        backoff = retry.backoff if retry else "none"
+
+        cur = input
+        transient_used = 0
+        repaired = False
+        while True:
+            try:
+                return await backend(cur)
+            except RyaRecoverableToolError as e:
+                # Self-heal exactly once: hand the input + error to the repair
+                # callback, retry with its patched input. A tool.repair step in the
+                # trace makes the self-heal visible.
+                if repair is None or repaired:
+                    raise
+                repaired = True
+                patched = repair(cur, e)
+                if inspect.isawaitable(patched):
+                    patched = await patched
+                self._ctx._trace("tool.repair", tool_id,
+                                 {"reason": e.reason, "detail": e.detail,
+                                  "patched": patched if patched is not None else cur})
+                cur = patched if patched is not None else cur
+            except Exception as e:  # noqa: BLE001 - re-raised unless retryable
+                cls = self._error_class(e)
+                if cls in on and transient_used < (max_attempts - 1):
+                    transient_used += 1
+                    self._ctx._trace("tool.retry", tool_id,
+                                     {"attempt": transient_used, "class": cls,
+                                      "maxAttempts": max_attempts})
+                    await self._backoff_sleep(backoff, transient_used)
+                    continue
+                raise
+
+    def _apply_adoption(self, decl, result) -> None:
+        """A5 adoption: after a successful call, copy declared result fields into
+        scoped memory so a later pinned tool in the same turn adopts them. Written
+        to the store synchronously (inside the journaled tool step), so a pin that
+        reads ``memory.<scope>.<key>`` on a subsequent call sees the adopted value;
+        on replay the tool step is memoized and the store already holds it."""
+        adopt = getattr(decl, "adopt", None) or {}
+        if not adopt or not isinstance(result, dict):
+            return
+        # A failed handler result (ok is explicitly False) adopts nothing.
+        if result.get("ok") is False:
+            return
+        for field, target in adopt.items():
+            val = result.get(field)
+            if val in (None, "", []):
+                continue
+            if "." not in target:
+                continue
+            scope, key = target.split(".", 1)
+            mem = self._ctx.store.load_memory(scope)
+            mem.setdefault("kv", {})[key] = val
+            self._ctx.store.save_memory(scope, mem)
+            self._ctx._trace("tool.adopt", target, {"field": field, "value": val})
 
 
 class _Guard:
@@ -949,6 +1090,25 @@ class _Guard:
         policy = load_policy(str(self._ctx.project_root / GUARD_FILE)) or {}
         return policy.get("grounding") or {}
 
+    def _policy(self) -> dict:
+        from ..guard import load_policy, GUARD_FILE
+        return load_policy(str(self._ctx.project_root / GUARD_FILE)) or {}
+
+    def scrub(self, obj):
+        """Id-secrecy scrub: rewrite every configured secret pattern in every
+        string leaf of ``obj`` to its safe token (no-op unless ``secrecy.enabled``
+        in rya.guard.yaml). Applied at the tool boundary and on outbound so a
+        secret id never reaches the model, the trace, or a channel send."""
+        from ..guard import _compile_secrecy, secrecy_scrub
+        return secrecy_scrub(obj, _compile_secrecy(self._policy()))
+
+    def check_secrecy(self, text: str) -> dict:
+        """Report whether any configured secret pattern appears in ``text``.
+        Returns {ok, hits, scrubbed} — handler-side assertion complement to the
+        automatic boundary scrub."""
+        from ..guard import secrecy_check
+        return secrecy_check(text, self._policy())
+
 
 class _Channels:
     def __init__(self, ctx: RuntimeContext) -> None:
@@ -956,6 +1116,12 @@ class _Channels:
 
     async def send(self, channel: str, message: dict) -> dict:
         from ..providers.channels import send as channel_send
+
+        # Id-secrecy scrub FIRST (opt-in via rya.guard.yaml `secrecy.enabled`):
+        # rewrite any secret id in the outbound message to its safe token before
+        # anything else sees it — the grounding check, the wire, and the trace all
+        # operate on the scrubbed message, so a secret id can never leave.
+        message = self._ctx.guard.scrub(message)
 
         # Grounding gate (opt-in via rya.guard.yaml `grounding.enabled`): an
         # outbound message may not contain money figures that no tool output of
@@ -1120,6 +1286,26 @@ class _Connections:
             return self._ctx.store.list_connections() if hasattr(self._ctx.store, "list_connections") else []
 
         return self._ctx._step("connection.list", "all", run)
+
+    async def upsert(self, provider: str, *, secret: str, scopes: Optional[List[str]] = None,
+                     label: Optional[str] = None) -> dict:
+        """Mint or refresh the current caller's connection for ``provider`` — the
+        write path a login handler uses after exchanging credentials for a bearer.
+        Owner is bound to ``identity.sub`` (per-user); overwrite-in-place keyed on
+        (provider, owner) so a re-login never leaves a stale duplicate the runtime
+        could later inject. The secret is sealed at rest and seeded into the
+        redaction vault; only public metadata is returned (never the secret)."""
+        owner = self._ctx.identity.sub if self._ctx.identity is not None else None
+        self._ctx._seed_secret(secret)
+
+        def run():
+            if not hasattr(self._ctx.store, "upsert_connection"):
+                raise RyaError("E_RUNTIME", "store does not support connection upsert.")
+            return self._ctx.store.upsert_connection(provider, list(scopes or []),
+                                                     secret=secret, owner=owner, label=label)
+
+        return self._ctx._step("connection.upsert", provider, run,
+                               {"scopes": list(scopes or []), "owner": owner})
 
 
 class _Jobs:

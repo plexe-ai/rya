@@ -843,10 +843,12 @@ def build_app(root: Path) -> FastAPI:
         from ..store import now_iso
         body = await request.json()
         status = body.get("status")
-        if status not in ("completed", "failed", "running", "waiting_approval", "rejected"):
+        if status not in ("completed", "failed", "running", "waiting_approval", "rejected",
+                          "needs_reconnect"):
             raise HTTPException(status_code=400, detail={
                 "code": "E_VALIDATION",
-                "message": "status must be one of completed|failed|running|waiting_approval|rejected."})
+                "message": "status must be one of completed|failed|running|waiting_approval|"
+                           "rejected|needs_reconnect."})
         raw_trace = body.get("trace")
         if not isinstance(raw_trace, list) or not raw_trace or len(raw_trace) > 1000:
             raise HTTPException(status_code=400, detail={

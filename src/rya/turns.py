@@ -145,7 +145,7 @@ def read_stream(engine, turn_id: str, after_seq: int = -1) -> List[dict]:
     return engine.store.stream_read(turn_id, after_seq)
 
 
-TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected")
+TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected", "needs_reconnect")
 
 
 def is_terminal(frames: List[dict]) -> Optional[dict]:

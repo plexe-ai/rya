@@ -313,9 +313,17 @@ class Engine:
             run["error"] = {"code": "E_APPROVAL_REJECTED", "approvalId": r.approval_id}
             ctx._trace("run.rejected", "approval rejected", {"approvalId": r.approval_id})
         except RyaError as e:
-            run["status"] = "failed"
-            run["error"] = e.to_dict()["error"]
-            ctx._trace("run.failed", e.code, {"message": e.message, "hint": e.hint})
+            if e.code == "E_CONNECTION_EXPIRED":
+                # A distinct, non-generic outcome: the connection expired mid-turn,
+                # so the run needs the user to reconnect (log in again) and retry —
+                # not a bug. Mirrors prod's CrizacAuthError → clean reconnect prompt.
+                run["status"] = "needs_reconnect"
+                run["error"] = e.to_dict()["error"]
+                ctx._trace("run.needs_reconnect", e.code, {"message": e.message, "hint": e.hint})
+            else:
+                run["status"] = "failed"
+                run["error"] = e.to_dict()["error"]
+                ctx._trace("run.failed", e.code, {"message": e.message, "hint": e.hint})
         except Exception as e:  # pragma: no cover - defensive
             run["status"] = "failed"
             run["error"] = {"code": "E_RUNTIME", "message": str(e)}
@@ -332,7 +340,7 @@ class Engine:
 
         # Export the finished run to any configured observability backend
         # (Langfuse / OTLP / webhook). Best-effort: never let export break a run.
-        if run["status"] in ("completed", "failed", "rejected"):
+        if run["status"] in ("completed", "failed", "rejected", "needs_reconnect"):
             try:
                 from ..observability.export import export_run
                 from ..sdk.context import load_env

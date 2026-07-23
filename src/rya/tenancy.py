@@ -34,7 +34,7 @@ except ImportError as exc:  # pragma: no cover
 from .store_postgres import _SCHEMA as _DATA_SCHEMA
 
 _DATA_TABLES = ["rya_runs", "rya_approvals", "rya_jobs", "rya_queue", "rya_stream",
-                "rya_memory", "rya_sessions", "rya_messages", "rya_connections", "rya_files"]
+                "rya_memory", "rya_sessions", "rya_messages", "rya_connections", "rya_files", "rya_job_groups"]
 
 _TENANCY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rya_users (

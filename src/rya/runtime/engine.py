@@ -218,6 +218,16 @@ class Engine:
             else:
                 job["status"] = "failed"
         self.store.save_job(job)
+        # Job-group fan-in: exactly-once on_complete when the whole group is done.
+        if job.get("groupId") and job["status"] in ("done", "failed"):
+            try:
+                out = self.store.group_job_done(job["groupId"], success=(job["status"] == "done"))
+                if out and out.get("fire"):
+                    oc = out["onComplete"]
+                    self.store.create_job(oc.get("parentRunId"), oc["handler"],
+                                          oc.get("payload", {}), now_iso())
+            except Exception:  # never let group bookkeeping kill the worker
+                pass
         return result
 
     def due_jobs(self) -> list:

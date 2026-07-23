@@ -28,7 +28,7 @@ evals:
     expect:
       status: completed
       tools_not_called: [case.save_extraction, la.update_record]
-      trace_lacks: job.schedule          # checklist incomplete -> no fan-out
+      trace_lacks: job.schedule_group    # checklist incomplete -> no fan-out
 
   - id: spread_upload_still_no_extraction
     trigger:
@@ -36,7 +36,7 @@ evals:
       payload: { fileId: f-spread, tags: { cif: mock-cif, docType: spread } }
     expect:
       status: completed
-      trace_lacks: job.schedule
+      trace_lacks: job.schedule_group
 
   - id: id_upload_still_no_extraction
     trigger:
@@ -44,7 +44,7 @@ evals:
       payload: { fileId: f-id, tags: { cif: mock-cif, docType: id } }
     expect:
       status: completed
-      trace_lacks: job.schedule
+      trace_lacks: job.schedule_group
 
   - id: final_upload_fans_out_extraction_jobs
     trigger:
@@ -52,7 +52,7 @@ evals:
       payload: { fileId: f-ref, tags: { cif: mock-cif, docType: reference_report } }
     expect:
       status: completed
-      trace_has: job.schedule            # checklist complete -> one job per doc
+      trace_has: job.schedule_group      # checklist complete -> grouped fan-out
       tools_not_called: [la.update_record]
 
   - id: untagged_upload_is_ignored

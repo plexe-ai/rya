@@ -175,7 +175,7 @@ class FileStore:
 
     # ---- jobs ----------------------------------------------------------
     def create_job(self, run_id: str, handler: str, payload: dict, run_at: str,
-                   max_attempts: int = 3) -> dict:
+                   max_attempts: int = 3, group_id: Optional[str] = None) -> dict:
         job = {
             "id": _new_id("job"),
             "parentRunId": run_id,
@@ -188,9 +188,35 @@ class FileStore:
             "lastError": None,
             "createdAt": now_iso(),
             "resultRunId": None,
+            "groupId": group_id,
         }
         self._write(self.jobs_dir / f"{job['id']}.json", job)
         return job
+
+    # ---- job groups (fan-in): remaining counter + exactly-once fire --------
+    def create_job_group(self, on_complete: dict, count: int) -> dict:
+        group = {"id": _new_id("grp"), "remaining": count, "fired": False,
+                 "failed": False, "onComplete": on_complete, "createdAt": now_iso()}
+        self._write(self.jobs_dir / f"{group['id']}.json", group)
+        return group
+
+    def group_job_done(self, group_id: str, success: bool = True) -> Optional[dict]:
+        """Decrement on success; mark failed on terminal failure. File backend
+        is single-process dev - Postgres is the concurrency-safe one."""
+        path = self.jobs_dir / f"{group_id}.json"
+        group = self._read(path)
+        if group is None:
+            return None
+        if not success:
+            group["failed"] = True
+            self._write(path, group)
+            return {"fire": False}
+        group["remaining"] = max(0, group["remaining"] - 1)
+        fire = group["remaining"] == 0 and not group["fired"] and not group["failed"]
+        if fire:
+            group["fired"] = True
+        self._write(path, group)
+        return {"fire": fire, "onComplete": group["onComplete"]}
 
     def get_job(self, job_id: str) -> Optional[dict]:
         return self._read(self.jobs_dir / f"{job_id}.json")

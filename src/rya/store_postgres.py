@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS rya_files (
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_files_ws ON rya_files (workspace_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS rya_job_groups (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    remaining INTEGER NOT NULL,
+    fired BOOLEAN NOT NULL DEFAULT FALSE,
+    failed BOOLEAN NOT NULL DEFAULT FALSE,
+    on_complete JSONB NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_conn_lookup ON rya_connections (workspace_id, provider, status);
 CREATE INDEX IF NOT EXISTS idx_runs_ws ON rya_runs (workspace_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_ws ON rya_approvals (workspace_id, status);
@@ -162,6 +170,34 @@ class PostgresStore:
     @property
     def _ws(self) -> str:
         return self.workspace_id
+
+    # ---- job groups (fan-in): atomic decrement + exactly-once fire ---------
+    def create_job_group(self, on_complete: dict, count: int) -> dict:
+        gid = _new_id("grp")
+        with self._conn.cursor() as cur:
+            cur.execute("INSERT INTO rya_job_groups (id, workspace_id, remaining, on_complete) "
+                        "VALUES (%s, %s, %s, %s)", (gid, self._ws, count, Json(on_complete)))
+        return {"id": gid, "remaining": count, "onComplete": on_complete}
+
+    def group_job_done(self, group_id: str, success: bool = True) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            if not success:
+                cur.execute("UPDATE rya_job_groups SET failed = TRUE WHERE id = %s AND workspace_id = %s",
+                            (group_id, self._ws))
+                return {"fire": False}
+            cur.execute("UPDATE rya_job_groups SET remaining = remaining - 1 "
+                        "WHERE id = %s AND workspace_id = %s RETURNING remaining, failed, on_complete",
+                        (group_id, self._ws))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            remaining, failed, on_complete = row
+            if remaining > 0 or failed:
+                return {"fire": False, "onComplete": on_complete}
+            # exactly-once claim
+            cur.execute("UPDATE rya_job_groups SET fired = TRUE "
+                        "WHERE id = %s AND workspace_id = %s AND fired = FALSE", (group_id, self._ws))
+            return {"fire": cur.rowcount == 1, "onComplete": on_complete}
 
     # ---- files (uploaded documents; immutable once saved) ---------------
     def save_file(self, name: str, content: bytes, content_type: Optional[str] = None,
@@ -282,12 +318,12 @@ class PostgresStore:
 
     # ---- jobs ----------------------------------------------------------
     def create_job(self, run_id: str, handler: str, payload: dict, run_at: str,
-                   max_attempts: int = 3) -> dict:
+                   max_attempts: int = 3, group_id: Optional[str] = None) -> dict:
         job = {
             "id": _new_id("job"), "parentRunId": run_id, "handler": handler,
             "payload": payload, "status": "pending", "runAt": run_at,
             "attempts": 0, "maxAttempts": max_attempts, "lastError": None,
-            "createdAt": now_iso(), "resultRunId": None,
+            "createdAt": now_iso(), "resultRunId": None, "groupId": group_id,
         }
         self.save_job(job)
         return job

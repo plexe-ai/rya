@@ -1138,6 +1138,29 @@ class _Jobs:
 
         return self._ctx._step("job.schedule", handler, run, {"delaySeconds": delay_seconds})
 
+    async def schedule_group(self, jobs: list, on_complete: tuple,
+                             max_attempts: int = 3) -> dict:
+        """Fan-out with race-free fan-in: schedule every ``(handler, payload)``
+        in ``jobs`` and, when ALL succeed, fire ``on_complete`` exactly once -
+        under any number of parallel workers. A terminal member failure marks
+        the group failed and on_complete never fires."""
+        def run():
+            oc_handler, oc_payload = on_complete
+            group = self._ctx.store.create_job_group(
+                {"handler": oc_handler, "payload": oc_payload,
+                 "parentRunId": self._ctx.run["id"]}, len(jobs))
+            run_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ids = []
+            for handler, payload in jobs:
+                j = self._ctx.store.create_job(self._ctx.run["id"], handler, payload,
+                                               run_at, max_attempts, group_id=group["id"])
+                ids.append(j["id"])
+            self._ctx.run.setdefault("scheduledJobs", []).extend(ids)
+            return {"groupId": group["id"], "jobIds": ids, "onComplete": oc_handler}
+
+        return self._ctx._step("job.schedule_group",
+                               f"{len(jobs)} jobs -> {on_complete[0]}", run)
+
 
 class _Cron:
     def __init__(self, ctx: RuntimeContext) -> None:

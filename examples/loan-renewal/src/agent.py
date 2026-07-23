@@ -172,19 +172,6 @@ async def case_load(input: dict) -> dict:
             "archive": json.loads(arch[0][0]) if arch else None}
 
 
-@agent.tool("case.claim_compose")
-async def case_claim_compose(input: dict) -> dict:
-    """Atomic fan-in: exactly one caller wins the right to schedule compose."""
-    conn, ph = _connect()
-    try:
-        cur = conn.cursor()
-        cur.execute(f"UPDATE la_cases SET compose_scheduled = 1 "
-                    f"WHERE case_id = {ph} AND compose_scheduled = 0", (input["caseId"],))
-        return {"won": cur.rowcount == 1}
-    finally:
-        conn.close()
-
-
 @agent.tool("la.update_record")
 async def la_update_record(input: dict) -> dict:
     """Step 8 - the single gated write. Idempotent (same UPDATE, keyed by case)
@@ -260,10 +247,12 @@ async def handle_upload(ctx, event):
     # (step 3-4), then the reference-report schema derivation (step 5 input).
     case["status"] = "extracting"
     await ctx.memory.set(f"case:{cif}", case, scope="agent")
-    for doc_type, file_id in case["received"].items():
-        await ctx.jobs.schedule("extract_document", {
-            "cif": cif, "caseId": case["caseId"], "docType": doc_type, "fileId": file_id,
-        })
+    # Platform fan-in: when ALL extractions succeed, compose fires exactly once.
+    await ctx.jobs.schedule_group(
+        [("extract_document", {"cif": cif, "caseId": case["caseId"],
+                               "docType": doc_type, "fileId": file_id})
+         for doc_type, file_id in case["received"].items()],
+        on_complete=("compose_report", {"cif": cif, "caseId": case["caseId"]}))
     return {"caseId": case["caseId"], "status": "extracting",
             "jobs": len(case["received"])}
 
@@ -307,15 +296,8 @@ async def extract_document(ctx, job):
 
     saved = await ctx.tools.call("case.save_extraction",
                                  {"caseId": p["caseId"], "docType": p["docType"], "data": data})
-
-    # Fan-in, race-free: the atomic count says whether the set is complete, and
-    # the compose claim guarantees exactly ONE worker schedules it - safe under
-    # any number of parallel workers.
-    if saved.get("extractedCount", 0) >= len(REQUIRED_DOCS):
-        claim = await ctx.tools.call("case.claim_compose", {"caseId": p["caseId"]})
-        if claim.get("won"):
-            await ctx.jobs.schedule("compose_report", {"cif": p["cif"], "caseId": p["caseId"]})
-            return {"docType": p["docType"], "complete": True}
+    # Fan-in is the platform's job now: this job's group fires compose_report
+    # exactly once when every extraction has succeeded.
     return {"docType": p["docType"], "extractedCount": saved.get("extractedCount")}
 
 

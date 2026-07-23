@@ -36,6 +36,24 @@ INTENT_SCHEMA = {
     "required": ["action", "cif", "product"],
 }
 
+# Fixed field names per docType: independent chunk calls MUST share keys or
+# the provenance merge can't align them (found live: chunk 0 said
+# annual_revenue, chunk 1 said annual_revenue_aed - conflict undetected).
+def _fields(*names):
+    return {"type": "object",
+            "properties": {n: {} for n in names},
+            "required": list(names)}
+
+EXTRACTION_SCHEMAS = {
+    "aecb": _fields("credit_score", "total_outstanding_liabilities_aed",
+                    "monthly_obligations_aed", "active_facilities", "defaults",
+                    "bounced_cheques", "worst_delinquency_bucket"),
+    "spread": _fields("annual_revenue_aed", "net_profit_aed", "total_assets_aed",
+                      "total_liabilities_aed", "current_ratio", "leverage_ratio"),
+    "id": _fields("legal_entity_name", "trade_license_number",
+                  "license_expiry_date", "authorized_signatories"),
+}
+
 EXTRACTION_PROMPTS = {
     "aecb": "Extract from this AECB credit bureau report: credit score, total outstanding "
             "liabilities (AED), monthly obligations (AED), number of active facilities, "
@@ -247,12 +265,9 @@ async def handle_upload(ctx, event):
     # (step 3-4), then the reference-report schema derivation (step 5 input).
     case["status"] = "extracting"
     await ctx.memory.set(f"case:{cif}", case, scope="agent")
-    # Platform fan-in: when ALL extractions succeed, compose fires exactly once.
-    await ctx.jobs.schedule_group(
-        [("extract_document", {"cif": cif, "caseId": case["caseId"],
-                               "docType": doc_type, "fileId": file_id})
-         for doc_type, file_id in case["received"].items()],
-        on_complete=("compose_report", {"cif": cif, "caseId": case["caseId"]}))
+    # Splitting long PDFs is heavy - plan in a job, never in the event path.
+    await ctx.jobs.schedule("plan_extraction", {"cif": cif, "caseId": case["caseId"],
+                                                "received": case["received"]})
     return {"caseId": case["caseId"], "status": "extracting",
             "jobs": len(case["received"])}
 
@@ -264,36 +279,52 @@ async def main(ctx, event):
     return await handle_message(ctx, event)
 
 
-# ---- step 4-5: per-document extraction jobs ---------------------------------
-@agent.job("extract_document")
-async def extract_document(ctx, job):
+# ---- step 4-5: plan -> chunked unit extraction (deep-document capable) ------
+@agent.job("plan_extraction")
+async def plan_extraction(ctx, job):
+    """Split oversized PDFs into page-range chunk files, then fan out ONE job
+    group over every unit (small doc = one unit; long doc = many chunk units).
+    Compose fires exactly once when every unit succeeds."""
+    from rya.documents import split_pdf
+
+    p = job.payload
+    units = []
+    for doc_type, file_id in p["received"].items():
+        doc = await ctx.files.as_document(file_id)
+        if doc["format"] == "pdf" and (len(doc["bytes"]) > 3_000_000):
+            chunks = split_pdf(doc["bytes"])
+        else:
+            chunks = split_pdf(doc["bytes"]) if doc["format"] == "pdf" else \
+                [{"bytes": doc["bytes"], "pages": (1, 1), "part": 0}]
+        if len(chunks) == 1:
+            units.append({"cif": p["cif"], "caseId": p["caseId"], "docType": doc_type,
+                          "fileId": file_id, "part": 0, "pages": list(chunks[0]["pages"])})
+            continue
+        for c in chunks:
+            meta = await ctx.files.save(
+                f"{doc_type}.p{c['pages'][0]}-{c['pages'][1]}.pdf", c["bytes"],
+                content_type="application/pdf",
+                tags={"cif": p["cif"], "docType": doc_type, "chunk": str(c["part"])})
+            units.append({"cif": p["cif"], "caseId": p["caseId"], "docType": doc_type,
+                          "fileId": meta["id"], "part": c["part"],
+                          "pages": list(c["pages"])})
+    await ctx.jobs.schedule_group(
+        [("extract_unit", u) for u in units],
+        on_complete=("compose_report", {"cif": p["cif"], "caseId": p["caseId"]}))
+    return {"units": len(units), "documents": len(p["received"])}
+
+
+@agent.job("extract_unit")
+async def extract_unit(ctx, job):
+    """Extract one unit (a whole small doc, or one chunk of a long one).
+    Two-pass per chunk: a cheap relevance gate first, deep extraction only
+    when the pages actually contain target data - most pages of a long credit
+    file are irrelevant to any given field."""
     p = job.payload
     doc = await ctx.files.as_document(p["fileId"])
-    # Enterprise-size documents: the Converse API caps a document block at
-    # ~4.5MB. Past ~3.5MB we split the PDF into page-range chunks and run one
-    # journaled model call per chunk, merging the JSON - big docs become more
-    # calls, not a failure. Falls back to single-call if pypdf is absent.
-    chunks = [doc]
-    if doc["format"] == "pdf" and len(doc["bytes"]) > 3_500_000:
-        try:
-            import io
-            from pypdf import PdfReader, PdfWriter
-            reader = PdfReader(io.BytesIO(doc["bytes"]))
-            step = max(1, len(reader.pages) // -(-len(doc["bytes"]) // 3_000_000))
-            chunks = []
-            for start in range(0, len(reader.pages), step):
-                w = PdfWriter()
-                for pg in reader.pages[start:start + step]:
-                    w.add_page(pg)
-                buf = io.BytesIO(); w.write(buf)
-                chunks.append({"name": f"{doc['name']} (p{start + 1}-)",
-                               "format": "pdf", "bytes": buf.getvalue()})
-        except ImportError:
-            ctx.logs.warning("pypdf not installed - sending oversized PDF whole")
+    pages = f"p{p['pages'][0]}-{p['pages'][1]}"
 
     if p["docType"] == "reference_report":
-        # Step 5: the reference report defines the FORMAT and FIELDS of the
-        # final output - derive a required-fields schema from it.
         res = await ctx.llm.respond(
             route="schema",
             system="This is a reference credit-renewal report. List the sections it contains "
@@ -307,21 +338,36 @@ async def extract_document(ctx, job):
     else:
         prompt = EXTRACTION_PROMPTS.get(p["docType"], "Extract all financially material data.")
         data = {}
-        for chunk in chunks:  # one journaled model call per chunk; dicts merge
+        relevant = True
+        if p["part"] or p["pages"][1] - p["pages"][0] > 20:  # chunked doc: gate first
+            gate = await ctx.llm.respond(
+                route="intent",
+                system=f"Task: {prompt} Do these pages contain ANY of that data? "
+                       'Respond as JSON {"relevant": true|false}.',
+                input={"pages": pages}, documents=[doc],
+                schema={"type": "object", "properties": {"relevant": {"type": "boolean"}},
+                        "required": ["relevant"]},
+            )
+            relevant = bool(gate.json.get("relevant"))
+        if relevant:
             res = await ctx.llm.respond(
                 route="extract",
-                system=prompt + " Respond as a flat JSON object. Use numbers for amounts "
-                                "(no currency symbols). Use null for anything not present.",
-                input={"docType": p["docType"], "part": chunk["name"]}, documents=[chunk],
-                schema={"type": "object"},
+                system=prompt + " Respond as a flat JSON object with EXACTLY the schema's "
+                                "field names. Use numbers for amounts (no currency "
+                                "symbols). Use null for anything not on these pages.",
+                input={"docType": p["docType"], "pages": pages}, documents=[doc],
+                schema=EXTRACTION_SCHEMAS.get(p["docType"], {"type": "object"}),
             )
-            data.update({k: v for k, v in res.json.items() if v is not None})
+            data = res.json
 
-    saved = await ctx.tools.call("case.save_extraction",
-                                 {"caseId": p["caseId"], "docType": p["docType"], "data": data})
-    # Fan-in is the platform's job now: this job's group fires compose_report
-    # exactly once when every extraction has succeeded.
-    return {"docType": p["docType"], "extractedCount": saved.get("extractedCount")}
+    await ctx.tools.call("case.save_extraction",
+                         {"caseId": p["caseId"],
+                          "docType": f"{p['docType']}#part{p['part']}",
+                          "data": {"_pages": pages, **data}}
+                         if p["docType"] != "reference_report" else
+                         {"caseId": p["caseId"], "docType": "reference_report", "data": data})
+    return {"docType": p["docType"], "part": p["part"], "pages": pages,
+            "extracted": len(data)}
 
 
 # ---- step 6-8: filter -> cited compose -> grounding -> approval -------------
@@ -354,16 +400,35 @@ async def compose_report(ctx, job):
         raise RuntimeError(f"case for CIF {p['cif']} disappeared")
     case = loaded["case"]
 
-    filtered = filter_to_schema(case["extractions"], case.get("reportSchema"))
+    # Provenance merge: chunk parts per document, conflicts FLAGGED not
+    # silently last-wins - a conflicting figure is information for the
+    # reviewer, never a coin flip.
+    from rya.documents import merge_extractions
+    by_doc: dict = {}
+    for key, data in case["extractions"].items():
+        doc_type = key.split("#part")[0]
+        pages = (data or {}).pop("_pages", "?") if isinstance(data, dict) else "?"
+        by_doc.setdefault(doc_type, []).append({"data": data, "source": pages})
+    merged, all_conflicts = {}, []
+    for doc_type, parts in by_doc.items():
+        m = merge_extractions(parts)
+        merged[doc_type] = {k: v["value"] for k, v in m["fields"].items()}
+        for c in m["conflicts"]:
+            all_conflicts.append({"docType": doc_type, **c})
+
+    filtered = filter_to_schema(merged, case.get("reportSchema"))
 
     res = await ctx.llm.respond(
         route="compose",
         system="Write the final credit renewal report following the reference report's "
                "sections. Cite every figure inline as [source: <docType>.<field>] - "
                "step 7 of the pipeline. Use ONLY the provided data; if a required field "
-               "is missing, write 'not available' rather than estimating.",
+               "is missing, write 'not available' rather than estimating. If any "
+               "conflicts are provided, add a 'DATA CONFLICTS - REVIEW REQUIRED' section "
+               "listing each conflicting field with both values and their page sources. NEVER compute derived figures (differences, sums, percentages) - state only values verbatim from the provided data.",
         input={"customer": loaded.get("archive"), "renewal": loaded.get("renewal"),
-               "reportSchema": case.get("reportSchema"), "data": filtered},
+               "reportSchema": case.get("reportSchema"), "data": filtered,
+               "conflicts": all_conflicts or "none"},
     )
     report = res.text
 
@@ -379,7 +444,8 @@ async def compose_report(ctx, job):
         body=report[:2000],
         action={"tool": "la.update_record",
                 "input": {"cif": p["cif"], "caseId": p["caseId"], "report": report,
-                          "summary": {"documents": sorted(case["extractions"]),
+                          "summary": {"conflicts": all_conflicts,
+                                      "documents": sorted(case["extractions"]),
                                       "filteredFields": {k: sorted(v) if isinstance(v, dict) else []
                                                          for k, v in filtered.items()}}}},
     )

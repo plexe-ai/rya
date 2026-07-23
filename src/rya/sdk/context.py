@@ -1081,6 +1081,18 @@ class _Files:
             raise RyaError("E_NOT_FOUND", f"file '{file_id}' has no stored content.")
         return data
 
+    async def save(self, name: str, content: bytes, content_type: Optional[str] = None,
+                   tags: Optional[dict] = None) -> dict:
+        """Persist a derived artifact (e.g. a PDF chunk) as a durable file.
+        Journaled by metadata: on replay the original file id is returned and
+        bytes are NOT re-written."""
+        def run():
+            return self._ctx.store.save_file(name, content, content_type=content_type,
+                                             tags=tags or {})
+
+        return self._ctx._step("file.save", name, run,
+                               {"size": len(content), "tags": tags})
+
     async def as_document(self, file_id: str) -> dict:
         """Shape a stored file for ``ctx.llm.respond(documents=[...])``."""
         meta = await self.get(file_id)

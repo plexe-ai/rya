@@ -16,7 +16,9 @@ the default VPC, creates or updates the CloudFormation stack (secrets and
 network are preserved on updates), translates stack failures into the actual
 root cause (ECS stopped-task reasons included), and polls `/healthz` until
 the ALB answers. State lands in `.rya/deploy.json`, so the second run is an
-update. Flags: `--region`, `--stack`, `--count`, `--no-ha`, `--skip-build`.
+update. Flags: `--region`, `--stack`, `--count`, `--no-ha`, `--skip-build`,
+`--langfuse` (provisions in-VPC Langfuse and wires trace/eval export to it -
+see `docs/langfuse.md` in the rya repo).
 
 First run on a fresh account: ~15 minutes, most of it RDS. Prereqs: AWS CLI
 authenticated to the target account, Docker with buildx, this repo inside the

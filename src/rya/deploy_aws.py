@@ -19,6 +19,7 @@ from .errors import RyaError
 
 STATE_FILE = ".rya/deploy.json"
 TEMPLATE = Path(__file__).parent / "deploy_assets" / "template.yaml"
+LF_TEMPLATE = Path(__file__).parent / "deploy_assets" / "langfuse.yaml"
 
 
 def _boto(service: str, region: str):
@@ -92,8 +93,15 @@ def build_and_push(root: Path, name: str, account: str, region: str, log,
                          text=True, cwd=root).stdout.strip() or "latest"
     image = f"{registry}/{repo}:{name}-{sha}"
     if skip_build:
-        log(f"skipping build; using {image}")
-        return image
+        # trust but verify: a tag for THIS commit must actually be in ECR,
+        # otherwise ECS gets an unpullable image and the update hangs.
+        try:
+            ecr.describe_images(repositoryName=repo,
+                                imageIds=[{"imageTag": f"{name}-{sha}"}])
+            log(f"skipping build; using {image}")
+            return image
+        except Exception:
+            log(f"--skip-build requested but {name}-{sha} is not in ECR; building")
     login = subprocess.run(f"aws ecr get-login-password --region {region} | "
                            f"docker login --username AWS --password-stdin {registry}",
                            shell=True, capture_output=True, text=True)
@@ -140,7 +148,8 @@ def discover_network(region: str, log, vpc_id: Optional[str] = None) -> dict:
 # ---- stack ------------------------------------------------------------------
 def deploy_stack(stack: str, region: str, image: str, net: dict, log,
                  count: int = 2, multi_az: bool = True,
-                 db_class: str = "db.t3.micro") -> dict:
+                 db_class: str = "db.t3.micro",
+                 extra_params: Optional[dict] = None) -> dict:
     cfn = _boto("cloudformation", region)
     params = {
         "VpcId": net["vpc"],
@@ -155,6 +164,7 @@ def deploy_stack(stack: str, region: str, image: str, net: dict, log,
         "RyaSecretKey": _secrets.token_hex(24),
         "RyaAdminToken": _secrets.token_hex(24),
     }
+    params.update(extra_params or {})
     exists = True
     try:
         cur = cfn.describe_stacks(StackName=stack)["Stacks"][0]
@@ -165,6 +175,10 @@ def deploy_stack(stack: str, region: str, image: str, net: dict, log,
                     "VpcId", "PublicSubnetIds", "PrivateSubnetIds"):
             if key in current:
                 params[key] = None  # use UsePreviousValue
+        # keep existing Langfuse wiring unless this run re-specifies it
+        for key in ("LangfuseHost", "LangfusePublicKey", "LangfuseSecretKey"):
+            if key in current and key not in params:
+                params[key] = None
     except Exception:
         exists = False
 
@@ -195,7 +209,15 @@ def wait_stack(cfn, stack: str, region: str, log, creating: bool) -> dict:
            "UPDATE_ROLLBACK_COMPLETE", "UPDATE_ROLLBACK_IN_PROGRESS", "DELETE_COMPLETE"}
     last = ""
     while True:
-        st = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+        try:
+            st = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+        except Exception as e:
+            if type(e).__name__ in ("EndpointConnectionError", "ConnectTimeoutError",
+                                    "ReadTimeoutError", "ConnectionClosedError"):
+                log("network blip while polling; retrying...")
+                time.sleep(15)
+                continue
+            raise
         if st != last:
             log(f"stack: {st}")
             last = st
@@ -241,6 +263,89 @@ def translate_failure(cfn, stack: str, region: str) -> str:
         return f"{fail['LogicalResourceId']}: {reason[:300]}"
     except Exception:
         return "Could not read stack events - inspect the CloudFormation console."
+
+
+
+# ---- langfuse ---------------------------------------------------------------
+_LF_SECRET_KEYS = ("PostgresPassword", "ClickhousePassword", "RedisPassword",
+                   "Salt", "EncryptionKey", "NextAuthSecret",
+                   "ProjectPublicKey", "ProjectSecretKey",
+                   "AdminEmail", "AdminPassword")
+
+
+def deploy_langfuse(stack: str, region: str, net: dict, log,
+                    prior: Optional[dict] = None, persist=None) -> dict:
+    """Create or update the in-VPC Langfuse stack; returns url + API keys.
+
+    All secrets are generated on create and recorded in deploy state; on
+    update every secret uses UsePreviousValue (the LANGFUSE_INIT_* values
+    only take effect on first boot, so rotating them via the stack would
+    desync from the database).
+    """
+    cfn = _boto("cloudformation", region)
+    prior = prior or {}
+    exists = True
+    try:
+        cfn.describe_stacks(StackName=stack)
+    except Exception:
+        exists = False
+
+    if exists:
+        if not prior.get("public_key"):
+            raise RyaError(
+                "E_VALIDATION",
+                f"Langfuse stack {stack} exists but .rya/deploy.json has no keys.",
+                hint="Copy the project API keys from the Langfuse UI into the "
+                     "langfuse section of .rya/deploy.json, then rerun.")
+        cf_params = ([{"ParameterKey": k, "UsePreviousValue": True}
+                      for k in _LF_SECRET_KEYS]
+                     + [{"ParameterKey": k, "UsePreviousValue": True}
+                        for k in ("VpcId", "SubnetIds", "TaskCpu", "TaskMemory")])
+        info = dict(prior)
+        try:
+            log(f"updating langfuse stack {stack}...")
+            cfn.update_stack(StackName=stack, TemplateBody=LF_TEMPLATE.read_text(),
+                             Parameters=cf_params, Capabilities=["CAPABILITY_IAM"])
+        except Exception as e:
+            if "No updates are to be performed" in str(e):
+                log("langfuse stack already up to date")
+                info["url"] = _outputs(cfn, stack).get("LangfuseUrl", info.get("url"))
+                return info
+            raise RyaError("E_RUNTIME", f"Langfuse stack update rejected: {str(e)[:200]}")
+        out = wait_stack(cfn, stack, region, log, creating=False)
+        info["url"] = out.get("LangfuseUrl", info.get("url"))
+        return info
+
+    info = {
+        "public_key": f"pk-lf-{_secrets.token_hex(12)}",
+        "secret_key": f"sk-lf-{_secrets.token_hex(24)}",
+        "admin_email": "admin@rya.local",
+        "admin_password": _secrets.token_hex(12),
+    }
+    values = {
+        "VpcId": net["vpc"],
+        "SubnetIds": ",".join(net["subnets"]),
+        "PostgresPassword": _secrets.token_hex(16),
+        "ClickhousePassword": _secrets.token_hex(16),
+        "RedisPassword": _secrets.token_hex(16),
+        "Salt": _secrets.token_hex(16),
+        "EncryptionKey": _secrets.token_hex(32),
+        "NextAuthSecret": _secrets.token_hex(24),
+        "ProjectPublicKey": info["public_key"],
+        "ProjectSecretKey": info["secret_key"],
+        "AdminEmail": info["admin_email"],
+        "AdminPassword": info["admin_password"],
+    }
+    if persist:
+        persist(dict(info, stack=stack))  # before create: a crash mid-wait must not lose the keys
+    log(f"creating langfuse stack {stack} (~7 min)...")
+    cfn.create_stack(StackName=stack, TemplateBody=LF_TEMPLATE.read_text(),
+                     Parameters=[{"ParameterKey": k, "ParameterValue": v}
+                                 for k, v in values.items()],
+                     Capabilities=["CAPABILITY_IAM"])
+    out = wait_stack(cfn, stack, region, log, creating=True)
+    info["url"] = out["LangfuseUrl"]
+    return info
 
 
 # ---- smoke ------------------------------------------------------------------

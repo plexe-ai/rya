@@ -52,7 +52,20 @@ Parameters:
     NoEcho: true
     Description: Admin token gating self-serve project provisioning (RYA_ADMIN_TOKEN).
 
+  LangfuseHost:
+    Type: String
+    Default: ""
+    Description: In-VPC Langfuse URL; empty disables trace export.
+  LangfusePublicKey:
+    Type: String
+    Default: ""
+  LangfuseSecretKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+
 Conditions:
+  LangfuseEnabled: !Not [!Equals [!Ref LangfuseHost, ""]]
   UseAnthropicKey: !Equals [!Ref AnthropicKeyEnabled, "true"]
   UseMultiAZ: !Equals [!Ref DBMultiAZ, "true"]
 
@@ -266,6 +279,18 @@ Resources:
               Value: !Ref FilesBucket
             - Name: RYA_JWKS_URL
               Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/jwks.json"
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_HOST, Value: !Ref LangfuseHost }
+              - !Ref "AWS::NoValue"
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_PUBLIC_KEY, Value: !Ref LangfusePublicKey }
+              - !Ref "AWS::NoValue"
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_SECRET_KEY, Value: !Ref LangfuseSecretKey }
+              - !Ref "AWS::NoValue"
             - Name: RYA_DATABASE_URL
               Value: !Sub
                 - "postgresql://${DBUsername}:${pw}@${Endpoint}:5432/rya"

@@ -278,6 +278,7 @@ def deploy(action: Optional[str] = typer.Argument(None, help="aws | status | des
            count: int = typer.Option(2, "--count", help="Fargate task count."),
            ha: bool = typer.Option(True, "--ha/--no-ha", help="Multi-AZ RDS."),
            skip_build: bool = typer.Option(False, "--skip-build", help="Reuse the last pushed image tag."),
+           langfuse: bool = typer.Option(False, "--langfuse", help="Provision in-VPC Langfuse and wire trace export."),
            yes: bool = typer.Option(False, "--yes", help="Skip the destroy confirmation."),
            check: bool = typer.Option(False, "--check", help="Only run the production-readiness check, then exit."),
            force: bool = typer.Option(False, "--force", help="Deploy even if readiness blocks remain."),
@@ -292,7 +293,7 @@ def deploy(action: Optional[str] = typer.Argument(None, help="aws | status | des
     """
     with guard(json):
         if action in ("aws", "status", "destroy"):
-            return _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json)
+            return _deploy_aws_action(action, region, stack, count, ha, skip_build, langfuse, yes, json)
         if action is not None:
             raise RyaError("E_VALIDATION", f"Unknown deploy action '{action}'.",
                            hint="Use: rya deploy aws | status | destroy")
@@ -346,7 +347,7 @@ def deploy(action: Optional[str] = typer.Argument(None, help="aws | status | des
 
 
 
-def _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json_mode):
+def _deploy_aws_action(action, region, stack, count, ha, skip_build, langfuse, yes, json_mode):
     from .. import deploy_aws as dx
     root, manifest = _project()
     stack = stack or f"{manifest.name}-live"
@@ -363,8 +364,13 @@ def _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json_m
         return
 
     if action == "destroy":
-        if not yes and not typer.confirm(f"Delete stack {stack} and ALL its data?"):
+        state = dx.load_state(root) or {}
+        lf_stack = (state.get("langfuse") or {}).get("stack")
+        what = f"stacks {stack} + {lf_stack}" if lf_stack else f"stack {stack}"
+        if not yes and not typer.confirm(f"Delete {what} and ALL their data?"):
             raise typer.Exit(0)
+        if lf_stack:
+            dx.destroy(lf_stack, region, log)
         dx.destroy(stack, region, log)
         (root / dx.STATE_FILE).unlink(missing_ok=True)
         emit(json_mode, {"destroyed": stack},
@@ -377,16 +383,35 @@ def _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json_m
     image = dx.build_and_push(root, manifest.name, pf["account"], region, log,
                               skip_build=skip_build)
     net = dx.discover_network(region, log)
-    outputs = dx.deploy_stack(stack, region, image, net, log, count=count, multi_az=ha)
+    prior = dx.load_state(root) or {}
+    lf_info = None
+    extra = None
+    if langfuse or prior.get("langfuse"):
+        lf_stack = (prior.get("langfuse") or {}).get("stack") or f"{stack}-langfuse"
+        lf_info = dx.deploy_langfuse(lf_stack, region, net, log,
+                                     prior=prior.get("langfuse"),
+                                     persist=lambda inf: dx.save_state(root, dict(prior, langfuse=inf)))
+        lf_info["stack"] = lf_stack
+        if langfuse:  # (re)wire the app stack to it explicitly
+            extra = {"LangfuseHost": lf_info["url"],
+                     "LangfusePublicKey": lf_info["public_key"],
+                     "LangfuseSecretKey": lf_info["secret_key"]}
+    outputs = dx.deploy_stack(stack, region, image, net, log, count=count, multi_az=ha,
+                              extra_params=extra)
     url = outputs.get("AlbUrl", "")
     if url:
         dx.smoke(url, log)
     state = {"stack": stack, "region": region, "url": url, "image": image}
+    if lf_info:
+        state["langfuse"] = lf_info
     dx.save_state(root, state)
     emit(json_mode, state, lambda: (
         console.print(f"\n[green]LIVE[/green] {url}"),
         console.print(f"  app:     {url}/app/"),
         console.print(f"  console: {url}/console"),
+        console.print(f"  langfuse: {state['langfuse']['url']} "
+                      f"(login {state['langfuse']['admin_email']}, "
+                      f"password in .rya/deploy.json)") if lf_info else None,
         console.print("  first user: open the app and sign up - the first account owns the workspace"),
         console.print("  [dim]note: HTTP - front with CloudFront+ACM before real users[/dim]")))
 

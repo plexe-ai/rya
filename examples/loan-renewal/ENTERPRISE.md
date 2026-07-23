@@ -40,7 +40,10 @@ ordered. Each item is scoped and independent.
       build+push, VPC discovery, create/update stack with secret+network
       preservation, root-cause failure translation, healthz smoke; plus
       `deploy status` / `deploy destroy`). Verified against loan-renewal-live.
-- [ ] Langfuse in the VPC (traces + eval scores for prod runs). ~0.5d
+- [x] Langfuse in the VPC: `rya deploy aws --langfuse` provisions the
+      {stack}-langfuse Fargate stack (web+worker+postgres+clickhouse+redis,
+      EFS + S3 via task role) and wires LANGFUSE_* into the app tasks.
+      Verified live: 8 eval traces + 28 scores in the in-VPC instance.
 - [ ] DR runbook: RDS restore drill, region-loss stance, key rotation. ~1d
 - [ ] Real bank integration: archive/LA tools -> `url:` HTTP tools against
       their systems, scoped credentials from connections. Sized with the bank.

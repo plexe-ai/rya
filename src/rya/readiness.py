@@ -60,6 +60,24 @@ def check_readiness(manifest, store, agent, project_root) -> dict:
                 block("E_SECRET_UNSET", f"Secret '{secret}' (required by '{t.id}') is not set.",
                       f"rya secrets set {secret}=…", secret=secret, tool=t.id)
 
+    # --- blocks: no per-user credential stored in plaintext at rest -----
+    # A tool that resolves a per-user connection (provider + require_user) must not
+    # have that connection sitting unencrypted on disk — a stolen store would leak
+    # the bearer. seal() silently degrades to plaintext when no key material is
+    # present; catch that here so a real deploy fails closed. list_connections()
+    # exposes `encrypted` (is_sealed) per row, secret stripped.
+    guarded_providers = {t.provider for t in manifest.tools
+                         if getattr(t, "provider", None) and getattr(t, "require_user", False)}
+    if guarded_providers and hasattr(store, "list_connections"):
+        for c in store.list_connections():
+            if (c.get("provider") in guarded_providers and c.get("secretSet")
+                    and not c.get("encrypted")):
+                block("E_PLAINTEXT_SECRET_AT_REST",
+                      f"Connection '{c.get('id')}' for provider '{c.get('provider')}' is stored "
+                      "in plaintext (not encrypted at rest).",
+                      "Set RYA_SECRET_KEY (or install `cryptography`) and run `rya connect --reseal` "
+                      "so the credential is sealed.", connection=c.get("id"), provider=c.get("provider"))
+
     # --- warnings: hardening advice -------------------------------------
     if resolve_provider(manifest.model.provider) == "mock":
         warn("W_LLM_MOCK", "The model provider resolves to the mock LLM.",

@@ -636,6 +636,44 @@ class PostgresStore:
             )
         return self._public_connection(conn)
 
+    def upsert_connection(self, provider: str, scopes: List[str], secret: Optional[str] = None,
+                          owner: Optional[str] = None, label: Optional[str] = None) -> dict:
+        """Overwrite-in-place the active connection for (provider, owner), or create
+        one. Keyed on (provider, owner) — NOT the random id — so a re-login refreshes
+        the same row instead of minting duplicates that could later inject a stale
+        token. Preserves the existing id/createdAt when overwriting; stamps updatedAt."""
+        from .seal import seal
+        owner = owner or self.user_id
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, data FROM rya_connections
+                   WHERE workspace_id=%s AND provider=%s AND status='active'
+                     AND owner IS NOT DISTINCT FROM %s
+                   ORDER BY (data->>'createdAt') ASC LIMIT 1 FOR UPDATE""",
+                (self._ws, provider, owner),
+            )
+            row = cur.fetchone()
+            conn = {
+                "id": row[0] if row else _new_id("conn"),
+                "provider": provider, "owner": owner,
+                "scopes": list(scopes or []), "label": label or provider,
+                "secret": seal(secret, None), "status": "active",
+                "createdAt": (row[1].get("createdAt") if row else now_iso()) or now_iso(),
+                "updatedAt": now_iso(),
+            }
+            if row:
+                cur.execute(
+                    "UPDATE rya_connections SET owner=%s, status='active', data=%s WHERE id=%s",
+                    (owner, Json(conn), conn["id"]),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO rya_connections (id, workspace_id, owner, provider, status, data)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (conn["id"], self._ws, owner, provider, "active", Json(conn)),
+                )
+        return self._public_connection(conn)
+
     def get_connection(self, provider: str, owner: Optional[str] = None) -> Optional[dict]:
         from .seal import unseal
         with self._conn.cursor() as cur:

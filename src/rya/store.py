@@ -448,6 +448,33 @@ class FileStore:
         self._write(self.connections_dir / f"{conn['id']}.json", conn)
         return self._public_connection(conn)
 
+    def upsert_connection(self, provider: str, scopes: List[str], secret: Optional[str] = None,
+                          owner: Optional[str] = None, label: Optional[str] = None) -> dict:
+        """Overwrite-in-place the active connection for (provider, owner), or create
+        one if none exists. Keyed on (provider, owner) — NOT the random id — so a
+        counsellor re-logging in refreshes the same doc instead of minting duplicates
+        (which would let get_connection later inject a stale token). Preserves the
+        existing id/createdAt when overwriting; stamps updatedAt."""
+        from .seal import seal
+        existing_path = None
+        for p in self.connections_dir.glob("conn_*.json"):
+            doc = self._read(p)
+            if (doc and doc.get("provider") == provider and doc.get("owner") == owner
+                    and doc.get("status") == "active"):
+                existing_path = p
+                existing = doc
+                break
+        conn = {
+            "id": existing["id"] if existing_path else _new_id("conn"),
+            "provider": provider, "owner": owner,
+            "scopes": list(scopes or []), "label": label or provider,
+            "secret": seal(secret, self.root), "status": "active",
+            "createdAt": existing["createdAt"] if existing_path else now_iso(),
+            "updatedAt": now_iso(),
+        }
+        self._write(self.connections_dir / f"{conn['id']}.json", conn)
+        return self._public_connection(conn)
+
     def get_connection(self, provider: str, owner: Optional[str] = None) -> Optional[dict]:
         """Resolve the connection for (provider, owner). A user-owned connection
         wins over a workspace-shared one (owner IS NULL); returns it WITH the

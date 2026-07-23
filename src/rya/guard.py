@@ -228,3 +228,84 @@ def grounding_check(text: str, tool_outputs: list) -> dict:
         grounded |= _all_numbers(out)
     violations = [f for f in figures if f not in grounded]
     return {"ok": not violations, "figures": figures, "violations": violations}
+
+
+# ---- id-secrecy scrub -------------------------------------------------------
+# Some tool outputs carry ids that must never reach the model or land in an
+# outbound message (e.g. Crizac's internal alphanumeric "master id", which the
+# model must never confuse with a numeric CAMS id). Unlike grounding — a check
+# that BLOCKS — secrecy SCRUBS: it rewrites the offending substrings to a safe
+# token and lets the result through, so the model keeps working with a redacted
+# value instead of failing the turn. This is the runtime form of production's
+# scrubMasterIds(), applied at the tool boundary (before the model sees a
+# result) and on outbound (before bytes leave). Opt in via `secrecy.enabled` in
+# rya.guard.yaml; also callable as ctx.guard.check_secrecy(text).
+
+# A compile cache keyed by object id of the (mtime-cached) policy dict, so the
+# per-request scrub never recompiles the same patterns.
+_secrecy_cache: dict = {}
+
+
+def _compile_secrecy(policy: Optional[dict]) -> list:
+    """Compile the secrecy patterns once. Returns ``[(regex, replacement, id)]``
+    or ``[]`` when disabled/absent (so the scrub is a pure no-op)."""
+    sec = (policy or {}).get("secrecy") or {}
+    if not sec.get("enabled"):
+        return []
+    cache_key = id(sec)
+    cached = _secrecy_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    out = []
+    for p in sec.get("patterns", []) or []:
+        if p.get("kind", "regex") != "regex":
+            continue
+        try:
+            rx = re.compile(p["pattern"])
+        except (re.error, KeyError, TypeError):
+            # A malformed pattern is skipped, not fatal — a broken secrecy rule
+            # must not take down every tool call. (deploy --check flags it.)
+            continue
+        out.append((rx, p.get("replacement", "(hidden)"), p.get("id", "secrecy")))
+    _secrecy_cache[cache_key] = out
+    return out
+
+
+def secrecy_scrub_text(text: str, compiled: list) -> tuple:
+    """Apply every compiled pattern to one string. Returns ``(scrubbed, hits)``
+    where hits is the list of pattern ids that matched."""
+    if not text or not compiled:
+        return text, []
+    hits: list = []
+    out = text
+    for rx, repl, pid in compiled:
+        def _sub(_m, _pid=pid):
+            hits.append(_pid)
+            return repl
+        out = rx.sub(_sub, out)
+    return out, hits
+
+
+def secrecy_scrub(obj, compiled: list):
+    """Recursively scrub every string LEAF of a tool result (dict/list/str/other).
+
+    Scrubs values only, never dict keys (field names are structure, not payload),
+    and returns non-string leaves untouched. Operating on the parsed object — not a
+    serialized JSON blob — keeps the replacement token from ever corrupting JSON."""
+    if not compiled:
+        return obj
+    if isinstance(obj, str):
+        return secrecy_scrub_text(obj, compiled)[0]
+    if isinstance(obj, dict):
+        return {k: secrecy_scrub(v, compiled) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [secrecy_scrub(v, compiled) for v in obj]
+    return obj
+
+
+def secrecy_check(text: str, policy: Optional[dict]) -> dict:
+    """Report whether any secret pattern appears in ``text`` (no mutation of the
+    caller's value beyond the returned ``scrubbed``). Returns ``{ok, hits, scrubbed}``."""
+    compiled = _compile_secrecy(policy)
+    scrubbed, hits = secrecy_scrub_text(text or "", compiled)
+    return {"ok": not hits, "hits": sorted(set(hits)), "scrubbed": scrubbed}

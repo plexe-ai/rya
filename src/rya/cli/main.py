@@ -332,6 +332,29 @@ def deploy(target: str = typer.Option("check", "--target", help="check | docker 
         emit(json, out, render)
 
 
+@app.command(name="doctor")
+def doctor_cmd(json: bool = typer.Option(False, "--json")):
+    """Static durable-execution checks: flags raw IO inside replayed handlers."""
+    with guard(json):
+        from ..doctor import lint_replay
+        root, manifest = _project()
+        findings = lint_replay(root / manifest.entrypoint)
+        rep = {"ok": not findings, "findings": findings}
+
+        def render():
+            if not findings:
+                console.print("[green]OK[/green] no replay-discipline issues found in handlers.")
+                return
+            console.print(f"[yellow]{len(findings)} replay-discipline issue(s):[/yellow]")
+            for f in findings:
+                console.print(f"  [red]line {f['line']}[/red] in [bold]{f['handler']}[/bold]: "
+                              f"{f['call']} - {f['hint']}")
+
+        emit(json, rep, render)
+        if findings:
+            raise typer.Exit(6)
+
+
 @app.command(name="eval")
 def eval_cmd(
     id: Optional[str] = typer.Option(None, "--id", help="Run only this eval case."),

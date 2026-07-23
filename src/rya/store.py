@@ -18,6 +18,7 @@ Layout::
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,9 +201,16 @@ class FileStore:
         self._write(self.jobs_dir / f"{group['id']}.json", group)
         return group
 
+    _group_lock = threading.Lock()  # file backend: serialize the decrement
+
     def group_job_done(self, group_id: str, success: bool = True) -> Optional[dict]:
-        """Decrement on success; mark failed on terminal failure. File backend
-        is single-process dev - Postgres is the concurrency-safe one."""
+        """Decrement on success; mark failed on terminal failure. Thread-safe
+        within a process via the lock; Postgres is the multi-process-safe one."""
+      # noqa
+        with FileStore._group_lock:
+            return self._group_job_done_locked(group_id, success)
+
+    def _group_job_done_locked(self, group_id: str, success: bool = True) -> Optional[dict]:
         path = self.jobs_dir / f"{group_id}.json"
         group = self._read(path)
         if group is None:

@@ -235,17 +235,62 @@ class Engine:
         now = now_iso()
         return [j for j in self.store.list_jobs("pending") if (j.get("runAt") or "") <= now]
 
-    def work_once(self) -> list:
+    def _clone(self) -> "Engine":
+        """A sibling engine on a FRESH store connection - required for running
+        jobs in threads (a psycopg connection must not be shared across them)."""
+        st = self.store
+        if hasattr(st, "dsn"):
+            from ..store_postgres import PostgresStore
+            new_store = PostgresStore(st.dsn, st.workspace_id, getattr(st, "user_id", None))
+        else:
+            new_store = type(st)(st.root)
+            new_store.ensure()
+        return Engine(self.manifest, self.agent, new_store, self.project_root,
+                      self.tools, self.models)
+
+    def work_once(self, concurrency: int = 1) -> list:
         """Claim and run every currently-due job. Safe to run from N workers
-        concurrently — claim_due_job is atomic (Postgres SKIP LOCKED)."""
-        ran = []
-        while True:
-            job = self.store.claim_due_job()
-            if not job:
-                break
-            result = self.run_job(job["id"])
-            ran.append({"jobId": job["id"], "runId": result["id"], "status": result["status"]})
-        return ran
+        concurrently — claim_due_job is atomic (Postgres SKIP LOCKED).
+
+        ``concurrency`` > 1 runs jobs in parallel threads, each on a cloned
+        engine with its own store connection; claims are serialized under a
+        lock so the file backend stays correct too."""
+        if concurrency <= 1:
+            ran = []
+            while True:
+                job = self.store.claim_due_job()
+                if not job:
+                    break
+                result = self.run_job(job["id"])
+                ran.append({"jobId": job["id"], "runId": result["id"], "status": result["status"]})
+            return ran
+
+        results: list = []
+        claim_lock = threading.Lock()
+        res_lock = threading.Lock()
+
+        def loop():
+            eng = self._clone()
+            try:
+                while True:
+                    with claim_lock:
+                        job = eng.store.claim_due_job()
+                    if not job:
+                        return
+                    result = eng.run_job(job["id"])
+                    with res_lock:
+                        results.append({"jobId": job["id"], "runId": result["id"],
+                                        "status": result["status"]})
+            finally:
+                if hasattr(eng.store, "close"):
+                    eng.store.close()
+
+        threads = [threading.Thread(target=loop) for _ in range(concurrency)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        return results
 
     def dead_letter(self) -> list:
         """Jobs that exhausted their retries (the dead-letter queue)."""

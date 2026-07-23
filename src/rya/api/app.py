@@ -296,18 +296,20 @@ def build_app(root: Path) -> FastAPI:
     # nothing running them (only `rya jobs run --due`). This loop makes served
     # agents complete their pipelines: every RYA_JOBS_WORKER_SECONDS (default 3;
     # 0 disables) it claims + runs every due job.
+    _jobs_conc = max(1, int(os.environ.get("RYA_JOBS_CONCURRENCY", "4") or 1))
+
     def _work_once() -> int:
         total = 0
         if mt:
             for ws in tenancy.list_workspaces():
                 eng = engine_for(ws["id"])
                 try:
-                    total += len(eng.work_once())
+                    total += len(eng.work_once(concurrency=_jobs_conc))
                 finally:
                     if hasattr(eng.store, "close"):
                         eng.store.close()
         else:
-            total += len(base_engine.work_once())
+            total += len(base_engine.work_once(concurrency=_jobs_conc))
         return total
 
     async def _jobs_loop(interval: float):

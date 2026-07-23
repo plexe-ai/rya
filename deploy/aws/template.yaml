@@ -9,6 +9,11 @@ Description: >
   radius. Deploy: `sam build && sam deploy --guided`.
 
 Parameters:
+  DBMultiAZ:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Multi-AZ RDS for production availability.
   AnthropicKeyEnabled:
     Type: String
     Default: "false"
@@ -49,6 +54,7 @@ Parameters:
 
 Conditions:
   UseAnthropicKey: !Equals [!Ref AnthropicKeyEnabled, "true"]
+  UseMultiAZ: !Equals [!Ref DBMultiAZ, "true"]
 
 Resources:
 
@@ -148,7 +154,7 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups: [!Ref DBSecurityGroup]
       StorageEncrypted: true
-      MultiAZ: false
+      MultiAZ: !If [UseMultiAZ, true, false]
       PubliclyAccessible: false
 
   # ---- Runtime (ECS Fargate behind an ALB) -------------------------------
@@ -371,6 +377,36 @@ Resources:
               issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
               audience: [!Ref UserPoolClient]
         DefaultAuthorizer: CognitoJwt
+
+  ServiceTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Running task count below desired - service degraded.
+      Namespace: AWS/ECS
+      MetricName: RunningTaskCount
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref Cluster }
+        - { Name: ServiceName, Value: !GetAtt Service.Name }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  DBCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU sustained high.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
 
 Outputs:
   AlbUrl:

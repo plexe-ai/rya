@@ -831,10 +831,23 @@ async function uploadSample(key){
   await postDoc(key, `${key}.pdf`, pdf, 'application/pdf');
 }
 async function postDoc(key, filename, buf, ctype){
-  const q = `name=${encodeURIComponent(filename)}&tag.cif=${state.cif}&tag.docType=${key}`;
-  const r = await apiFetch(`/files?${q}`, {method:'POST',
-    headers:{'content-type': ctype}, body: buf});
-  const body = await r.json();
+  let body;
+  if(buf.byteLength > 4 * 1024 * 1024){
+    // large document: presigned direct-to-S3 upload, bytes bypass the API
+    const pre = await (await apiFetch('/files/presign', {method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({name: filename, contentType: ctype,
+                            tags: {cif: state.cif, docType: key}})})).json();
+    await fetch(pre.uploadUrl, {method:'PUT', headers:{'content-type': ctype}, body: buf});
+    body = await (await apiFetch(`/files/${pre.fileId}/confirm`, {method:'POST'})).json();
+    body.file = {size: buf.byteLength};
+    body.runId = body.runId;
+  }else{
+    const q = `name=${encodeURIComponent(filename)}&tag.cif=${state.cif}&tag.docType=${key}`;
+    const r = await apiFetch(`/files?${q}`, {method:'POST',
+      headers:{'content-type': ctype}, body: buf});
+    body = await r.json();
+  }
   state.uploaded[key] = true; state.filenames[key] = filename;
   state.sizes[key] = (body.file || {}).size; renderDocs();
   const run = await (await apiFetch(`/runs/${body.runId}`)).json();

@@ -269,6 +269,27 @@ async def main(ctx, event):
 async def extract_document(ctx, job):
     p = job.payload
     doc = await ctx.files.as_document(p["fileId"])
+    # Enterprise-size documents: the Converse API caps a document block at
+    # ~4.5MB. Past ~3.5MB we split the PDF into page-range chunks and run one
+    # journaled model call per chunk, merging the JSON - big docs become more
+    # calls, not a failure. Falls back to single-call if pypdf is absent.
+    chunks = [doc]
+    if doc["format"] == "pdf" and len(doc["bytes"]) > 3_500_000:
+        try:
+            import io
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(io.BytesIO(doc["bytes"]))
+            step = max(1, len(reader.pages) // -(-len(doc["bytes"]) // 3_000_000))
+            chunks = []
+            for start in range(0, len(reader.pages), step):
+                w = PdfWriter()
+                for pg in reader.pages[start:start + step]:
+                    w.add_page(pg)
+                buf = io.BytesIO(); w.write(buf)
+                chunks.append({"name": f"{doc['name']} (p{start + 1}-)",
+                               "format": "pdf", "bytes": buf.getvalue()})
+        except ImportError:
+            ctx.logs.warning("pypdf not installed - sending oversized PDF whole")
 
     if p["docType"] == "reference_report":
         # Step 5: the reference report defines the FORMAT and FIELDS of the
@@ -285,14 +306,16 @@ async def extract_document(ctx, job):
         data = res.json
     else:
         prompt = EXTRACTION_PROMPTS.get(p["docType"], "Extract all financially material data.")
-        res = await ctx.llm.respond(
-            route="extract",
-            system=prompt + " Respond as a flat JSON object. Use numbers for amounts "
-                            "(no currency symbols). Use null for anything not present.",
-            input={"docType": p["docType"]}, documents=[doc],
-            schema={"type": "object"},
-        )
-        data = res.json
+        data = {}
+        for chunk in chunks:  # one journaled model call per chunk; dicts merge
+            res = await ctx.llm.respond(
+                route="extract",
+                system=prompt + " Respond as a flat JSON object. Use numbers for amounts "
+                                "(no currency symbols). Use null for anything not present.",
+                input={"docType": p["docType"], "part": chunk["name"]}, documents=[chunk],
+                schema={"type": "object"},
+            )
+            data.update({k: v for k, v in res.json.items() if v is not None})
 
     saved = await ctx.tools.call("case.save_extraction",
                                  {"caseId": p["caseId"], "docType": p["docType"], "data": data})

@@ -10,7 +10,7 @@ COPY src ./src
 RUN pip install --no-cache-dir '.[api,postgres,llm,mcp]'
 # Bedrock provider (IAM-signed model calls) - separate layer to keep the big
 # install cached.
-RUN pip install --no-cache-dir '.[bedrock]'
+RUN pip install --no-cache-dir '.[bedrock]' pypdf
 
 ARG PROJECT
 COPY ${PROJECT} /project

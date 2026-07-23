@@ -36,8 +36,10 @@ ordered. Each item is scoped and independent.
       connections) + dashboard. ~0.5d
 
 ## P2 - operations
-- [ ] `rya deploy aws` one-command deploy (spec: the manual run of
-      2026-07-23; build+push+discover+stack+translate-errors+bootstrap). ~2d
+- [x] `rya deploy aws` one-command deploy (preflight incl. live Bedrock probe,
+      build+push, VPC discovery, create/update stack with secret+network
+      preservation, root-cause failure translation, healthz smoke; plus
+      `deploy status` / `deploy destroy`). Verified against loan-renewal-live.
 - [ ] Langfuse in the VPC (traces + eval scores for prod runs). ~0.5d
 - [ ] DR runbook: RDS restore drill, region-loss stance, key rotation. ~1d
 - [ ] Real bank integration: archive/LA tools -> `url:` HTTP tools against

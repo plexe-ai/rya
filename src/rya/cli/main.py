@@ -271,7 +271,14 @@ def dev(json: bool = typer.Option(False, "--json")):
 
 
 @app.command()
-def deploy(target: str = typer.Option("check", "--target", help="check | docker | fly | render"),
+def deploy(action: Optional[str] = typer.Argument(None, help="aws | status | destroy (omit for readiness/artifacts)"),
+           target: str = typer.Option("check", "--target", help="check | docker | fly | render"),
+           region: str = typer.Option("us-east-1", "--region"),
+           stack: Optional[str] = typer.Option(None, "--stack", help="Stack name (default {agent}-live)."),
+           count: int = typer.Option(2, "--count", help="Fargate task count."),
+           ha: bool = typer.Option(True, "--ha/--no-ha", help="Multi-AZ RDS."),
+           skip_build: bool = typer.Option(False, "--skip-build", help="Reuse the last pushed image tag."),
+           yes: bool = typer.Option(False, "--yes", help="Skip the destroy confirmation."),
            check: bool = typer.Option(False, "--check", help="Only run the production-readiness check, then exit."),
            force: bool = typer.Option(False, "--force", help="Deploy even if readiness blocks remain."),
            write: bool = typer.Option(True, "--write/--no-write", help="Write deploy artifacts into the project."),
@@ -284,6 +291,11 @@ def deploy(target: str = typer.Option("check", "--target", help="check | docker 
     A plain `rya deploy` runs the check as a GATE first (override with --force).
     """
     with guard(json):
+        if action in ("aws", "status", "destroy"):
+            return _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json)
+        if action is not None:
+            raise RyaError("E_VALIDATION", f"Unknown deploy action '{action}'.",
+                           hint="Use: rya deploy aws | status | destroy")
         from ..readiness import check_readiness
         from .deploy_templates import write_artifacts, deploy_plan
         root, manifest = _project()
@@ -331,6 +343,52 @@ def deploy(target: str = typer.Option("check", "--target", help="check | docker 
             console.print(f"  deploy: [bold]{plan['command']}[/bold]")
         emit(json, out, render)
 
+
+
+
+def _deploy_aws_action(action, region, stack, count, ha, skip_build, yes, json_mode):
+    from .. import deploy_aws as dx
+    root, manifest = _project()
+    stack = stack or f"{manifest.name}-live"
+    log = (lambda m: None) if json_mode else (lambda m: console.print(f"  [dim]{m}[/dim]"))
+
+    if action == "status":
+        state = dx.load_state(root)
+        if not state:
+            emit(json_mode, {"deployed": False},
+                 lambda: console.print("[yellow]no deployment recorded[/yellow] - run `rya deploy aws`."))
+            return
+        emit(json_mode, {"deployed": True, **state},
+             lambda: console.print(f"[green]{state['stack']}[/green] ({state['region']}) - {state.get('url')}"))
+        return
+
+    if action == "destroy":
+        if not yes and not typer.confirm(f"Delete stack {stack} and ALL its data?"):
+            raise typer.Exit(0)
+        dx.destroy(stack, region, log)
+        (root / dx.STATE_FILE).unlink(missing_ok=True)
+        emit(json_mode, {"destroyed": stack},
+             lambda: console.print(f"[green]destroyed[/green] {stack}"))
+        return
+
+    # ---- rya deploy aws ----
+    console.print(f"[bold]rya deploy aws[/bold] - {manifest.name} -> {stack} ({region})")
+    pf = dx.preflight(root, manifest, region, log)
+    image = dx.build_and_push(root, manifest.name, pf["account"], region, log,
+                              skip_build=skip_build)
+    net = dx.discover_network(region, log)
+    outputs = dx.deploy_stack(stack, region, image, net, log, count=count, multi_az=ha)
+    url = outputs.get("AlbUrl", "")
+    if url:
+        dx.smoke(url, log)
+    state = {"stack": stack, "region": region, "url": url, "image": image}
+    dx.save_state(root, state)
+    emit(json_mode, state, lambda: (
+        console.print(f"\n[green]LIVE[/green] {url}"),
+        console.print(f"  app:     {url}/app/"),
+        console.print(f"  console: {url}/console"),
+        console.print("  first user: open the app and sign up - the first account owns the workspace"),
+        console.print("  [dim]note: HTTP - front with CloudFront+ACM before real users[/dim]")))
 
 @app.command(name="doctor")
 def doctor_cmd(json: bool = typer.Option(False, "--json")):

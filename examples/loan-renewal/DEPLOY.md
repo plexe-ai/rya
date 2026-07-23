@@ -1,8 +1,30 @@
 # Deploying to a fresh AWS account
 
-Total: ~45 minutes, most of it AWS provisioning time. Prereqs: AWS CLI
-authenticated to the target account, Docker with buildx, this repo + the rya
-repo cloned.
+## The one command
+
+```bash
+cd examples/loan-renewal
+rya deploy aws                 # preflight -> image -> network -> stack -> smoke
+rya deploy status              # stack + URL
+rya deploy destroy             # tear it all down (asks first)
+```
+
+`rya deploy aws` runs everything in the manual runbook below: verifies AWS
+credentials, docker buildx, and a real Bedrock model call (the expensive
+failure, caught first), builds and pushes the arm64 image to ECR, discovers
+the default VPC, creates or updates the CloudFormation stack (secrets and
+network are preserved on updates), translates stack failures into the actual
+root cause (ECS stopped-task reasons included), and polls `/healthz` until
+the ALB answers. State lands in `.rya/deploy.json`, so the second run is an
+update. Flags: `--region`, `--stack`, `--count`, `--no-ha`, `--skip-build`.
+
+First run on a fresh account: ~15 minutes, most of it RDS. Prereqs: AWS CLI
+authenticated to the target account, Docker with buildx, this repo inside the
+rya checkout, and Bedrock Anthropic model access enabled (step 0 below - the
+preflight checks it and tells you if not).
+
+The manual steps below are what the command automates - useful for
+understanding, debugging, or air-gapped variants.
 
 ## 0. Bedrock access (the one account-specific step - do it FIRST)
 Console -> Bedrock -> Model access -> enable Anthropic Claude models. The

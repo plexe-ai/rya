@@ -22,10 +22,8 @@ from rya import define_agent
 
 agent = define_agent()
 
-# Seed data ships in the repo; all writes go to a runtime copy so demo runs
-# never dirty the checked-in fixture.
+# Seed archive ships in the repo (data/bank_db.json "archive" section).
 SEED_DB = Path(__file__).resolve().parent.parent / "data" / "bank_db.json"
-BANK_DB = SEED_DB.with_name("bank_db.runtime.json")
 REQUIRED_DOCS = ["aecb", "spread", "id", "reference_report"]
 
 INTENT_SCHEMA = {
@@ -49,90 +47,135 @@ EXTRACTION_PROMPTS = {
 }
 
 
-# ---- bank-system tools (leaves over the bank DB) ----------------------------
-def _db() -> dict:
-    src = BANK_DB if BANK_DB.exists() else SEED_DB
-    return json.loads(src.read_text())
+# ---- bank-system store: real SQL (Postgres in prod, SQLite locally) --------
+# Domain data - archive customers, renewal cases, extractions, final reports -
+# lives in proper tables: RYA_DATABASE_URL (the same RDS as the runtime) when
+# present, else a local SQLite file. Durable, queryable, survives restarts.
+# Swap any tool for a `url:` HTTP tool to hit the bank's real systems instead.
+import os
+import sqlite3
+
+DB_URL = os.environ.get("RYA_DATABASE_URL") or os.environ.get("DATABASE_URL")
+SQLITE_PATH = SEED_DB.with_name("bank.sqlite3")
+_SCHEMA = [
+    "CREATE TABLE IF NOT EXISTS la_archive (cif TEXT PRIMARY KEY, data TEXT NOT NULL)",
+    """CREATE TABLE IF NOT EXISTS la_renewals (case_id TEXT PRIMARY KEY, cif TEXT NOT NULL,
+       product TEXT, status TEXT, final_report TEXT, data_summary TEXT, updated_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS la_cases (case_id TEXT PRIMARY KEY, cif TEXT NOT NULL,
+       extractions TEXT DEFAULT '{}', report_schema TEXT)""",
+]
+_ready = False
 
 
-def _save_db(db: dict) -> None:
-    BANK_DB.write_text(json.dumps(db, indent=2, default=str))
+def _connect():
+    if DB_URL:
+        import psycopg
+        return psycopg.connect(DB_URL, autocommit=True), "%s"
+    c = sqlite3.connect(SQLITE_PATH)
+    c.isolation_level = None
+    return c, "?"
+
+
+def _exec(sql, params=(), fetch=False):
+    global _ready
+    conn, ph = _connect()
+    try:
+        cur = conn.cursor()
+        if not _ready:
+            for ddl in _SCHEMA:
+                cur.execute(ddl)
+            cur.execute(f"SELECT COUNT(*) FROM la_archive")
+            if cur.fetchone()[0] == 0:  # seed the demo archive once
+                for cif, data in json.loads(SEED_DB.read_text())["archive"].items():
+                    cur.execute(f"INSERT INTO la_archive (cif, data) VALUES ({ph}, {ph})",
+                                (cif, json.dumps(data)))
+            _ready = True
+        cur.execute(sql.replace("%s", ph), params)
+        return cur.fetchall() if fetch else None
+    finally:
+        conn.close()
 
 
 @agent.tool("archive.lookup_cif")
 async def archive_lookup(input: dict) -> dict:
     cif = str(input.get("cif", "")).strip()
-    customer = _db()["archive"].get(cif)
-    return {"cif": cif, "found": customer is not None, "customer": customer}
+    rows = _exec("SELECT data FROM la_archive WHERE cif = %s", (cif,), fetch=True)
+    return {"cif": cif, "found": bool(rows),
+            "customer": json.loads(rows[0][0]) if rows else None}
 
 
 @agent.tool("la.create_file")
 async def la_create_file(input: dict) -> dict:
-    db = _db()
     cif = str(input["cif"])
-    db["la"]["files"].setdefault(cif, {"cif": cif, "customerName": input.get("customerName") or "Unknown",
-                                       "status": "new"})
-    _save_db(db)
+    data = json.dumps({"cif": cif, "customerName": input.get("customerName") or "Unknown",
+                       "status": "new"})
+    rows = _exec("SELECT 1 FROM la_archive WHERE cif = %s", (cif,), fetch=True)
+    if not rows:
+        _exec("INSERT INTO la_archive (cif, data) VALUES (%s, %s)", (cif, data))
     return {"ok": True, "fileId": f"file-{cif}"}
 
 
 @agent.tool("la.create_renewal")
 async def la_create_renewal(input: dict) -> dict:
-    db = _db()
     cif, product = str(input["cif"]), input.get("product", "LA")
     case_id = f"{product}-{cif}"
-    db["la"]["renewals"][case_id] = {"caseId": case_id, "cif": cif, "product": product,
-                                     "status": "draft"}
-    db["la"]["cases"].setdefault(case_id, {"caseId": case_id, "cif": cif, "extractions": {},
-                                           "reportSchema": None})
-    _save_db(db)
+    if not _exec("SELECT 1 FROM la_renewals WHERE case_id = %s", (case_id,), fetch=True):
+        _exec("INSERT INTO la_renewals (case_id, cif, product, status) VALUES (%s, %s, %s, 'draft')",
+              (case_id, cif, product))
+    if not _exec("SELECT 1 FROM la_cases WHERE case_id = %s", (case_id,), fetch=True):
+        _exec("INSERT INTO la_cases (case_id, cif) VALUES (%s, %s)", (case_id, cif))
     return {"ok": True, "caseId": case_id}
 
 
 @agent.tool("case.save_extraction")
 async def case_save_extraction(input: dict) -> dict:
-    db = _db()
-    case = db["la"]["cases"].get(input["caseId"])
-    if case is None:
+    rows = _exec("SELECT extractions FROM la_cases WHERE case_id = %s", (input["caseId"],), fetch=True)
+    if not rows:
         return {"ok": False, "error": f"unknown case {input['caseId']}"}
     if input.get("docType") == "reference_report":
-        case["reportSchema"] = input["data"]
+        _exec("UPDATE la_cases SET report_schema = %s WHERE case_id = %s",
+              (json.dumps(input["data"]), input["caseId"]))
     else:
-        case["extractions"][input["docType"]] = input["data"]
-    _save_db(db)
+        ext = json.loads(rows[0][0] or "{}")
+        ext[input["docType"]] = input["data"]
+        _exec("UPDATE la_cases SET extractions = %s WHERE case_id = %s",
+              (json.dumps(ext), input["caseId"]))
     return {"ok": True, "caseId": input["caseId"], "docType": input.get("docType")}
 
 
 @agent.tool("case.load")
 async def case_load(input: dict) -> dict:
-    db = _db()
     cif = str(input.get("cif", "")).strip()
-    case = next((c for c in db["la"]["cases"].values() if c["cif"] == cif), None)
-    if case is None:
+    rows = _exec("SELECT case_id, extractions, report_schema FROM la_cases WHERE cif = %s",
+                 (cif,), fetch=True)
+    if not rows:
         return {"found": False, "cif": cif}
-    renewal = db["la"]["renewals"].get(case["caseId"], {})
-    return {"found": True, "case": case, "renewal": renewal,
-            "archive": db["archive"].get(cif)}
+    case_id, ext, schema = rows[0]
+    ren = _exec("SELECT product, status FROM la_renewals WHERE case_id = %s", (case_id,), fetch=True)
+    arch = _exec("SELECT data FROM la_archive WHERE cif = %s", (cif,), fetch=True)
+    return {"found": True,
+            "case": {"caseId": case_id, "cif": cif,
+                     "extractions": json.loads(ext or "{}"),
+                     "reportSchema": json.loads(schema) if schema else None},
+            "renewal": {"caseId": case_id, "product": ren[0][0], "status": ren[0][1]} if ren else {},
+            "archive": json.loads(arch[0][0]) if arch else None}
 
 
 @agent.tool("la.update_record")
 async def la_update_record(input: dict) -> dict:
-    """Step 8 - the single gated write: final report + summary into the LA DB."""
-    db = _db()
-    case_id = input["caseId"]
-    renewal = db["la"]["renewals"].get(case_id)
-    case = db["la"]["cases"].get(case_id)
-    # Defense in the tool itself: the write must match the case's own CIF -
-    # a confused caller (or model) cannot redirect it to another customer.
-    if renewal is None or case is None:
-        return {"ok": False, "error": f"unknown case {case_id}"}
-    if str(input.get("cif")) != renewal["cif"]:
+    """Step 8 - the single gated write. Idempotent (same UPDATE, keyed by case)
+    and CIF-guarded: a confused caller cannot redirect it to another customer."""
+    rows = _exec("SELECT cif FROM la_renewals WHERE case_id = %s", (input["caseId"],), fetch=True)
+    if not rows:
+        return {"ok": False, "error": f"unknown case {input['caseId']}"}
+    if str(input.get("cif")) != rows[0][0]:
         return {"ok": False, "error": "cif does not match the case record - write refused"}
-    renewal["status"] = "submitted"
-    renewal["finalReport"] = input["report"]
-    renewal["dataSummary"] = input.get("summary") or {}
-    _save_db(db)
-    return {"ok": True, "caseId": case_id, "status": "submitted"}
+    from datetime import datetime, timezone
+    _exec("UPDATE la_renewals SET status='submitted', final_report=%s, data_summary=%s, updated_at=%s "
+          "WHERE case_id = %s",
+          (input["report"], json.dumps(input.get("summary") or {}),
+           datetime.now(timezone.utc).isoformat(), input["caseId"]))
+    return {"ok": True, "caseId": input["caseId"], "status": "submitted"}
 
 
 # ---- step 1-2: intent -> case -> document checklist -------------------------

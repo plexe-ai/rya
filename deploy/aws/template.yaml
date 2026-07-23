@@ -183,6 +183,31 @@ Resources:
                 Action: [secretsmanager:GetSecretValue]
                 Resource: [!Ref AppSecret, !Ref DBSecret]
 
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-old-documents
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 180
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 900
+
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -193,6 +218,13 @@ Resources:
             Principal: { Service: ecs-tasks.amazonaws.com }
             Action: sts:AssumeRole
       Policies:
+        - PolicyName: files-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:HeadObject]
+                Resource: !Sub "${FilesBucket.Arn}/*"
         - PolicyName: bedrock-invoke
           PolicyDocument:
             Version: "2012-10-17"
@@ -224,6 +256,8 @@ Resources:
           Environment:
             - Name: RYA_MULTITENANT
               Value: "1"
+            - Name: RYA_FILES_S3_BUCKET
+              Value: !Ref FilesBucket
             - Name: RYA_JWKS_URL
               Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/jwks.json"
             - Name: RYA_DATABASE_URL

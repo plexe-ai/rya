@@ -122,8 +122,14 @@ class FileStore:
                 "contentType": content_type or "application/octet-stream",
                 "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
                 "tags": tags or {}, "createdAt": now_iso()}
+        from . import files_s3
         self.files_dir.mkdir(parents=True, exist_ok=True)
-        (self.files_dir / meta["id"]).write_bytes(content)
+        if files_s3.bucket():
+            if content:  # presigned uploads register metadata first; bytes arrive via S3 PUT
+                files_s3.put_bytes(meta["id"], content, meta["contentType"])
+            meta["storage"] = "s3"
+        else:
+            (self.files_dir / meta["id"]).write_bytes(content)
         self._write(self.files_dir / f"{meta['id']}.json", meta)
         return meta
 
@@ -131,8 +137,14 @@ class FileStore:
         return self._read(self.files_dir / f"{file_id}.json")
 
     def read_file(self, file_id: str) -> Optional[bytes]:
+        meta = self.get_file(file_id)
+        if meta is None:
+            return None
+        if meta.get("storage") == "s3":
+            from . import files_s3
+            return files_s3.get_bytes(file_id)
         p = self.files_dir / file_id
-        return p.read_bytes() if p.is_file() and self.get_file(file_id) else None
+        return p.read_bytes() if p.is_file() else None
 
     def list_files(self, tags: Optional[dict] = None) -> List[dict]:
         out = []

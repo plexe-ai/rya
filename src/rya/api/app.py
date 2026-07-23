@@ -930,6 +930,45 @@ def build_app(root: Path) -> FastAPI:
             out["runStatus"] = run["status"]
         return out
 
+    @api.post("/files/presign")
+    async def presign_file(request: Request, engine: Engine = Depends(get_engine)):
+        """Large-file path: register metadata, return a presigned S3 PUT URL.
+        The browser uploads DIRECTLY to S3, then calls /files/{id}/confirm."""
+        from .. import files_s3
+        if not files_s3.bucket():
+            raise HTTPException(status_code=409, detail={
+                "code": "E_VALIDATION",
+                "message": "Presigned uploads need RYA_FILES_S3_BUCKET."})
+        body = await request.json()
+        name = body.get("name")
+        if not name:
+            raise HTTPException(status_code=400, detail={"code": "E_VALIDATION",
+                                                         "message": "'name' is required"})
+        ctype = body.get("contentType") or "application/octet-stream"
+        meta = engine.store.save_file(name, b"", content_type=ctype,
+                                      tags={**(body.get("tags") or {}), "_storage": "s3",
+                                            "_pending": "1"})
+        return {"ok": True, "fileId": meta["id"],
+                "uploadUrl": files_s3.presign_put(meta["id"], ctype)}
+
+    @api.post("/files/{file_id}/confirm")
+    def confirm_file(file_id: str, engine: Engine = Depends(get_engine)):
+        """After a presigned PUT: verify the object landed, fire file.uploaded."""
+        from .. import files_s3
+        meta = engine.store.get_file(file_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail={"code": "E_NOT_FOUND"})
+        h = files_s3.head(file_id)
+        if h is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "E_VALIDATION", "message": "object not found in S3 - upload first"})
+        tags = {k: v for k, v in (meta.get("tags") or {}).items() if k != "_pending"}
+        run = engine.run_event("file.uploaded",
+                               {"fileId": file_id, "name": meta["name"], "tags": tags,
+                                "size": h["size"], "contentType": h.get("contentType")},
+                               source="upload")
+        return {"ok": True, "runId": run["id"], "runStatus": run["status"], "size": h["size"]}
+
     @api.get("/files")
     def list_files(engine: Engine = Depends(get_engine)):
         return {"files": engine.store.list_files()}

@@ -207,6 +207,12 @@ class PostgresStore:
                 "contentType": content_type or "application/octet-stream",
                 "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
                 "tags": tags or {}, "createdAt": now_iso()}
+        from . import files_s3
+        if files_s3.bucket():
+            if content:  # presigned uploads register metadata first; bytes arrive via S3 PUT
+                files_s3.put_bytes(meta["id"], content, meta["contentType"])
+            meta["tags"] = {**meta["tags"], "_storage": "s3"}
+            content = b""
         with self._conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO rya_files (id, workspace_id, name, content_type, size, sha256, tags, content, created_at) "
@@ -227,6 +233,10 @@ class PostgresStore:
         return self._file_meta_row(r) if r else None
 
     def read_file(self, file_id: str) -> Optional[bytes]:
+        meta = self.get_file(file_id)
+        if meta and (meta.get("tags") or {}).get("_storage") == "s3":
+            from . import files_s3
+            return files_s3.get_bytes(file_id)
         with self._conn.cursor() as cur:
             cur.execute("SELECT content FROM rya_files WHERE id=%s AND workspace_id=%s",
                         (file_id, self._ws))

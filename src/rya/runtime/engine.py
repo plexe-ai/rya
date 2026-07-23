@@ -371,7 +371,7 @@ class Engine:
             if e.code == "E_CONNECTION_EXPIRED":
                 # A distinct, non-generic outcome: the connection expired mid-turn,
                 # so the run needs the user to reconnect (log in again) and retry —
-                # not a bug. Mirrors prod's CrizacAuthError → clean reconnect prompt.
+                # not a bug: surface a clean reconnect prompt instead of a failure.
                 run["status"] = "needs_reconnect"
                 run["error"] = e.to_dict()["error"]
                 ctx._trace("run.needs_reconnect", e.code, {"message": e.message, "hint": e.hint})

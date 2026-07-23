@@ -121,9 +121,9 @@ class ToolDecl(BaseModel):
     # Adoption (A5): on a SUCCESSFUL call, copy a field of the tool's result into
     # scoped memory, so a later pinned tool in the SAME turn adopts it. Each entry
     # maps a result field to a "scope.key" memory target, e.g.
-    #   adopt: {camsId: student_state.camsId}
-    # means "write result['camsId'] to memory[student_state]['camsId'] on success".
-    # Pins that read `memory.student_state.camsId` then resolve to the adopted id.
+    #   adopt: {accountId: session_state.accountId}
+    # means "write result['accountId'] to memory[session_state]['accountId'] on success".
+    # Pins that read `memory.session_state.accountId` then resolve to the adopted id.
     adopt: dict[str, str] = Field(default_factory=dict)
     # Scoped connected credentials: if `provider` is set, the runtime resolves a
     # vaulted connection for (provider, requesting-user), enforces that the
@@ -134,7 +134,7 @@ class ToolDecl(BaseModel):
     # Fail closed on missing identity: when true, the tool refuses to run without a
     # verified user (identity.sub). Prevents falling through to a workspace-shared
     # connection when the caller's user token is absent — a per-user credential
-    # (e.g. a per-counsellor Crizac bearer) must never be silently shared.
+    # (e.g. a per-user API bearer token) must never be silently shared.
     require_user: bool = False
     # Server-side arg pinning: never trust the model (or handler input) for these
     # arguments. Each entry maps an input field to a trusted source, resolved by

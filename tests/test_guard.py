@@ -158,17 +158,16 @@ def test_no_policy_is_noop(monkeypatch, tmp_path):
 
 
 # ---- id-secrecy scrub ----------------------------------------------------
-# Ports chatstudyabroad/lib/utils.test.ts:226-263 (scrubMasterIds) so the Rya
-# primitive and the production regex stay bit-for-bit identical. This is the
-# non-negotiable Phase-1 gate: over-redaction (eating passports / numeric CAMS
-# ids / phones) is as much a regression as under-redaction (leaking a master id).
+# The secrecy scrub redacts opaque master ids at the boundary. Over-redaction
+# (eating passports / numeric account ids / phones) is as much a regression as
+# under-redaction (leaking a master id), so both directions are pinned here.
 SECRECY_POLICY = {
     "secrecy": {
         "enabled": True,
         "apply_on": ["tool_result", "outbound"],
         "action": "scrub",
         "patterns": [
-            {"id": "crizac_master_id", "kind": "regex",
+            {"id": "opaque_master_id", "kind": "regex",
              "pattern": r"\b[A-Za-z]{3,8}\d{8,}\b", "replacement": "(id hidden)"},
         ],
     }
@@ -177,12 +176,12 @@ _SECRECY = _compile_secrecy(SECRECY_POLICY)
 
 
 @pytest.mark.parametrize("raw,want", [
-    # IS scrubbed — 3-8 leading letters + 8+ digits = a Crizac master id.
+    # IS scrubbed — 3-8 leading letters + 8+ digits = an opaque master id.
     ("The master id is IjmQ1782803306 for this student.",
      "The master id is (id hidden) for this student."),
     ("YKHw1782723298 / sGog1782764730", "(id hidden) / (id hidden)"),
-    # NOT scrubbed — the production negatives (utils.test.ts:249-257).
-    ("CAMS 1472802 was created", "CAMS 1472802 was created"),          # numeric CAMS id
+    # NOT scrubbed — known safe values that must survive.
+    ("account 1472802 was created", "account 1472802 was created"),          # numeric account id
     ("passport MEGHA1234", "passport MEGHA1234"),                       # only 4 trailing digits
     ("passport Z1234567", "passport Z1234567"),                         # 1 letter + 7 digits
     ("September 2026, $33,800, 9903105259", "September 2026, $33,800, 9903105259"),  # year/money/phone
@@ -196,8 +195,8 @@ def test_secrecy_scrub_matches_production(raw, want):
 def test_secrecy_scrub_reports_hits():
     scrubbed, hits = secrecy_scrub_text("id IjmQ1782803306 and YKHw1782723298", _SECRECY)
     assert scrubbed == "id (id hidden) and (id hidden)"
-    assert hits == ["crizac_master_id", "crizac_master_id"]
-    assert secrecy_scrub_text("CAMS 1472802", _SECRECY)[1] == []
+    assert hits == ["opaque_master_id", "opaque_master_id"]
+    assert secrecy_scrub_text("account 1472802", _SECRECY)[1] == []
 
 
 def test_secrecy_scrub_per_leaf_of_dict():
@@ -205,7 +204,7 @@ def test_secrecy_scrub_per_leaf_of_dict():
     # leave keys and non-string values (ints, bools) untouched, never corrupt JSON.
     obj = {
         "masterId": "IjmQ1782803306",
-        "camsId": "1472802",            # numeric CAMS id preserved
+        "accountId": "1472802",            # numeric account id preserved
         "count": 3,                      # non-string leaf untouched
         "nested": {"note": "see sGog1782764730"},
         "list": ["YKHw1782723298", "plain text", 42],
@@ -213,7 +212,7 @@ def test_secrecy_scrub_per_leaf_of_dict():
     out = secrecy_scrub(obj, _SECRECY)
     assert out == {
         "masterId": "(id hidden)",
-        "camsId": "1472802",
+        "accountId": "1472802",
         "count": 3,
         "nested": {"note": "see (id hidden)"},
         "list": ["(id hidden)", "plain text", 42],
@@ -228,14 +227,14 @@ def test_secrecy_disabled_is_noop():
 
 def test_secrecy_check_reports_without_mutating_caller():
     r = secrecy_check("id IjmQ1782803306", SECRECY_POLICY)
-    assert r["ok"] is False and r["hits"] == ["crizac_master_id"]
+    assert r["ok"] is False and r["hits"] == ["opaque_master_id"]
     assert r["scrubbed"] == "id (id hidden)"
-    assert secrecy_check("CAMS 1472802", SECRECY_POLICY)["ok"] is True
+    assert secrecy_check("account 1472802", SECRECY_POLICY)["ok"] is True
 
 
 def _secrecy_agent(tmp_path):
     """Agent whose one tool returns a record carrying a master id AND a numeric
-    CAMS id, so we can prove the boundary scrub redacts the former and preserves
+    account id, so we can prove the boundary scrub redacts the former and preserves
     the latter — end-to-end through the engine + trace."""
     (tmp_path / "rya.agent.yaml").write_text(
         "name: t\nruntime: python\nentrypoint: agent.py\n"
@@ -245,7 +244,7 @@ def _secrecy_agent(tmp_path):
         "agent = define_agent()\n"
         "@agent.tool('lookup')\n"
         "async def lookup(inp):\n"
-        "    return {'masterId': 'IjmQ1782803306', 'camsId': '1472802'}\n"
+        "    return {'masterId': 'IjmQ1782803306', 'accountId': '1472802'}\n"
         "@agent.on_event\n"
         "async def h(ctx, e):\n"
         "    return await ctx.tools.call('lookup', {})\n")
@@ -264,7 +263,7 @@ def test_secrecy_scrub_fires_at_tool_boundary(tmp_path, monkeypatch):
 
     # The scrub runs INSIDE the journaled tool step, so neither the returned
     # result nor the trace should ever carry the raw master id — but the numeric
-    # CAMS id survives untouched.
+    # account id survives untouched.
     blob = json.dumps(run, default=str)
     assert "IjmQ1782803306" not in blob
     assert "(id hidden)" in blob

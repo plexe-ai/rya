@@ -2,7 +2,7 @@
 credential-only-for-egress refactor, the E_CONNECTION_EXPIRED → needs_reconnect
 outcome, and the plaintext-at-rest deploy block.
 
-These are the runtime primitives the csa-counsellor Crizac tools rely on. The
+These are the runtime primitives that per-user, url-backed connection tools rely on. The
 reconnect signal is exercised here (not as a live eval) because no offline
 provider can synthesise an upstream 401 — same rationale as the other
 deterministic gates.
@@ -66,29 +66,29 @@ def _url_agent(tmp_path, port, require_user=False):
 # ---- upsert overwrite-in-place ---------------------------------------------
 def test_upsert_overwrites_in_place_no_stale_duplicate(tmp_path):
     store = Store(tmp_path); store.ensure()
-    a = store.upsert_connection("crizac", ["crm:read"], secret="tok-1", owner="c1")
-    b = store.upsert_connection("crizac", ["crm:read", "crm:write"], secret="tok-2", owner="c1")
+    a = store.upsert_connection("crm", ["crm:read"], secret="tok-1", owner="c1")
+    b = store.upsert_connection("crm", ["crm:read", "crm:write"], secret="tok-2", owner="c1")
     assert a["id"] == b["id"]                                    # same doc, in place
     assert b.get("updatedAt") and b["createdAt"] == a["createdAt"]
-    assert store.get_connection("crizac", "c1")["secret"] == "tok-2"   # newest token wins
+    assert store.get_connection("crm", "c1")["secret"] == "tok-2"   # newest token wins
     active = [c for c in store.list_connections()
-              if c["provider"] == "crizac" and c.get("owner") == "c1"]
+              if c["provider"] == "crm" and c.get("owner") == "c1"]
     assert len(active) == 1                                       # no stale duplicate
     # a different owner is a distinct connection, untouched by c1's re-login
-    store.upsert_connection("crizac", ["crm:read"], secret="tok-x", owner="c2")
-    assert store.get_connection("crizac", "c2")["secret"] == "tok-x"
-    assert store.get_connection("crizac", "c1")["secret"] == "tok-2"
+    store.upsert_connection("crm", ["crm:read"], secret="tok-x", owner="c2")
+    assert store.get_connection("crm", "c2")["secret"] == "tok-x"
+    assert store.get_connection("crm", "c1")["secret"] == "tok-2"
 
 
 def test_upsert_migrates_a_create_made_duplicate(tmp_path):
     # create_connection always mints a new doc; a subsequent upsert must adopt the
     # existing (provider, owner) doc rather than add yet another.
     store = Store(tmp_path); store.ensure()
-    store.create_connection("crizac", ["crm:read"], secret="old", owner="c1")
-    store.upsert_connection("crizac", ["crm:read"], secret="new", owner="c1")
+    store.create_connection("crm", ["crm:read"], secret="old", owner="c1")
+    store.upsert_connection("crm", ["crm:read"], secret="new", owner="c1")
     active = [c for c in store.list_connections()
-              if c["provider"] == "crizac" and c.get("owner") == "c1"]
-    assert len(active) == 1 and store.get_connection("crizac", "c1")["secret"] == "new"
+              if c["provider"] == "crm" and c.get("owner") == "c1"]
+    assert len(active) == 1 and store.get_connection("crm", "c1")["secret"] == "new"
 
 
 # ---- E_CONNECTION_EXPIRED → needs_reconnect --------------------------------
@@ -146,12 +146,12 @@ def test_require_user_allows_with_identity(tmp_path):
 def test_handler_backed_provider_tool_runs_without_connection(tmp_path):
     # A provider+require_user tool that has a LOCAL @agent.tool handler never
     # egresses the secret, so it must run offline with NO connection and NO
-    # identity — the refactor that keeps the csa suite deterministic while the
-    # Crizac tools carry a live `url:`.
+    # identity — a local-handler tool stays deterministic offline while
+    # url-backed tools carry a live `url:`.
     (tmp_path / "rya.agent.yaml").write_text(
         "name: h\nruntime: python\nentrypoint: agent.py\n"
-        "tools:\n  - id: local.read\n    permission: allowed\n    provider: crizac\n"
-        "    scopes: [crm:read]\n    require_user: true\n    url: https://crizac-api.example/x\n")
+        "tools:\n  - id: local.read\n    permission: allowed\n    provider: crm\n"
+        "    scopes: [crm:read]\n    require_user: true\n    url: https://crm-api.example/x\n")
     (tmp_path / "agent.py").write_text(
         "from rya import define_agent\nagent=define_agent()\n"
         "@agent.tool('local.read')\nasync def r(inp):\n    return {'ok':True}\n"
@@ -166,8 +166,8 @@ def test_handler_backed_provider_tool_runs_without_connection(tmp_path):
 def _readiness_agent(tmp_path):
     (tmp_path / "rya.agent.yaml").write_text(
         "name: h\nruntime: python\nentrypoint: agent.py\n"
-        "tools:\n  - id: c.read\n    permission: read_only\n    provider: crizac\n"
-        "    scopes: [crm:read]\n    require_user: true\n    url: https://crizac-api.example/x\n")
+        "tools:\n  - id: c.read\n    permission: read_only\n    provider: crm\n"
+        "    scopes: [crm:read]\n    require_user: true\n    url: https://crm-api.example/x\n")
     (tmp_path / "agent.py").write_text(
         "from rya import define_agent\nagent=define_agent()\n@agent.on_event\nasync def h(ctx,e):\n    return {}\n")
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
@@ -175,9 +175,9 @@ def _readiness_agent(tmp_path):
     return manifest, store
 
 
-def test_plaintext_crizac_connection_blocks_deploy(tmp_path):
+def test_plaintext_connection_blocks_deploy(tmp_path):
     manifest, store = _readiness_agent(tmp_path)
-    pub = store.create_connection("crizac", ["crm:read"], secret="PLAINTOKEN", owner="c1")
+    pub = store.create_connection("crm", ["crm:read"], secret="PLAINTOKEN", owner="c1")
     # simulate seal() degrading to plaintext (no key material) by writing the raw
     # secret to disk without the enc:v1: envelope.
     p = tmp_path / ".rya" / "connections" / f"{pub['id']}.json"
@@ -187,8 +187,8 @@ def test_plaintext_crizac_connection_blocks_deploy(tmp_path):
     assert "E_PLAINTEXT_SECRET_AT_REST" in [b["code"] for b in rep["blocks"]]
 
 
-def test_sealed_crizac_connection_is_ready(tmp_path):
+def test_sealed_connection_is_ready(tmp_path):
     manifest, store = _readiness_agent(tmp_path)
-    store.create_connection("crizac", ["crm:read"], secret="tok", owner="c1")  # sealed (keyfile)
+    store.create_connection("crm", ["crm:read"], secret="tok", owner="c1")  # sealed (keyfile)
     rep = check_readiness(manifest, store, load_agent(manifest, tmp_path), tmp_path)
     assert "E_PLAINTEXT_SECRET_AT_REST" not in [b["code"] for b in rep["blocks"]]

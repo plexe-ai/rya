@@ -232,13 +232,13 @@ def grounding_check(text: str, tool_outputs: list) -> dict:
 
 # ---- id-secrecy scrub -------------------------------------------------------
 # Some tool outputs carry ids that must never reach the model or land in an
-# outbound message (e.g. Crizac's internal alphanumeric "master id", which the
-# model must never confuse with a numeric CAMS id). Unlike grounding — a check
-# that BLOCKS — secrecy SCRUBS: it rewrites the offending substrings to a safe
-# token and lets the result through, so the model keeps working with a redacted
-# value instead of failing the turn. This is the runtime form of production's
-# scrubMasterIds(), applied at the tool boundary (before the model sees a
-# result) and on outbound (before bytes leave). Opt in via `secrecy.enabled` in
+# outbound message (e.g. an external CRM's internal alphanumeric "master id",
+# which the model must never confuse with a numeric account id). Unlike
+# grounding — a check that BLOCKS — secrecy SCRUBS: it rewrites the offending
+# substrings to a safe token and lets the result through, so the model keeps
+# working with a redacted value instead of failing the turn. It applies at the
+# tool boundary (before the model sees a result) and on outbound (before bytes
+# leave). Opt in via `secrecy.enabled` in
 # rya.guard.yaml; also callable as ctx.guard.check_secrecy(text).
 
 # A compile cache keyed by object id of the (mtime-cached) policy dict, so the

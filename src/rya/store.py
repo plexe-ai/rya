@@ -452,7 +452,7 @@ class FileStore:
                           owner: Optional[str] = None, label: Optional[str] = None) -> dict:
         """Overwrite-in-place the active connection for (provider, owner), or create
         one if none exists. Keyed on (provider, owner) — NOT the random id — so a
-        counsellor re-logging in refreshes the same doc instead of minting duplicates
+        user re-logging in refreshes the same doc instead of minting duplicates
         (which would let get_connection later inject a stale token). Preserves the
         existing id/createdAt when overwriting; stamps updatedAt."""
         from .seal import seal

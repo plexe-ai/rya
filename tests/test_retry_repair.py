@@ -4,9 +4,8 @@
 
 Driven through the real Engine against a synthetic agent, so retry/repair/adoption
 are exercised exactly as ``ctx.tools.call`` runs them (permission + pin + scrub +
-journal), not in isolation. The deterministic csa-counsellor consumer (create_lead
-idempotency + self-heal + adoption ordering) is gated in
-``examples/csa-counsellor/tests/test_agent_phase3.py``.
+journal), not in isolation. A concrete consumer that exercises these primitives end-to-end (idempotent
+writes + self-heal + adoption ordering) lives in the example agent's phase tests.
 """
 
 from rya.manifest import load_manifest
@@ -44,11 +43,11 @@ def repair_needs_fix(inp, err):
 
 @agent.tool("mklead")
 async def mklead(inp):
-    return {"ok": True, "camsId": "999"}
+    return {"ok": True, "accountId": "999"}
 
 @agent.tool("usekey")
 async def usekey(inp):
-    return {"ok": True, "seen": inp.get("camsId")}
+    return {"ok": True, "seen": inp.get("accountId")}
 
 @agent.on_event
 async def handle(ctx, event):
@@ -81,17 +80,17 @@ _TOOLS = """
     permission: allowed
   - id: mklead
     permission: allowed
-    adopt: {camsId: student_state.camsId}
+    adopt: {accountId: session_state.accountId}
   - id: usekey
     permission: allowed
-    pin: {camsId: memory.student_state.camsId}
+    pin: {accountId: memory.session_state.accountId}
 """
 
 
 def _engine(tmp_path):
     (tmp_path / "rya.agent.yaml").write_text(
         "name: t\nruntime: python\nentrypoint: agent.py\n"
-        "memory:\n  type: managed\n  collections: [student_state]\n"
+        "memory:\n  type: managed\n  collections: [session_state]\n"
         "tools:" + _TOOLS)
     (tmp_path / "agent.py").write_text(_AGENT)
     manifest = load_manifest(tmp_path / "rya.agent.yaml")
@@ -141,7 +140,7 @@ def test_recoverable_error_self_heals_via_repair(tmp_path):
 def test_adoption_feeds_a_later_pinned_call(tmp_path):
     run = _engine(tmp_path).run_event("x", {"which": "adopt"})
     assert run["status"] == "completed"
-    assert run["output"]["use"]["seen"] == "999"   # usekey adopted mklead's camsId
+    assert run["output"]["use"]["seen"] == "999"   # usekey adopted mklead's accountId
     assert "tool.adopt" in _kinds(run)
 
 

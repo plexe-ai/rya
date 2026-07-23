@@ -110,8 +110,8 @@ def _http_tool(url: str, input: dict, auth_secret: Optional[str] = None) -> dict
         body = e.read().decode(errors="replace")[:200]
         # A 401 on a request we authenticated means the injected connection
         # credential is expired/invalid: surface a typed reconnect signal (the
-        # runtime maps it to a `needs_reconnect` outcome), mirroring prod's
-        # CrizacAuthError → "please reconnect". No auto-refresh. A 401 with no
+        # runtime maps it to a `needs_reconnect` outcome) so the caller is asked
+        # to reconnect. No auto-refresh. A 401 with no
         # credential is just a plain upstream error.
         if e.code == 401 and auth_secret:
             raise RyaError("E_CONNECTION_EXPIRED", f"upstream rejected the credential (HTTP 401): {body}",
@@ -334,7 +334,7 @@ class RuntimeContext:
         # Fail closed on missing identity: a `require_user` tool must resolve a
         # per-user connection. Without a verified `sub`, get_connection would fall
         # through to a workspace-shared credential — a silent attribution leak (one
-        # counsellor acting under another's Crizac token). Refuse instead.
+        # user acting under another's API token). Refuse instead.
         if getattr(decl, "require_user", False) and not owner:
             raise RyaError(
                 "E_NO_IDENTITY",

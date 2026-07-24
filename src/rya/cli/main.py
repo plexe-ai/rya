@@ -358,6 +358,17 @@ def doctor_cmd(json: bool = typer.Option(False, "--json")):
 @app.command(name="eval")
 def eval_cmd(
     id: Optional[str] = typer.Option(None, "--id", help="Run only this eval case."),
+    langfuse_dataset: Optional[str] = typer.Option(
+        None, "--langfuse-dataset",
+        help="Pull this Langfuse dataset and run the agent over every item, "
+             "recording the results as a Langfuse dataset run."),
+    run_name: Optional[str] = typer.Option(
+        None, "--run-name", help="Name for the Langfuse dataset run (default rya-<agent>-<ts>)."),
+    payload_defaults: Optional[str] = typer.Option(
+        None, "--payload-defaults", help="JSON merged under each item's payload, "
+        'e.g. \'{"email":"counsellor@csa.test"}\'.'),
+    trigger_type: str = typer.Option(
+        "message.received", "--trigger-type", help="Event type to fire per dataset item."),
     json: bool = typer.Option(False, "--json"),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ):
@@ -365,12 +376,49 @@ def eval_cmd(
 
     Each case fires a real event and scores the run against expectations. Exits
     non-zero (5) if any case fails — gate a deploy on it like `rya deploy --check`.
+
+    With --langfuse-dataset, instead pull that dataset's items from Langfuse, run
+    the agent over each, and link every run's trace to its dataset item as a
+    Langfuse dataset run (Datasets → runs). An item may carry a Rya `expect` block
+    under its metadata to be scored the same way local eval cases are.
     """
     with guard(json):
-        from ..evals import run_evals
         root, manifest = _project()
         agent = load_agent(manifest, root)
         store = open_store(root)
+
+        if langfuse_dataset:
+            from ..evals import run_langfuse_dataset
+            defaults = jsonlib.loads(payload_defaults) if payload_defaults else None
+            rep = run_langfuse_dataset(manifest, agent, store, root, langfuse_dataset,
+                                       run_name=run_name, trigger_type=trigger_type,
+                                       payload_defaults=defaults)
+
+            def render_ds():
+                if not rep["hasItems"]:
+                    console.print(f"[yellow]no items[/yellow] — dataset '{langfuse_dataset}' "
+                                  "is empty or not found in Langfuse.")
+                    return
+                head = "[green]✓[/green]" if rep["ok"] else "[red]✗[/red]"
+                console.print(f"{head} dataset [bold]{rep['dataset']}[/bold]: "
+                              f"{rep['passed']}/{rep['total']} passed (score {rep['score']})")
+                console.print(f"  [dim]run '{rep['runName']}' — traces linked in Langfuse "
+                              "(Datasets → runs)[/dim]")
+                for r in rep["results"]:
+                    g = "[green]✓[/green]" if r["pass"] else "[red]✗[/red]"
+                    console.print(f"  {g} [bold]{r['itemId']}[/bold]  [dim]{r['status']} · {r['runId']}[/dim]")
+                    for c in r["checks"]:
+                        if not c["pass"]:
+                            console.print(f"      [red]✗[/red] {c['check']}: {c['detail']}")
+                    if r.get("error"):
+                        console.print(f"      [red]error:[/red] {r['error']}")
+
+            emit(json, rep, render_ds)
+            if rep["hasItems"] and not rep["ok"]:
+                raise typer.Exit(5)
+            return
+
+        from ..evals import run_evals
         rep = run_evals(manifest, agent, store, root, only=id)
 
         def render():

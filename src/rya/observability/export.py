@@ -40,6 +40,16 @@ def _post(url: str, headers: dict, payload: dict, timeout: int = 10) -> int:
         return resp.status
 
 
+def _lf_configured(env: dict) -> bool:
+    return bool(env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY")
+                and env.get("LANGFUSE_SECRET_KEY"))
+
+
+def _lf_auth(env: dict) -> str:
+    return base64.b64encode(
+        f"{env['LANGFUSE_PUBLIC_KEY']}:{env['LANGFUSE_SECRET_KEY']}".encode()).decode()
+
+
 def run_summary(run: dict, env: Optional[dict] = None) -> dict:
     return {
         "runId": run["id"],
@@ -83,7 +93,7 @@ def _provider_of(model: str) -> str:
 
 # ---- Langfuse --------------------------------------------------------------
 def _langfuse(run: dict, env: dict) -> None:
-    auth = base64.b64encode(f"{env['LANGFUSE_PUBLIC_KEY']}:{env['LANGFUSE_SECRET_KEY']}".encode()).decode()
+    auth = _lf_auth(env)
     created = run.get("createdAt")
     rid = run["id"]
     # Engine runs: trigger is a string and the event dict sits alongside.
@@ -220,9 +230,9 @@ def export_scores(trace_id: str, scores: list, env: Optional[dict] = None) -> Op
     "error: ..." string, or None when Langfuse isn't configured.
     """
     env = env or os.environ
-    if not (env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY") and env.get("LANGFUSE_SECRET_KEY")):
+    if not _lf_configured(env):
         return None
-    auth = base64.b64encode(f"{env['LANGFUSE_PUBLIC_KEY']}:{env['LANGFUSE_SECRET_KEY']}".encode()).decode()
+    auth = _lf_auth(env)
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     batch = []
     for i, s in enumerate(scores):
@@ -242,6 +252,71 @@ def export_scores(trace_id: str, scores: list, env: Optional[dict] = None) -> Op
         return f"error: {e}"
 
 
+# ---- Langfuse datasets (pull items + link runs) ----------------------------
+def fetch_dataset_items(dataset_name: str, env: Optional[dict] = None) -> list:
+    """Fetch every item of a Langfuse dataset (following pagination).
+
+    Reads the dataset the same way the UI does: ``GET
+    /api/public/dataset-items?datasetName=<name>``. Each item carries ``id``,
+    ``input``, ``expectedOutput``, ``metadata``, ``datasetName`` and
+    ``sourceTraceId``. Returns [] when Langfuse isn't configured; raises only on
+    an outright HTTP error (the caller reports it) — an *empty* dataset is a
+    legitimate empty list, not an error.
+    """
+    import urllib.parse
+    import urllib.request
+
+    env = env or os.environ
+    if not _lf_configured(env):
+        return []
+    host = env["LANGFUSE_HOST"].rstrip("/")
+    auth = _lf_auth(env)
+    items, page = [], 1
+    while True:
+        q = urllib.parse.urlencode({"datasetName": dataset_name, "page": page, "limit": 100})
+        req = urllib.request.Request(
+            f"{host}/api/public/dataset-items?{q}", method="GET",
+            headers={"Authorization": f"Basic {auth}", "content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            doc = json.loads(resp.read().decode())
+        batch = doc.get("data") or []
+        items.extend(batch)
+        meta = doc.get("meta") or {}
+        total_pages = meta.get("totalPages") or 1
+        if page >= total_pages or not batch:
+            break
+        page += 1
+    return items
+
+
+def export_dataset_run_item(run_name: str, dataset_item_id: str, trace_id: str,
+                            env: Optional[dict] = None, metadata: Optional[dict] = None,
+                            run_description: Optional[str] = None) -> Optional[str]:
+    """Link a run's trace to a dataset item under a named dataset run.
+
+    ``POST /api/public/dataset-run-items`` with ``{runName, datasetItemId,
+    traceId}`` (Langfuse recommends referencing the trace directly, so no
+    ``observationId``). This is what surfaces the run under *Datasets → runs* in
+    the Langfuse UI. Best-effort like the other exporters — returns "sent", an
+    "error: ..." string, or None when Langfuse isn't configured.
+    """
+    env = env or os.environ
+    if not _lf_configured(env):
+        return None
+    body = {"runName": run_name, "datasetItemId": dataset_item_id, "traceId": trace_id}
+    if metadata is not None:
+        body["metadata"] = metadata
+    if run_description is not None:
+        body["runDescription"] = run_description
+    try:
+        host = env["LANGFUSE_HOST"].rstrip("/")
+        _post(f"{host}/api/public/dataset-run-items",
+              {"Authorization": f"Basic {_lf_auth(env)}"}, body)
+        return "sent"
+    except Exception as e:
+        return f"error: {e}"
+
+
 def export_run(run: dict, env: Optional[dict] = None) -> dict:
     env = env or os.environ
     results = {}
@@ -252,7 +327,7 @@ def export_run(run: dict, env: Optional[dict] = None) -> dict:
             results["webhook"] = "sent"
         except Exception as e:  # never fail a run because export failed
             results["webhook"] = f"error: {e}"
-    if env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY") and env.get("LANGFUSE_SECRET_KEY"):
+    if _lf_configured(env):
         try:
             _langfuse(run, env)
             results["langfuse"] = "sent"

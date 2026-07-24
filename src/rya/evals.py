@@ -225,6 +225,29 @@ SCORERS = {
 }
 
 
+def _score_expect(run: dict, expect: dict, env: dict) -> list:
+    """Run an ``expect`` block through the SCORERS and return a list of checks:
+    ``{check, pass, detail, value?}``. Shared by the local suite and the Langfuse
+    dataset runner (whose per-item expect comes from item metadata)."""
+    checks = []
+    for key, expected in (expect or {}).items():
+        scorer = SCORERS.get(key)
+        if scorer is None:
+            checks.append({"check": key, "pass": False, "detail": "unknown scorer"})
+            continue
+        try:
+            out = scorer(expected, run, env)
+            ok, detail = out[0], out[1]
+            value = out[2] if len(out) > 2 else None  # numeric metric score, if any
+        except Exception as e:
+            ok, detail, value = False, f"scorer error: {e}", None
+        check = {"check": key, "pass": bool(ok), "detail": detail}
+        if value is not None:
+            check["value"] = value
+        checks.append(check)
+    return checks
+
+
 def _export_case_scores(cid: str, run: dict, checks: list, passed: bool, env: dict) -> Optional[str]:
     """Push one eval case's results to Langfuse as scores on the run's trace.
 
@@ -283,21 +306,7 @@ def run_evals(manifest, agent, store, root, only: Optional[str] = None) -> dict:
                                    trig.get("payload", {}), source="eval")
         except Exception as e:
             run, error = {"status": "error", "trace": []}, str(e)
-        for key, expected in expect.items():
-            scorer = SCORERS.get(key)
-            if scorer is None:
-                checks.append({"check": key, "pass": False, "detail": "unknown scorer"})
-                continue
-            try:
-                out = scorer(expected, run, env)
-                ok, detail = out[0], out[1]
-                value = out[2] if len(out) > 2 else None  # numeric metric score, if any
-            except Exception as e:
-                ok, detail, value = False, f"scorer error: {e}", None
-            check = {"check": key, "pass": bool(ok), "detail": detail}
-            if value is not None:
-                check["value"] = value
-            checks.append(check)
+        checks = _score_expect(run, expect, env)
         passed = all(c["pass"] for c in checks) and error is None
         exported = _export_case_scores(cid, run, checks, passed, env)
         results.append({"id": cid, "pass": passed, "runId": run.get("id"),
@@ -314,4 +323,114 @@ def run_evals(manifest, agent, store, root, only: Optional[str] = None) -> dict:
         "results": results,
         "hasEvals": bool(cases),
         "langfuse": "enabled" if lf_on else None,
+    }
+
+
+# ---- Langfuse dataset runs -------------------------------------------------
+def _item_to_trigger(item: dict, trigger_type: str, payload_defaults: Optional[dict] = None):
+    """Map a Langfuse dataset item's ``input`` onto a Rya event ``(type, payload)``.
+
+    Three shapes, most explicit first:
+      - ``input`` is a dict carrying ``type``/``payload`` → use them verbatim.
+      - ``input`` is any other dict → it *is* the payload (type = ``trigger_type``).
+      - ``input`` is a string → payload ``{"body": <string>}``.
+    ``payload_defaults`` (e.g. ``{"email": "counsellor@csa.test"}``) is merged
+    UNDER the item payload, so a dataset that only carries ``body`` still
+    satisfies a handler that requires a fixed field, while the item always wins
+    on conflict.
+    """
+    raw = item.get("input")
+    if isinstance(raw, dict) and ("payload" in raw or "type" in raw):
+        typ = raw.get("type", trigger_type)
+        payload = dict(raw.get("payload") or {})
+    elif isinstance(raw, dict):
+        typ, payload = trigger_type, dict(raw)
+    elif isinstance(raw, str):
+        typ, payload = trigger_type, {"body": raw}
+    else:
+        typ, payload = trigger_type, {}
+    return typ, {**(payload_defaults or {}), **payload}
+
+
+def run_langfuse_dataset(manifest, agent, store, root, dataset: str,
+                         run_name: Optional[str] = None,
+                         trigger_type: str = "message.received",
+                         payload_defaults: Optional[dict] = None) -> dict:
+    """Pull a Langfuse dataset, run the agent over every item, and record the
+    results back to Langfuse as a dataset run.
+
+    Each item fires a real engine run (exactly like a local eval case); the run's
+    trace is exported (``traceId == run id``) and linked to the dataset item via a
+    ``dataset-run-item`` under ``run_name`` — which is what makes the run appear
+    under *Datasets → runs* in the Langfuse UI. An item may carry a Rya ``expect``
+    block under its ``metadata`` (``metadata.expect``); when present it is scored
+    with the same SCORERS as local evals and the checks are attached to the trace.
+    """
+    from datetime import datetime, timezone
+
+    from .errors import RyaError
+    from .observability.export import (export_dataset_run_item, export_run,
+                                       fetch_dataset_items)
+    from .runtime import Engine
+    from .sdk.context import load_env
+
+    env = load_env(Path(root))
+    if not (env.get("LANGFUSE_HOST") and env.get("LANGFUSE_PUBLIC_KEY")
+            and env.get("LANGFUSE_SECRET_KEY")):
+        raise RyaError(
+            "E_LANGFUSE_NOT_CONFIGURED",
+            "Running a Langfuse dataset needs LANGFUSE_HOST + LANGFUSE_PUBLIC_KEY + "
+            "LANGFUSE_SECRET_KEY.",
+            hint="Set them in the project .env (see docs/langfuse.md), then re-run.")
+
+    items = fetch_dataset_items(dataset, env)
+    if not run_name:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_name = f"rya-{manifest.name}-{stamp}"
+
+    results = []
+    for item in items:
+        item_id = item.get("id")
+        typ, payload = _item_to_trigger(item, trigger_type, payload_defaults)
+        engine = Engine(manifest, agent, store, root)
+        error = None
+        try:
+            run = engine.run_event(typ, payload, source="eval")
+        except Exception as e:
+            run, error = {"status": "error", "trace": []}, str(e)
+
+        # The engine exports only terminal runs; export the rest so the trace
+        # exists for both scores and the dataset-run-item link.
+        if run.get("id") and run.get("status") not in ("completed", "failed", "rejected"):
+            try:
+                export_run(run, env)
+            except Exception:
+                pass
+
+        expect = (item.get("metadata") or {}).get("expect") if isinstance(item.get("metadata"), dict) else None
+        checks = _score_expect(run, expect, env) if expect else []
+        # No expect block → the item is "run and linked", which counts as a pass;
+        # the trace + any DeepEval-derived scores still land in Langfuse.
+        passed = (all(c["pass"] for c in checks) if checks else True) and error is None
+        if checks:
+            _export_case_scores(item_id, run, checks, passed, env)
+
+        linked = None
+        if run.get("id"):
+            linked = export_dataset_run_item(
+                run_name, item_id, run["id"], env,
+                metadata={"status": run.get("status"), "ryaRunId": run["id"]})
+        results.append({"itemId": item_id, "pass": passed, "runId": run.get("id"),
+                        "status": run.get("status"), "linked": linked,
+                        "checks": checks, "error": error})
+
+    n_pass = sum(1 for r in results if r["pass"])
+    return {
+        "ok": all(r["pass"] for r in results),
+        "dataset": dataset, "runName": run_name,
+        "total": len(results), "passed": n_pass, "failed": len(results) - n_pass,
+        "score": round(n_pass / len(results), 3) if results else None,
+        "results": results,
+        "hasItems": bool(items),
+        "langfuse": "enabled",
     }

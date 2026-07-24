@@ -514,17 +514,27 @@ def _mock_chat(messages: list, tools: Optional[list]) -> dict:
 
 def chat(*, messages: list, tools: Optional[list] = None, system: str = "",
          model_default: str = "mock-llm", provider: str = "auto",
-         temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> dict:
+         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+         on_token=None) -> dict:
     """One model turn that may request tool calls. Returns
     ``{text, toolCalls:[{id,name,input}], model, provider, usage}``.
 
     ``messages`` is a list of ``{role: user|assistant|tool, content, [name]}``.
     The mock provider drives a deterministic call-one-tool-then-answer loop;
-    real providers use the native tool-use / function-calling format."""
+    real providers use the native tool-use / function-calling format.
+
+    When ``on_token`` is given, the assistant's text is streamed chunk by chunk
+    to the callback as it arrives (currently the anthropic provider); the
+    returned dict is identical to the non-streaming shape. Providers without a
+    streaming chat path ignore ``on_token`` and return the full result at once,
+    so passing it is always safe."""
     effective = resolve_provider(provider)
     if effective == "bedrock":
         return _bedrock_chat(model_default, system, messages, tools, temperature, max_tokens)
     if effective == "anthropic":
+        if on_token:
+            return _anthropic_chat_stream(model_default, system, messages, tools,
+                                          temperature, max_tokens, on_token)
         return _anthropic_chat(model_default, system, messages, tools, temperature, max_tokens)
     if effective == "openai":
         return _openai_chat(model_default, system, messages, tools, temperature, max_tokens)
@@ -535,12 +545,10 @@ def chat(*, messages: list, tools: Optional[list] = None, system: str = "",
     return _mock_chat(messages, tools)
 
 
-def _anthropic_chat(name, system, messages, tools, temperature, max_tokens) -> dict:
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RyaError("E_VALIDATION", "anthropic provider but ANTHROPIC_API_KEY is not set.",
-                       hint="Set ANTHROPIC_API_KEY or use the mock provider.")
-    model = name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_LLM_MODEL", _DEFAULT_ANTHROPIC)
+def _anthropic_messages(messages) -> list:
+    """Shape Rya's ``{role, content, [toolCalls|toolUseId]}`` messages into the
+    Anthropic content-block format. Shared by the non-streaming and streaming
+    chat paths so they can never diverge."""
     amsgs = []
     for m in messages:
         if m["role"] == "tool":
@@ -562,10 +570,24 @@ def _anthropic_chat(name, system, messages, tools, temperature, max_tokens) -> d
         else:
             amsgs.append({"role": m["role"], "content": m["content"] if isinstance(m["content"], str)
                           else _stringify(m["content"])})
-    payload = {"model": model, "max_tokens": max_tokens or 1024, "system": system, "messages": amsgs}
+    return amsgs
+
+
+def _anthropic_tools(tools) -> list:
+    return [{"name": t["name"], "description": t.get("description", ""),
+             "input_schema": t.get("input_schema", {"type": "object"})} for t in tools]
+
+
+def _anthropic_chat(name, system, messages, tools, temperature, max_tokens) -> dict:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RyaError("E_VALIDATION", "anthropic provider but ANTHROPIC_API_KEY is not set.",
+                       hint="Set ANTHROPIC_API_KEY or use the mock provider.")
+    model = name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_LLM_MODEL", _DEFAULT_ANTHROPIC)
+    payload = {"model": model, "max_tokens": max_tokens or 1024, "system": system,
+               "messages": _anthropic_messages(messages)}
     if tools:
-        payload["tools"] = [{"name": t["name"], "description": t.get("description", ""),
-                             "input_schema": t.get("input_schema", {"type": "object"})} for t in tools]
+        payload["tools"] = _anthropic_tools(tools)
     if temperature is not None:
         payload["temperature"] = temperature
     j = _http_json("https://api.anthropic.com/v1/messages",
@@ -576,6 +598,70 @@ def _anthropic_chat(name, system, messages, tools, temperature, max_tokens) -> d
     u = j.get("usage") or {}
     return {"text": text, "toolCalls": calls, "model": model, "provider": "anthropic",
             "usage": {"input": u.get("input_tokens"), "output": u.get("output_tokens")} if u else None}
+
+
+def _anthropic_chat_stream(name, system, messages, tools, temperature, max_tokens, on_token) -> dict:
+    """Streaming twin of ``_anthropic_chat``: emits assistant text deltas to
+    ``on_token`` as they arrive, while assembling the SAME return shape
+    ``{text, toolCalls, model, provider, usage}``. Tool-use blocks are rebuilt
+    from ``input_json_delta`` fragments exactly as the non-streaming path parses
+    them, so a tool-calling step behaves identically - only the final text is
+    additionally streamed."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RyaError("E_VALIDATION", "anthropic provider but ANTHROPIC_API_KEY is not set.",
+                       hint="Set ANTHROPIC_API_KEY or use the mock provider.")
+    model = name if name not in _PLACEHOLDER_NAMES else os.environ.get("RYA_LLM_MODEL", _DEFAULT_ANTHROPIC)
+    payload = {"model": model, "max_tokens": max_tokens or 1024, "system": system,
+               "messages": _anthropic_messages(messages), "stream": True}
+    if tools:
+        payload["tools"] = _anthropic_tools(tools)
+    if temperature is not None:
+        payload["temperature"] = temperature
+    resp = _http_stream("https://api.anthropic.com/v1/messages",
+                        {"x-api-key": key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json", "accept": "text/event-stream"}, payload)
+    blocks: dict = {}  # index -> {"type", "text"} | {"type":"tool_use","id","name","json"}
+    usage_in = usage_out = None
+    with resp:
+        for ev in _sse_events(resp):
+            t = ev.get("type")
+            if t == "message_start":
+                usage_in = (ev.get("message", {}).get("usage") or {}).get("input_tokens")
+            elif t == "content_block_start":
+                idx = ev.get("index")
+                cb = ev.get("content_block", {}) or {}
+                if cb.get("type") == "tool_use":
+                    blocks[idx] = {"type": "tool_use", "id": cb.get("id"), "name": cb.get("name"), "json": ""}
+                else:
+                    blocks[idx] = {"type": "text", "text": ""}
+            elif t == "content_block_delta":
+                b = blocks.get(ev.get("index"))
+                if b is None:
+                    continue
+                d = ev.get("delta", {}) or {}
+                if d.get("type") == "text_delta":
+                    chunk = d.get("text", "")
+                    if chunk:
+                        b["text"] = b.get("text", "") + chunk
+                        if on_token:
+                            on_token(chunk)
+                elif d.get("type") == "input_json_delta":
+                    b["json"] = b.get("json", "") + d.get("partial_json", "")
+            elif t == "message_delta":
+                usage_out = (ev.get("usage") or {}).get("output_tokens")
+    ordered = [blocks[i] for i in sorted(blocks)]
+    text = "".join(b.get("text", "") for b in ordered if b["type"] == "text")
+    calls = []
+    for b in ordered:
+        if b["type"] == "tool_use":
+            try:
+                inp = json.loads(b["json"]) if b.get("json") else {}
+            except json.JSONDecodeError:
+                inp = {}
+            calls.append({"id": b.get("id"), "name": b.get("name"), "input": inp})
+    return {"text": text, "toolCalls": calls, "model": model, "provider": "anthropic",
+            "usage": {"input": usage_in, "output": usage_out} if (usage_in or usage_out) else None}
 
 
 def _openai_chat(name, system, messages, tools, temperature, max_tokens) -> dict:

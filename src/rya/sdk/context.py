@@ -1310,6 +1310,44 @@ class _Connections:
 
         return self._ctx._step("connection.get", provider, run)
 
+    async def secret(self, provider: str, *, scopes: Optional[List[str]] = None) -> Optional[str]:
+        """The raw bearer for the CALLER's ``provider`` connection, for a HANDLER
+        to build an upstream client with. Leaf tools get no ``ctx`` and this never
+        reaches them; it is the handler-side analogue of the credential the runtime
+        injects into a declared ``url:`` tool.
+
+        Enforces the same per-user resolution + scope-intersection rule as tool
+        injection (:meth:`RuntimeContext._authorize_connection`) and seeds the
+        secret into the redaction vault, so it can never surface in a trace or log.
+        It is deliberately **not** journaled — a plaintext credential must never
+        touch the run journal — so a replay re-resolves it live rather than
+        memoizing it.
+
+        NEVER return this to the model or put it in a tool result: treat it as
+        write-only into the client you build. Returns ``None`` when the caller has
+        no active connection for ``provider``.
+        """
+        owner = self._ctx.identity.sub if self._ctx.identity is not None else None
+        conn = self._ctx.store.get_connection(provider, owner) if hasattr(self._ctx.store, "get_connection") else None
+        if conn is None or conn.get("status") != "active":
+            return None
+        required = set(scopes or [])
+        if required:
+            conn_scopes = set(conn.get("scopes", []))
+            user_scopes = self._ctx.identity.scopes if self._ctx.identity is not None else None
+            effective = conn_scopes if user_scopes is None else (conn_scopes & set(user_scopes))
+            missing = required - effective
+            if missing:
+                raise RyaError(
+                    "E_SCOPE_DENIED",
+                    f"Handler requires {sorted(required)} on '{provider}', but the effective "
+                    f"grant (connection ∩ user) is {sorted(effective)}; missing {sorted(missing)}.",
+                    hint="Grant the missing scopes on the connection, or authorize the user for them.",
+                )
+        secret = conn.get("secret")
+        self._ctx._seed_secret(secret)  # vault it — never leaks into traces/logs
+        return secret
+
     async def list(self) -> List[dict]:
         def run():
             return self._ctx.store.list_connections() if hasattr(self._ctx.store, "list_connections") else []

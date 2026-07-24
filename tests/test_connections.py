@@ -116,3 +116,48 @@ def test_missing_connection_is_blocked(tmp_path):
     assert run["status"] == "failed"
     assert run["error"]["code"] == "E_NO_CONNECTION"
     assert seen["hits"] == 0
+
+
+# ---- ctx.connections.secret() — handler-side credential resolution --------
+def _secret_agent(tmp_path, body):
+    (tmp_path / "rya.agent.yaml").write_text(
+        "name: gh\nruntime: python\nentrypoint: agent.py\ntools:\n  - id: noop\n    permission: allowed\n")
+    (tmp_path / "agent.py").write_text(
+        "from rya import define_agent\nagent=define_agent()\n@agent.on_event\nasync def h(ctx,e):\n" + body)
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    store = Store(tmp_path); store.ensure()
+    return manifest, store
+
+
+def test_connections_secret_resolves_for_handler_and_is_vaulted(tmp_path):
+    manifest, store = _secret_agent(
+        tmp_path,
+        "    tok = await ctx.connections.secret('github')\n"
+        "    return {'has': bool(tok), 'ok': (tok or '').startswith('ghtok_')}\n")
+    store.create_connection("github", ["repo:read"], secret=SECRET)
+    engine = Engine(manifest, load_agent(manifest, tmp_path), store, tmp_path)
+    run = engine.run_event("x", {})
+    assert run["status"] == "completed"
+    assert run["output"]["has"] is True and run["output"]["ok"] is True
+    # resolved secret is vaulted → never in the trace, and NOT journaled as plaintext
+    assert SECRET not in json.dumps(run["trace"])
+    assert SECRET not in json.dumps(run["journal"])
+
+
+def test_connections_secret_none_when_absent(tmp_path):
+    manifest, store = _secret_agent(
+        tmp_path, "    return {'has': bool(await ctx.connections.secret('github'))}\n")
+    engine = Engine(manifest, load_agent(manifest, tmp_path), store, tmp_path)
+    run = engine.run_event("x", {})
+    assert run["status"] == "completed" and run["output"]["has"] is False
+
+
+def test_connections_secret_enforces_scope_intersection(tmp_path):
+    manifest, store = _secret_agent(
+        tmp_path, "    return {'has': bool(await ctx.connections.secret('github', scopes=['issues:write']))}\n")
+    # connection has issues:write, but the user only has repo:read → denied.
+    store.create_connection("github", ["issues:write", "repo:read"], secret=SECRET)
+    engine = Engine(manifest, load_agent(manifest, tmp_path), store, tmp_path)
+    ident = Identity("user-1", {"scopes": ["repo:read"]})
+    run = engine.run_event("x", {}, identity=ident)
+    assert run["status"] == "failed" and run["error"]["code"] == "E_SCOPE_DENIED"

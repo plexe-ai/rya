@@ -107,6 +107,77 @@ def test_loop_never_autonomously_calls_gated_tools(tmp_path):
     assert not any(e.get("label") == "danger" for e in ctx.run["trace"])
 
 
+def test_run_replays_history_before_current_message(tmp_path, monkeypatch):
+    # Prior turns from ctx.sessions.history(...) are seeded into the loop ahead of
+    # the current message, so follow-ups ("#2", "compare those") have context.
+    ctx, _ = _ctx(tmp_path, BASE_MANIFEST)
+    captured = {}
+    import rya.providers as providers
+
+    def fake_chat(*, messages, **_kw):
+        captured["messages"] = messages
+        return {"text": "done", "toolCalls": []}
+
+    monkeypatch.setattr(providers, "chat", fake_chat)
+
+    async def go():
+        history = [
+            {"role": "user", "content": "find UK data science"},
+            {"role": "assistant", "content": "here are 3 options"},
+        ]
+        await ctx.llm.run(input={"q": "compare #2 and #3"}, system="s",
+                          tools=["lookup"], history=history)
+
+    asyncio.run(go())
+    msgs = captured["messages"]
+    assert msgs[0] == {"role": "user", "content": "find UK data science"}
+    assert msgs[1] == {"role": "assistant", "content": "here are 3 options"}
+    # current message comes last, carrying the raw input dict
+    assert msgs[2]["role"] == "user" and msgs[2]["content"] == {"q": "compare #2 and #3"}
+
+
+def test_run_history_filters_blanks_and_unknown_roles(tmp_path, monkeypatch):
+    # Storage may hold blank assistant turns or non-user/assistant rows; those must
+    # never reach the provider (Anthropic rejects empty content / stray roles).
+    ctx, _ = _ctx(tmp_path, BASE_MANIFEST)
+    captured = {}
+    import rya.providers as providers
+
+    def fake_chat(*, messages, **_kw):
+        captured["messages"] = messages
+        return {"text": "done", "toolCalls": []}
+
+    monkeypatch.setattr(providers, "chat", fake_chat)
+
+    history = [
+        {"role": "assistant", "content": ""},       # blank → skip
+        {"role": "assistant", "content": "   "},     # whitespace-only → skip
+        {"role": "system", "content": "noise"},      # non user/assistant → skip
+        {"role": "tool", "content": "result"},       # tool role → skip
+        {"role": "user", "content": "keep me"},      # kept
+    ]
+    asyncio.run(ctx.llm.run(input={"q": "now"}, tools=["lookup"], history=history))
+    assert captured["messages"] == [
+        {"role": "user", "content": "keep me"},
+        {"role": "user", "content": {"q": "now"}},
+    ]
+
+
+def test_run_without_history_is_unchanged(tmp_path, monkeypatch):
+    # Backward compatibility: no history → only the current message is seeded.
+    ctx, _ = _ctx(tmp_path, BASE_MANIFEST)
+    captured = {}
+    import rya.providers as providers
+
+    def fake_chat(*, messages, **_kw):
+        captured["messages"] = messages
+        return {"text": "done", "toolCalls": []}
+
+    monkeypatch.setattr(providers, "chat", fake_chat)
+    asyncio.run(ctx.llm.run(input={"q": "solo"}, tools=["lookup"]))
+    assert captured["messages"] == [{"role": "user", "content": {"q": "solo"}}]
+
+
 SCOPED_MANIFEST = """name: ai
 runtime: python
 entrypoint: agent.py

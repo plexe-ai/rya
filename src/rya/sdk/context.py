@@ -443,12 +443,16 @@ class _LLM:
 
     async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None,
                       route: Optional[str] = None,
-                      documents: Optional[list] = None) -> LLMResponse:
+                      documents: Optional[list] = None, stream: bool = True) -> LLMResponse:
         """Call the model. Pass ``schema`` (a JSON Schema) for first-class
         **structured output** — the result's ``.json`` is the parsed, validated
         object. Pass ``route`` to use a named per-purpose model from
         ``model.routes``. When the run has a token subscriber (WebSocket turns),
         the response is streamed chunk by chunk as it is generated.
+
+        Pass ``stream=False`` for an INTERNAL call whose text must not reach the
+        user's token stream (e.g. a memory-extraction or title sidecar) — the
+        returned value is unchanged, only the live token forwarding is skipped.
 
         ``documents`` grounds the call in files (extraction over PDFs): a list of
         ``{name, format, path|bytes|b64}``; relative paths resolve against the
@@ -458,7 +462,7 @@ class _LLM:
 
         mb = self._ctx.manifest.model
         model, provider, temperature, max_tokens, label = self._params(route)
-        on_token = self._ctx._on_token
+        on_token = self._ctx._on_token if stream else None
         docs = None
         if documents:
             docs = []
@@ -499,12 +503,19 @@ class _LLM:
                            provider=res.get("provider"))
 
     async def run(self, *, input, system: str = "", tools: Optional[List[str]] = None,
-                  max_steps: int = 6, route: Optional[str] = None) -> dict:
+                  max_steps: int = 6, route: Optional[str] = None, stream: bool = True,
+                  history: Optional[List[dict]] = None) -> dict:
         """Governed **agent loop**: the model reasons and calls tools until it has
         an answer. Every tool call goes through ``ctx.tools.call`` — so the same
         permissions, scoped credentials, Action Guard, and audit apply to what the
         model decides to do. Approval-gated tools are NOT exposed to the loop;
         side-effectful actions still require an explicit ``ctx.approvals.request``.
+
+        ``history`` optionally seeds the loop with prior conversation turns so
+        follow-ups ("compare those", "#2") resolve against earlier context. Pass
+        the window from ``ctx.sessions.history(...)``; only ``user``/``assistant``
+        text turns are replayed (blanks and other roles are ignored). The caller
+        owns the window size.
 
         Returns ``{text, steps, toolCalls}`` where ``toolCalls`` lists what ran.
         """
@@ -533,13 +544,31 @@ class _LLM:
             return {"name": tid, "description": desc, "input_schema": schema}
         tool_defs = [_tool_def(tid) for tid in usable]
 
-        messages: List[dict] = [{"role": "user", "content": input}]
+        # Seed with prior conversation turns (if any) so the loop can resolve
+        # follow-ups against earlier context, then the current message. Storage
+        # carries only user/assistant text turns; skip blanks and other roles so
+        # the provider never receives an empty-content message (Anthropic rejects
+        # those) or a role it can't normalize.
+        messages: List[dict] = []
+        for m in history or []:
+            role = m.get("role")
+            content = m.get("content")
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": input})
         ran: List[dict] = []
+        # Stream the model's text to any token subscriber (SSE/WS/durable turns)
+        # so the governed loop types out its answer like a direct model call.
+        # Tool-use assembly is unchanged - only text deltas are forwarded.
+        # Pass stream=False for an internal loop whose text must not reach the
+        # user's token stream (mirrors respond()).
+        on_token = self._ctx._on_token if stream else None
         for step in range(max_steps):
             def turn(_msgs=list(messages)):
                 return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
                                      model_default=model, provider=provider,
-                                     temperature=temperature, max_tokens=max_tokens)
+                                     temperature=temperature, max_tokens=max_tokens,
+                                     on_token=on_token)
 
             res = self._ctx._step("llm.chat", f"step {step}", turn, {"system": system})
             calls = res.get("toolCalls") or []

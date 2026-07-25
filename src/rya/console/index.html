@@ -493,10 +493,18 @@ function render(s){
   setCt('approvals',s.stats.approvalsPending, s.stats.approvalsPending>0);
 
   const st=s.stats, gated=s.tools.filter(t=>t.permission==='approval_required').length;
+  // The Tokens subtitle tells the truth: cost when priced (RYA_PRICE_* env),
+  // else the REAL model that ran; 'mock LLM' only when runs actually used the mock.
+  const shortModel=m=>(m.match(/claude-[a-z0-9-]+?(?=-[0-9]{8})/)||[m.split('.').pop().split(':')[0]])[0];
+  const realModels=(st.models||[]).filter(m=>!/^mock/.test(m)&&m!=='dev');
+  const llmSub=st.costUsd!=null?('$'+Number(st.costUsd).toFixed(st.costUsd<1?4:2))
+    :realModels.length?shortModel(realModels[realModels.length-1])
+    :(st.models||[]).length?'mock LLM'
+    :(s.runtime.llmProvider==='mock'?'mock LLM':s.runtime.llmProvider);
   document.getElementById('stats').innerHTML=[
     tile('play','Runs',st.runs,(st.byStatus.completed||0)+' completed'),
     tile('user-check','Approvals',st.approvalsPending,'pending review',st.approvalsPending>0),
-    tile('coins','Tokens',(st.inputTokens+st.outputTokens).toLocaleString(),st.costUsd!=null?('$'+Number(st.costUsd).toFixed(st.costUsd<1?4:2)):'mock LLM'),
+    tile('coins','Tokens',(st.inputTokens+st.outputTokens).toLocaleString(),llmSub),
     tile('clock','Jobs queued',st.jobsPending,'background'),
   ].join('');
 

@@ -109,3 +109,22 @@ def test_console_security_headers_and_assets(tmp_path, monkeypatch):
     assert c.get("/lucide.min.js").status_code == 200
     assert "javascript" in c.get("/lucide.min.js").headers.get("content-type", "")
     assert c.get("/favicon.ico").status_code == 200
+
+
+def test_stats_report_models_actually_used(tmp_path):
+    """The console must not call real Bedrock runs 'mock LLM': stats carry the
+    model ids seen in traces so the UI can label the LLM truthfully."""
+    scaffold.write_project(tmp_path, "agg2", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
+    engine.run_event("message.received", {"email": "ada@x.com"})
+
+    run = engine.store.list_runs(manifest.name)[0]
+    for ev in run["trace"]:
+        if ev["kind"] == "llm.respond":
+            ev["data"]["result"]["model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    engine.store.save_run(run)
+
+    c = build_console(manifest, engine.store, agent, tmp_path)
+    assert c["stats"]["models"] == ["us.anthropic.claude-haiku-4-5-20251001-v1:0"]

@@ -125,6 +125,7 @@ def build_console(manifest, store, agent, project_root) -> dict:
     cost = 0.0
     tool_calls: dict = {}
     model_calls: dict = {}
+    models_seen: set = set()
     for r in runs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         u = run_usage(r)
@@ -132,6 +133,10 @@ def build_console(manifest, store, agent, project_root) -> dict:
         if u["costUsd"]:
             cost += u["costUsd"]
         for ev in r.get("trace", []):
+            if ev.get("kind") == "llm.respond":
+                m = ((ev.get("data") or {}).get("result") or {}).get("model")
+                if m:
+                    models_seen.add(m)
             if ev.get("kind") == "tool.call":
                 tool_calls[ev.get("label")] = tool_calls.get(ev.get("label"), 0) + 1
             elif ev.get("kind") == "model.call":
@@ -171,7 +176,8 @@ def build_console(manifest, store, agent, project_root) -> dict:
                   "sessions": len(sessions),
                   "messages": sum(s.get("messageCount", 0) for s in sessions),
                   "inputTokens": in_tok, "outputTokens": out_tok,
-                  "costUsd": round(cost, 4) if cost else None},
+                  "costUsd": round(cost, 4) if cost else None,
+                  "models": sorted(models_seen)},
         "tools": [{"id": t.id, "permission": t.permission.value,
                    "externalSideEffects": getattr(treg.get(t.id), "external_side_effects", None),
                    "requiredSecrets": getattr(treg.get(t.id), "required_secrets", []),

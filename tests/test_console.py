@@ -128,3 +128,43 @@ def test_stats_report_models_actually_used(tmp_path):
 
     c = build_console(manifest, engine.store, agent, tmp_path)
     assert c["stats"]["models"] == ["us.anthropic.claude-haiku-4-5-20251001-v1:0"]
+
+
+def test_governance_surface_in_console(tmp_path):
+    """The control-plane governance section: policy hash, real enforcement
+    flags, kill-switch state, and violations aggregated from run traces."""
+    scaffold.write_project(tmp_path, "gov", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
+    engine.run_event("message.received", {"email": "ada@x.com"})
+
+    # plant a grounding block + an egress block in a trace
+    run = engine.store.list_runs(manifest.name)[0]
+    run["trace"].append({"seq": 99, "ts": "2026-07-25T10:00:00Z",
+                         "kind": "guard.grounding_blocked", "label": "email",
+                         "data": {"violations": [4200000.0]}})
+    run["trace"].append({"seq": 100, "ts": "2026-07-25T10:01:00Z",
+                         "kind": "run.failed", "label": "E_EGRESS_BLOCKED",
+                         "data": {"message": "https://evil.example denied by rule"}})
+    engine.store.save_run(run)
+
+    c = build_console(manifest, engine.store, agent, tmp_path)
+    g = c["governance"]
+    assert len(g["policy"]["hash"]) == 16
+    assert set(g["enforcement"]) == {"egressGuard", "groundingGate", "approverIdentity",
+                                     "perUserIdentity", "multiTenantRls", "secretsSealed"}
+    kinds = {v["kind"] for v in g["violations"]}
+    assert kinds == {"guard.grounding_blocked", "E_EGRESS_BLOCKED"}
+    assert g["switches"]["active"] == []
+
+    # same policy -> same hash; changed enforcement -> different hash
+    import os
+    c2 = build_console(manifest, engine.store, agent, tmp_path)
+    assert c2["governance"]["policy"]["hash"] == g["policy"]["hash"]
+    os.environ["RYA_REQUIRE_APPROVER_IDENTITY"] = "1"
+    try:
+        c3 = build_console(manifest, engine.store, agent, tmp_path)
+        assert c3["governance"]["policy"]["hash"] != g["policy"]["hash"]
+    finally:
+        del os.environ["RYA_REQUIRE_APPROVER_IDENTITY"]

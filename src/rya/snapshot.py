@@ -14,6 +14,7 @@ ops layer can import it without cycles.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 from .models.registry import default_registry as _models
@@ -109,6 +110,80 @@ def build_snapshot(manifest, store, agent=None, recent_limit: int = 5, project_r
     return snapshot
 
 
+
+
+_VIOLATION_CODES = {"E_EGRESS_BLOCKED", "E_GROUNDING_BLOCKED", "E_TOOL_PERMISSION_DENIED",
+                    "E_APPROVER_IDENTITY_REQUIRED", "E_BUDGET_EXCEEDED"}
+
+
+def _governance(manifest, store, runs, project_root) -> dict:
+    """The control-plane governance surface: what is enforced, under which
+    policy version, what has been overridden, and what got blocked. Everything
+    here reflects REAL enforcement state - nothing is aspirational."""
+    import hashlib
+    import json as _json
+
+    env = os.environ
+    guard_path = Path(project_root) / "rya.guard.yaml"
+    guard_txt = guard_path.read_text() if guard_path.exists() else ""
+    try:
+        import yaml as _yaml
+        gy = _yaml.safe_load(guard_txt) or {}
+    except Exception:
+        gy = {}
+    grounding_on = bool((gy.get("grounding") or {}).get("enabled"))
+    from .auth import jwt_configured
+    from .seal import available as seal_available
+
+    pinned = sum(1 for t in manifest.tools if getattr(t, "pin", None))
+    gated = sum(1 for t in manifest.tools if t.permission.value == "approval_required")
+    denied = sum(1 for t in manifest.tools if t.permission.value == "disabled")
+
+    # The policy document is everything that constrains the agent. Its hash is
+    # the version an auditor can pin a run to.
+    policy_material = _json.dumps({
+        "tools": [{"id": t.id, "permission": t.permission.value,
+                   "pin": sorted(getattr(t, "pin", {}) or {})} for t in manifest.tools],
+        "guard": guard_txt,
+        "approverIdentityRequired": env.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1",
+        "multiTenant": _multitenant(),
+    }, sort_keys=True)
+    policy_hash = hashlib.sha256(policy_material.encode()).hexdigest()[:16]
+
+    rc = store.load_memory("_runtime_config")
+    overrides = [dict(v, tool=k.split(":", 1)[1]) for k, v in (rc.get("kv") or {}).items()
+                 if k.startswith("tool:")]
+    history = ((rc.get("collections") or {}).get("history") or [])[-10:]
+
+    violations = []
+    for r in runs:
+        for ev in r.get("trace", []):
+            kind = ev.get("kind", "")
+            data = ev.get("data") or {}
+            if kind.startswith("guard."):
+                violations.append({"ts": ev.get("ts"), "runId": r["id"], "kind": kind,
+                                   "detail": str(data.get("violations") or ev.get("label") or "")[:160]})
+            elif kind == "run.failed" and str(ev.get("label")) in _VIOLATION_CODES:
+                violations.append({"ts": ev.get("ts"), "runId": r["id"], "kind": ev["label"],
+                                   "detail": str(data.get("message") or "")[:160]})
+    violations = sorted(violations, key=lambda v: v.get("ts") or "", reverse=True)[:25]
+
+    return {
+        "policy": {"hash": policy_hash, "toolsGated": gated, "toolsDenied": denied,
+                   "pinnedArgTools": pinned, "egressRules": len(gy.get("rules") or []),
+                   "egressDefault": gy.get("default", "deny") if guard_txt else None},
+        "enforcement": {
+            "egressGuard": bool(guard_txt),
+            "groundingGate": grounding_on,
+            "approverIdentity": env.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1",
+            "perUserIdentity": jwt_configured(),
+            "multiTenantRls": _multitenant(),
+            "secretsSealed": seal_available(),
+        },
+        "switches": {"active": overrides, "history": list(reversed(history))},
+        "violations": violations,
+    }
+
 def build_console(manifest, store, agent, project_root) -> dict:
     """Rich aggregate state for the web console — everything one dashboard needs
     in a single call, computed from the live runtime (not mocked)."""
@@ -162,6 +237,7 @@ def build_console(manifest, store, agent, project_root) -> dict:
 
     return {
         "ok": True,
+        "governance": _governance(manifest, store, runs, project_root),
         "agent": {"name": manifest.name, "version": manifest.version,
                   "runtime": manifest.runtime, "environment": manifest.environment,
                   "status": "running",

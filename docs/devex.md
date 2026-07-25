@@ -55,3 +55,26 @@ rya schedules list --json     # cron schedules
 Mocked tools/models/LLM are deterministic, so runs are reproducible in tests and
 CI. Manifest-mutating commands (`tools register`, `models register`,
 `channels connect`, `schedules create`) reject duplicates with `E_VALIDATION`.
+
+## Linting & formatting
+
+[Ruff](https://docs.astral.sh/ruff/) is both the linter and the formatter. It
+ships in the `dev` extra (`pip install -e '.[dev]'`) and is configured entirely
+in `pyproject.toml` — no separate config file.
+
+```bash
+ruff check .                  # lint
+ruff check --fix .            # apply the safe autofixes
+ruff format .                 # format
+ruff format --check .         # verify formatting without writing
+ruff check path/to/file.py    # scope either command to what you touched
+```
+
+The existing tree is **not** clean against this config yet, and neither command
+runs in CI. The config is the target we converge on incrementally: when you
+touch a file, lint and format that file. Don't reformat the repo in a single
+pass — it would bury real changes under thousands of lines of churn.
+
+Rules are selected in `[tool.ruff.lint]`; each `ignore` entry carries a comment
+explaining why. If a rule fights a deliberate pattern in the codebase, add it
+there with a reason rather than sprinkling `# noqa`.

@@ -40,7 +40,7 @@ llm = ["anthropic>=0.40"]
 bedrock = ["boto3>=1.34"]     # AWS Bedrock provider (Converse API, IAM-signed - no API key)
 deepeval = ["deepeval>=1.0"]  # LLM-output-quality eval metrics (`deepeval` scorer); needs a
                               # judge key (OPENAI_API_KEY, or ANTHROPIC_API_KEY + the `anthropic` pkg via rya[llm])
-dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27"]
+dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27", "ruff>=0.16"]
 
 [project.scripts]
 rya = "rya.cli.main:app"
@@ -59,3 +59,43 @@ packages = ["src/rya"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter. `ruff check` / `ruff format` (see docs/devex.md).
+#
+# The existing tree is NOT yet clean against this config; it is the target we
+# converge on file by file, not a gate. Nothing here is enforced in CI yet.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+extend-exclude = ["src/rya/console", "site", ".rya"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes — undefined names, unused imports/variables
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # isort — import ordering
+    "UP",   # pyupgrade — modern syntax for our floor (py310)
+    "B",    # flake8-bugbear — likely bugs
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length — the formatter owns wrapping; long strings/URLs stay
+    "B008",    # call-in-default: Typer/FastAPI declare params this way by design
+    "SIM105",  # contextlib.suppress is not always clearer than try/except: pass
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]      # conftest sets sys.path before importing rya
+"examples/*" = ["E402"]   # examples favour narrative order over import hygiene
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true

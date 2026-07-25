@@ -184,6 +184,32 @@ def _governance(manifest, store, runs, project_root) -> dict:
         "violations": violations,
     }
 
+
+
+def _branding(project_root) -> Optional[dict]:
+    """Env-driven whitelabel for the console: RYA_BRAND_NAME + optional
+    RYA_BRAND_TAGLINE and RYA_BRAND_LOGO (path to a small png/svg, embedded
+    as a data URI). Absent env -> None -> stock Rya chrome."""
+    env = dict(os.environ)
+    try:
+        from dotenv import dotenv_values
+        for k, v in (dotenv_values(Path(project_root) / ".env") or {}).items():
+            env.setdefault(k, v)  # process env wins; .env bakes defaults into the image
+    except Exception:
+        pass
+    name = env.get("RYA_BRAND_NAME")
+    if not name:
+        return None
+    out = {"name": name, "tagline": env.get("RYA_BRAND_TAGLINE") or "agent control plane"}
+    logo = env.get("RYA_BRAND_LOGO")
+    if logo:
+        lp = Path(logo) if Path(logo).is_absolute() else Path(project_root) / logo
+        if lp.is_file() and lp.stat().st_size <= 200_000:
+            import base64
+            mime = "image/svg+xml" if lp.suffix == ".svg" else f"image/{lp.suffix.lstrip('.')}"
+            out["logo"] = f"data:{mime};base64," + base64.b64encode(lp.read_bytes()).decode()
+    return out
+
 def build_console(manifest, store, agent, project_root) -> dict:
     """Rich aggregate state for the web console — everything one dashboard needs
     in a single call, computed from the live runtime (not mocked)."""
@@ -237,6 +263,7 @@ def build_console(manifest, store, agent, project_root) -> dict:
 
     return {
         "ok": True,
+        "branding": _branding(project_root),
         "governance": _governance(manifest, store, runs, project_root),
         "agent": {"name": manifest.name, "version": manifest.version,
                   "runtime": manifest.runtime, "environment": manifest.environment,

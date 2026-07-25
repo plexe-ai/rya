@@ -49,6 +49,9 @@
   .nav button svg{width:15px;height:15px;stroke-width:1.9;color:var(--text-3);flex:none}.nav button:hover svg,.nav button.on svg{color:var(--ink)}
   .nav button .ct{margin-left:auto;font-size:11px;font-weight:500;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--text-3)}
   .nav button .ct.amber{color:var(--amber)}
+  .pwr{display:flex;align-items:center;gap:6px;padding:8px 10px;font-size:11px;color:var(--text-3);border-top:1px solid var(--line)}
+  .pwr svg{width:14px;height:14px;flex:none}.pwr b{font-weight:600;color:var(--text-2)}
+  .ws-logo img{width:100%;height:100%;object-fit:contain;border-radius:4px;background:#fff}
   .side-foot{margin-top:auto;display:flex;align-items:center;gap:9px;padding:8px;border-top:1px solid var(--border)}
   .ava{width:24px;height:24px;border-radius:50%;background:var(--ink);display:grid;place-items:center;color:#fff;font-size:10.5px;font-weight:600;flex:none}
   .side-foot .me{font-size:12.5px;font-weight:500;color:var(--ink)}.side-foot .em{font-size:11px;color:var(--text-3);margin-top:-2px}
@@ -217,7 +220,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <button class="ws" aria-label="Workspace"><div class="ws-logo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name" id="wsName">—</div><div class="ws-sub" id="wsSub">loading…</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
+    <button class="ws" aria-label="Workspace"><div class="ws-logo" id="wsLogo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name" id="wsName">—</div><div class="ws-sub" id="wsSub">loading…</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
     <div class="agent-pick"><span class="ai"><i data-lucide="bot"></i></span><div><div class="nm" id="sideAgent">—</div><div class="en" id="sideEnv">loading…</div></div><span class="dot"></span></div>
     <div class="grp">Build</div>
     <nav class="nav" id="nav">
@@ -247,6 +250,7 @@
       <button data-v="secrets"><i data-lucide="key-round"></i>Secrets<span class="ct" data-ct="secrets"></span></button>
       <button data-v="team"><i data-lucide="users"></i>Team &amp; access</button>
     </nav>
+    <div class="pwr">Powered by <svg viewBox="0 0 532 507" aria-hidden="true"><path fill="currentColor" d="M247 0h38v88h-38z"/><path fill="currentColor" d="M266 0l52 88h-104z"/><rect fill="currentColor" x="60" y="118" width="412" height="330" rx="165"/><rect fill="currentColor" x="0" y="228" width="70" height="120" rx="30"/><rect fill="currentColor" x="462" y="228" width="70" height="120" rx="30"/><rect fill="currentColor" x="80" y="438" width="372" height="69" rx="34"/><rect fill="var(--bg,#fff)" x="100" y="158" width="332" height="250" rx="125"/><rect fill="currentColor" x="172" y="228" width="56" height="110" rx="28"/><rect fill="currentColor" x="304" y="228" width="56" height="110" rx="28"/></svg><b>Plexe</b> · Rya runtime</div>
     <div class="side-foot"><div class="ava" id="meAva">RY</div><div><div class="me" id="meName">—</div><div class="em" id="meEmail">—</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
   </aside>
 
@@ -463,14 +467,21 @@ function showRuntimeDown(msg){
   icons();
 }
 function render(s){
-  document.title='Rya · '+s.agent.name;
-  document.getElementById('agentName').textContent=s.agent.name;
+  const br=s.branding;
+  document.title=(br?br.name:'Rya')+' · '+s.agent.name;
+  if(br){
+    if(br.logo) document.getElementById('wsLogo').innerHTML='<img src="'+br.logo+'" alt="">';
+    document.getElementById('wsName').textContent=br.name;
+    document.getElementById('wsSub').textContent=br.tagline;
+  }
+  const vw=(s.viewer&&s.viewer.workspace&&s.viewer.workspace!=='default')?s.viewer.workspace:null;
+  document.getElementById('agentName').textContent=(br&&vw)?vw:s.agent.name;
   document.getElementById('sideAgent').textContent=s.agent.name;
   document.getElementById('sideEnv').textContent='v'+s.agent.version+' · '+s.agent.environment;
   document.getElementById('wsSub').textContent=s.agent.environment+' · '+s.runtime.store;
   // Real viewer identity (no hardcoded placeholders).
   const v=s.viewer||{}; const ws=(v.workspace&&v.workspace!=='default')?v.workspace:'Default workspace';
-  document.getElementById('wsName').textContent=ws;
+  if(!br) document.getElementById('wsName').textContent=ws;
   const who=v.user||(v.mode==='multi-tenant'?'workspace key':'operator');
   document.getElementById('meName').textContent=who;
   document.getElementById('meEmail').textContent=v.mode||'';

@@ -447,7 +447,18 @@ def build_app(root: Path) -> FastAPI:
         from ..snapshot import build_console
         store = engine.store
         ws_id = getattr(store, "workspace_id", "default")
-        viewer = {"workspace": ws_id,
+        ws_name = ws_id
+        if mt and ws_id != "default":
+            try:
+                import psycopg
+                with psycopg.connect(os.environ["RYA_DATABASE_URL"], autocommit=True) as c_, c_.cursor() as cur:
+                    cur.execute("SELECT name FROM rya_workspaces WHERE id=%s", (ws_id,))
+                    row = cur.fetchone()
+                    if row:
+                        ws_name = row[0]
+            except Exception:
+                pass
+        viewer = {"workspace": ws_name, "workspaceId": ws_id,
                   "mode": "multi-tenant" if mt else "single-tenant",
                   "user": (manifest.owner if not mt else None)}
         return {**build_console(manifest, store, agent, root),

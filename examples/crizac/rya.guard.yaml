@@ -1,0 +1,12 @@
+# Crizac egress + grounding policy. Default deny: the agent can reach CAMS,
+# the contracted-university APIs, and Bedrock - nothing else leaves the process.
+default: deny
+ssrf: true
+fail: closed
+rules:
+  - { kind: prefix, action: allow, url: "https://api.crizac.com/" }
+  - { kind: prefix, action: allow, url: "https://cams.crizac.internal/" }
+  - { kind: glob,   action: allow, url: "https://bedrock-runtime.*.amazonaws.com/*" }
+
+grounding:
+  enabled: true

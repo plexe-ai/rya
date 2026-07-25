@@ -168,3 +168,21 @@ def test_governance_surface_in_console(tmp_path):
         assert c3["governance"]["policy"]["hash"] != g["policy"]["hash"]
     finally:
         del os.environ["RYA_REQUIRE_APPROVER_IDENTITY"]
+
+
+def test_branding_from_project_env(tmp_path):
+    scaffold.write_project(tmp_path, "brand", template="demo")
+    (tmp_path / ".env").write_text("RYA_BRAND_NAME=Crizac\nRYA_BRAND_TAGLINE=Making education easy\n")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
+    c = build_console(manifest, engine.store, agent, tmp_path)
+    assert c["branding"] == {"name": "Crizac", "tagline": "Making education easy"}
+
+
+def test_no_branding_by_default(tmp_path):
+    scaffold.write_project(tmp_path, "plain", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
+    assert build_console(manifest, engine.store, agent, tmp_path)["branding"] is None

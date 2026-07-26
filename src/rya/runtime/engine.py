@@ -340,6 +340,11 @@ class Engine:
             on_ui=on_ui,
         )
 
+        # Record who this run was for, so observability backends can attribute it
+        # (Langfuse `userId`) without each agent having to plumb it through.
+        if identity is not None and getattr(identity, "sub", None):
+            run["userId"] = identity.sub
+
         async def invoke():
             res = handler(ctx, arg)
             if inspect.isawaitable(res):

@@ -39,6 +39,15 @@ from ..store import Store, now_iso, _new_id
 from ..tools.registry import ToolRegistry
 
 
+def _iso_ms(dt: datetime) -> str:
+    """Millisecond-precision UTC ISO timestamp, for trace step timing.
+
+    Deliberately separate from ``store.now_iso()``: that one is second-resolution
+    and its exact format is compared when scheduling jobs, so it must not change.
+    """
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 @dataclass
 class Event:
     id: str
@@ -166,6 +175,11 @@ class RuntimeContext:
         self.project_root = project_root
         self.identity = identity  # verified user Identity, or None
         self._seq = 0
+        # Id of the ctx.llm.run agent loop currently executing, if any. Stamped
+        # onto that loop's model steps and the tool calls they trigger, so an
+        # observability backend can group a loop's steps under one span without
+        # the runtime having to journal an extra (replay-visible) step.
+        self._active_loop: Optional[str] = None
         self._env = load_env(project_root)
 
         # Secret-redaction vault (pattern from openclaw's SecretVault): collect
@@ -203,7 +217,9 @@ class RuntimeContext:
         entry = self.run["journal"].get(key)
         if entry is not None and entry.get("status") == "done":
             return entry.get("result")  # memoized replay — no re-execution, no new trace
+        started = datetime.now(timezone.utc)
         result = fn()
+        ended = datetime.now(timezone.utc)
         self.run["journal"][key] = {
             "seq": seq,
             "kind": kind,
@@ -211,7 +227,8 @@ class RuntimeContext:
             "status": "done",
             "result": result,
         }
-        self._trace(kind, label, {**(data or {}), "result": result})
+        self._trace(kind, label, {**(data or {}), "result": result},
+                    started=started, ended=ended)
         self.store.save_run(self.run)
         return result
 
@@ -225,14 +242,19 @@ class RuntimeContext:
         entry = self.run["journal"].get(key)
         if entry is not None and entry.get("status") == "done":
             return entry.get("result")
+        started = datetime.now(timezone.utc)
         result = await afn()
+        ended = datetime.now(timezone.utc)
         self.run["journal"][key] = {"seq": seq, "kind": kind, "label": label,
                                     "status": "done", "result": result}
-        self._trace(kind, label, {**(data or {}), "result": result})
+        self._trace(kind, label, {**(data or {}), "result": result},
+                    started=started, ended=ended)
         self.store.save_run(self.run)
         return result
 
-    def _trace(self, kind: str, label: str, data: dict) -> None:
+    def _trace(self, kind: str, label: str, data: dict,
+               started: Optional[datetime] = None,
+               ended: Optional[datetime] = None) -> None:
         entry = {
             "seq": len(self.run["trace"]),
             "ts": now_iso(),
@@ -240,6 +262,13 @@ class RuntimeContext:
             "label": self._redact(label),
             "data": self._redact(data),
         }
+        # Real wall-clock span for this step, at millisecond precision. `ts` stays
+        # second-resolution (now_iso is compared for scheduling elsewhere), so
+        # observability backends need these to show true latency instead of
+        # collapsing every step in a turn onto the same second.
+        if started is not None:
+            entry["startedAt"] = _iso_ms(started)
+            entry["endedAt"] = _iso_ms(ended or started)
         self.run["trace"].append(entry)
         if self._on_trace is not None:
             try:
@@ -495,7 +524,9 @@ class _LLM:
 
         # Journal document names only - never raw bytes (the journal is replayed
         # and shipped to observability backends).
-        step_data = {"system": system}
+        step_data = {"system": system, "input": input,
+                     "modelParameters": {"temperature": temperature, "max_tokens": max_tokens,
+                                         "provider": provider, "route": route}}
         if documents:
             step_data["documents"] = [d.get("name") or d.get("path") for d in documents]
         res = self._ctx._step("llm.respond", label, run, step_data)
@@ -563,25 +594,43 @@ class _LLM:
         # Pass stream=False for an internal loop whose text must not reach the
         # user's token stream (mirrors respond()).
         on_token = self._ctx._on_token if stream else None
-        for step in range(max_steps):
-            def turn(_msgs=list(messages)):
-                return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
-                                     model_default=model, provider=provider,
-                                     temperature=temperature, max_tokens=max_tokens,
-                                     on_token=on_token)
+        # Tag this loop's steps (and the tool calls they trigger) with one id, so
+        # observability can render them as a single "agent loop" span. Purely
+        # descriptive data on existing steps — no extra journaled step, so replay
+        # after an approval pause is unaffected. Restored in `finally` because a
+        # nested/second ctx.llm.run must not inherit this loop's id.
+        loop_id = _new_id("loop")
+        outer_loop = self._ctx._active_loop
+        self._ctx._active_loop = loop_id
+        params = {"temperature": temperature, "max_tokens": max_tokens,
+                  "provider": provider, "route": route}
+        try:
+            for step in range(max_steps):
+                def turn(_msgs=list(messages)):
+                    return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
+                                         model_default=model, provider=provider,
+                                         temperature=temperature, max_tokens=max_tokens,
+                                         on_token=on_token)
 
-            res = self._ctx._step("llm.chat", f"step {step}", turn, {"system": system})
-            calls = res.get("toolCalls") or []
-            if not calls:
-                return {"text": res.get("text", ""), "steps": step + 1, "toolCalls": ran}
-            messages.append({"role": "assistant", "content": res.get("text", ""), "toolCalls": calls})
-            for c in calls:
-                name = c.get("name")
-                # Governed execution: permission + scoped creds + Action Guard all apply.
-                result = await self._ctx.tools.call(name, c.get("input") or {})
-                ran.append({"tool": name, "input": c.get("input"), "result": result})
-                messages.append({"role": "tool", "name": name, "toolUseId": c.get("id"), "content": result})
-        return {"text": "[max_steps reached]", "steps": max_steps, "toolCalls": ran}
+                # Journal the exact prompt for this step (system + the messages sent
+                # so far) so observability backends can show the real model input,
+                # not just the system block. Snapshot the list — it grows each step.
+                res = self._ctx._step("llm.chat", f"step {step}", turn,
+                                      {"system": system, "messages": list(messages),
+                                       "loopId": loop_id, "modelParameters": params})
+                calls = res.get("toolCalls") or []
+                if not calls:
+                    return {"text": res.get("text", ""), "steps": step + 1, "toolCalls": ran}
+                messages.append({"role": "assistant", "content": res.get("text", ""), "toolCalls": calls})
+                for c in calls:
+                    name = c.get("name")
+                    # Governed execution: permission + scoped creds + Action Guard all apply.
+                    result = await self._ctx.tools.call(name, c.get("input") or {})
+                    ran.append({"tool": name, "input": c.get("input"), "result": result})
+                    messages.append({"role": "tool", "name": name, "toolUseId": c.get("id"), "content": result})
+            return {"text": "[max_steps reached]", "steps": max_steps, "toolCalls": ran}
+        finally:
+            self._ctx._active_loop = outer_loop
 
 
 class _Models:
@@ -628,7 +677,9 @@ class _Memory:
         def run():
             return self._ctx.store.load_memory(s)["kv"].get(key)
 
-        return self._ctx._step("memory.get", f"{s}:{key}", run)
+        # Record what was asked for, so a lookup that MISSES still reads as a
+        # deliberate "scope/key -> null" in traces rather than an empty row.
+        return self._ctx._step("memory.get", f"{s}:{key}", run, {"scope": s, "key": key})
 
     async def set(self, key: str, value: Any, scope: Optional[str] = None) -> Any:
         s = self._scope(scope)
@@ -1004,8 +1055,12 @@ class _Tools:
             self._apply_adoption(decl, result)
             return result
 
+        # Carry the enclosing agent-loop id (if this call came from ctx.llm.run)
+        # so tracing can nest the tool under the model step that requested it.
+        loop = self._ctx._active_loop
         return await self._ctx._astep("tool.call", tool_id, run_tool,
-                                      {"input": input, "permission": perm.value, "impl": impl, **meta})
+                                      {"input": input, "permission": perm.value, "impl": impl,
+                                       **({"loopId": loop} if loop else {}), **meta})
 
     @staticmethod
     def _error_class(exc) -> Optional[str]:

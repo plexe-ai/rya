@@ -29,7 +29,10 @@ def run_usage(run: dict, env: Optional[dict] = None) -> dict:
     cost = 0.0
     priced = False
     for ev in run.get("trace", []):
-        if ev.get("kind") != "llm.respond":
+        # Count every real LLM call: single-shot `llm.respond` AND each governed
+        # agent-loop step `llm.chat` (both carry {model, usage}). Without llm.chat
+        # the whole compose loop's tokens/cost were silently dropped from metering.
+        if ev.get("kind") not in ("llm.respond", "llm.chat"):
             continue
         res = (ev.get("data") or {}).get("result") or {}
         usage = res.get("usage") or {}

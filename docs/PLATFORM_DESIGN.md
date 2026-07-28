@@ -15,12 +15,44 @@ still up for debate.
 
 | # | Decision | Why it matters | Detail |
 |---|---|---|---|
-| **D1** | Split the platform/SDK boundary at the **policy** layer, not the store layer | makes control-plane parity across every execution topology structural instead of a permanent testing problem | §3, §7, §11, §14 phase 0 |
+| **D1** | Split the platform/SDK boundary at the **policy** layer, not the store layer | a governed decision must not ship inside a client-versioned artifact. This is a *coupling and versioning* constraint, not a trust one — see §4.4 for how Temporal, Prefect and Trigger.dev all land in the same place | §3, §5.4, §7, §11, §14 phase 0 |
 | **D2** | A run's config/secrets are **platform-delivered**, never read ambiently from the worker's process | kills the "works on my machine" bug class — which is live in this codebase today | §7, §9 |
 | **D3** | Push tool implementations toward **platform-resolved `url:` tools** wherever a tool is a pure HTTP call | collapses egress parity, thins workers, removes round trips | §7 |
 | **D4** | **Journal-diff conformance** is the parity test; pool binding is **explicit, with no fallback** | parity becomes a CI diff; a prod run can never execute on a dev laptop | §5.2, §11 |
 
 Open questions are collected in §15.
+
+### Positioning deltas — six decisions this RFC forces
+
+D1–D4 are architecture and are settled. The six below are **product decisions**
+that this RFC currently makes implicitly, by contradicting something the repo,
+the docs, or the public site already commits to. They are listed here so they get
+decided deliberately rather than absorbed. None of them is mine to settle.
+
+| # | Committed today | What this RFC implies | Status |
+|---|---|---|---|
+| **P1** | `architecture.md:11-12` — "**the store is the seam** that makes one codebase serve every tier," with `ctx`/`engine` holding the store handle | D1: the worker never touches the store; the seam is policy | direct reversal of the documented central idea — needs `architecture.md` rewritten, not patched |
+| **P2** | `site/index.html` — "**We do not run a multi-tenant SaaS.** Each customer gets a dedicated deployment inside their own account"; `deploy/aws/template.yaml:3-9` — "no shared blast radius" | managed multi-tenant is the *default* pool kind (§4.1) | **a live public claim, verbatim contradicted.** Coexistence is possible — single-tenant becomes the on-prem / self-hosted-pool topology — but the marketing claim must change from absolute to tiered |
+| **P3** | `architecture.md:96-105` draws OSS-core vs proprietary-cloud; `LICENSE` grants Apache-2.0 (irrevocably) over *all* of `src/rya`, including `guard.py`, `seal.py`, `tenancy.py` — the very modules that diagram labels proprietary. `architecture.md:107` already admits the licence is "a product decision, not yet committed" | §13's repo split cuts by *who executes*, moving guard / seal / policy / store / providers platform-side | the split forces the licensing decision that has been deferred. Note the existing grant is perpetual and irrevocable for today's code; only future platform releases could differ |
+| **P4** | `README.md:93-95` — "`rya serve` is the whole product in one process… the hosted instance **is** `rya serve`" | control plane and execution plane are separate deployables | §1 of this RFC uses that exact sentence's subject as its problem statement |
+| **P5** | `README.md:61-63`, `langfuse.md:37` — set `ANTHROPIC_API_KEY` / `RYA_DATABASE_URL` / `LANGFUSE_*` and the same code runs everywhere | D2: ambient env is not a run input | the documented mechanism becomes a readiness-gate finding |
+| **P6** | `rya` on PyPI is the package an *agent author* installs — `uvx rya create` in `README.md:54` and on the site. **The publish is still pending sign-off** | `rya` becomes the platform package (keeps `api`/`postgres`/`llm`/`mcp`); `rya-sdk` is the client one | name inversion: both packages want the `rya` console script, and `uvx rya create` breaks. **Recommend pausing the pending `uv publish` until this is settled** — a PyPI name is effectively irreversible |
+
+**Two commitments this RFC currently drops in silence** — both need an explicit
+verdict rather than omission:
+
+- **The Cognito / API-Gateway / per-mutator-Lambda architecture.**
+  `VISION_GAP.md:141-142` calls it "the hardest, most differentiating property,"
+  and `deploy/aws/template.yaml` already implements it (cfn-lint clean). This RFC
+  answers the same question — how does a governed write get validated — a
+  structurally different way (policy service + authorize/commit RPC, §7) and never
+  says whether the Lambda-mutator model is superseded, absorbed, or abandoned.
+- **RWAP** (`docs/integrations/rwap.md`) — a real external consumer of the bare
+  `/queue/*` HTTP API, explicitly designed so "RWAP never adopts Python" and needs
+  no SDK. §4 leans on `queue.py` as its foundation and §5.2 adds worker
+  registration carrying protocol version, SDK version and bundle digest, without
+  stating whether the SDK-free HTTP path survives unchanged. A working integration
+  is at silent risk.
 
 ---
 
@@ -149,16 +181,26 @@ Everything else follows from this. Three coherent answers exist in the market.
 | Client-network data access | needs egress/peering | native | choice |
 | Code/secrets leave client network | yes | no | choice |
 | Build service, registry, sandboxing needed | yes | no | yes (later) |
-| Distance from today's code | large | **small** — `queue.py` is already this | — |
+| Distance from today's code | large | **moderate** — see the correction below | — |
 
 **Recommendation: C, sequenced B → A.**
 
-B is close to shipping: `queue.py` already gives external workers claim / lease /
-heartbeat / complete / fail / retry / DLQ / concurrency caps, and the TS client
-already implements the worker loop. Standing up a *code-executing* worker on top
-of that unblocks the repo split — the highest-value outcome — in weeks rather
-than a quarter. A is then a strictly additive statement: "the platform operates
-the worker pool for you", reusing the identical protocol, plus a build service.
+`queue.py` already gives external workers claim / lease / heartbeat / complete /
+fail / retry / DLQ / concurrency caps, and the TS client already implements that
+loop. **But an earlier draft of this section claimed the distance to B was
+"small," and that was wrong.** `queue.py` is a queue for *opaque background jobs*
+whose payloads a caller-supplied handler interprets; it has no relationship to
+`RuntimeContext`, the journal, or replay. There is no worker registration, no
+capability advertisement, and no "claim a run, receive its journal snapshot,
+authorize → execute → commit per new step" flow. The only place a queue-claimed
+job maps onto real agent-run execution is `turns.py:_run_turn`, and it does so
+**in-process**, calling `engine.run_event(...)` with the store handle the caller
+already has. So: the queue *mechanics* are done and genuinely reusable; the
+store-less, code-executing worker is greenfield. B is still the right first step
+and still far cheaper than A — it just isn't nearly free.
+
+A is then a strictly additive statement: "the platform operates the worker pool
+for you", reusing the identical protocol, plus a build service.
 
 This also matches the on-prem story you want: an on-prem install is the same
 platform with a managed pool inside the customer's own cluster.
@@ -204,7 +246,9 @@ uncommitted code.
 Not philosophy — your own repo is the argument. `rya-agent/src/students_store.py`
 reads the same Postgres the Next.js app owns, and the Crizac client talks to an
 internal CRM. That is a VPC-local dependency, which is the canonical reason a
-client must host the worker: the data cannot move. Add data residency,
+client must host the worker: the data cannot move. (§5.6 invariant 1 is scoped so
+this is explicitly *allowed* — the worker is barred from the **platform's** state,
+never from the client's own.) Add data residency,
 compliance, egress to internal systems, special hardware. Managed stays the
 default because nobody wants to run ops and because we control the isolation
 posture there.
@@ -216,6 +260,57 @@ the platform's; only the compute is borrowed, and the user-visible contract
 weakens: a client can operate their compute badly — wrong image, no autoscale,
 blocked egress — and the platform can only *detect* that, not prevent it. Hence
 capability advertisement (§5.2) and per-pool health surfaced in the console.
+
+### 4.4 Prior art: where the others cut
+
+Read from their docs rather than from memory, because this decision is the one
+most worth borrowing on.
+
+| | Where code runs | Worker → DB? | Who owns state transitions | Local dev |
+|---|---|---|---|---|
+| **[Temporal](https://docs.temporal.io/encyclopedia/architecture/how-temporal-works)** | the customer's workers, *including on Temporal Cloud* | **never** — explicit in the docs | the Server: workers emit **Commands**, the History Service validates them into Events and persists | a worker on your machine against a server |
+| **[Prefect](https://www.prefect.io/how-it-works)** | the customer's infra — "your code and data never leave your infrastructure" | **no** — workers *poll* the API; Prefect makes no inbound request into your network | the control plane: scheduling, state, orchestration rules; it receives "logs and state, never your data" | a worker process locally |
+| **[Trigger.dev](https://mintlify.wiki/triggerdotdev/trigger.dev/how-it-works)** | their infra (supervisor + per-task containers) | via API | the platform: queue, run state, CRIU checkpoints, observability | [`trigger dev`](https://trigger.dev/docs/cli-dev-commands) runs tasks in a **local Node process** registered with the webapp |
+
+Three conclusions:
+
+1. **All three cut above the store; none hands the executing process a database.**
+   Three independent teams, three different products, same boundary.
+2. **Two of the three treat customer-run workers as the default, not an exception
+   — and still do not ship state-transition authority to them.** Temporal Cloud's
+   workers are *always* the customer's. Prefect sells the hybrid model as the
+   enterprise posture. So "customer-hosted" is not a second-class or suspect
+   topology; and yet neither concludes "therefore let the worker decide." The
+   industry answer is *trusted workers, server-validated transitions* — not
+   because workers are hostile, but because it is the only way one orchestrator
+   serves many worker versions and topologies at once.
+3. **Temporal kept determinism and replay SDK-side, and that is exactly where its
+   well-known pain lives.** Non-determinism-on-replay errors, `GetVersion`
+   patching, [Worker Versioning](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning)
+   with Build IDs and Deployment Versions, and warnings that once an SDK option is
+   enabled you cannot roll back to an SDK that lacks it. An entire product surface
+   exists to manage the consequences of SDK-side replay logic. That is empirical
+   evidence for putting *less* in the SDK — and it independently confirms §7's
+   journal/version coupling risk, since Worker Versioning is precisely the
+   mitigation proposed there.
+
+**Where the analogy breaks — in our favour.** None of these three has Rya's
+governance layer. Temporal has no notion of "the model may not call this tool", no
+egress firewall, no grounding gate, no approval tier a caller cannot bypass. For
+them, SDK-side logic is *bookkeeping*: wrong is annoying. For Rya the policy layer
+is a *security boundary*: wrong means a student record written against the wrong
+counsellor. Rya therefore has strictly more reason to server-side policy than the
+three companies that already do.
+
+**A note on framing.** "Untrusted worker" is the wrong justification and should
+not appear in this design. The property that matters is not malice but **skew**: a
+self-hosted worker is not hostile, it is eight months behind on the SDK; a laptop
+is not adversarial, it has a stale virtualenv and a `.env` from March. Trust the
+operator completely and every coupling argument above still holds. Corollary worth
+keeping: **trust changes the performance envelope, not the authority boundary** —
+a co-located managed pool can legitimately earn read-side fast paths (cached or
+replica-served memory and knowledge reads) while every decision and every write
+stays server-side.
 
 ---
 
@@ -230,8 +325,8 @@ capability advertisement (§5.2) and per-pool health surfaced in the console.
 | **Dispatcher** | matches ready runs/jobs to workers by (environment, version, pool, concurrency key) | `queue.py` (extend) |
 | **Scheduler** | cron, delayed jobs, lease reaping, turn reclaim sweeps | engine cron + sweeper |
 | **LLM gateway** | all model calls; routes, fallbacks, streaming, token/cost metering, prompt/response tracing | `providers/`, `observability/usage` |
-| **Policy service** | tool permission resolution, kill switches, arg pinning, scoped-credential authorization | `sdk/context.py` (extract) |
-| **Guard / egress proxy** | outbound allowlist for tool + worker traffic, grounding gate | `guard.py` (promote to a proxy) |
+| **Policy service** | tool permission resolution, kill switches, arg pinning, scoped-credential authorization | extract from `sdk/context.py` — logic exists and is tested, but inline in the file being thinned. Kill switches also need carving out of `load_memory("_runtime_config")`, an ordinary memory scope with no schema distinction from user data |
+| **Guard / egress proxy** | outbound allowlist for tool + worker traffic, grounding gate | `guard.py` — a rewrite, not a promotion: policy loads from `cwd`/`RYA_GUARD_PATH` by file mtime, and `check_egress` is called from `_http_tool` *inside `sdk/context.py`* |
 | **Vault** | connection secrets, per-user credentials, envelope encryption via KMS | `seal.py`, `ctx.connections` |
 | **Stream service** | durable turn buffers, fan-out to UI clients, resume by `Last-Event-ID` | `turns.py` |
 | **Build service** | bundle → image → registry → version record (phase 3+) | — |
@@ -239,7 +334,9 @@ capability advertisement (§5.2) and per-pool health surfaced in the console.
 
 Splitting these into separate deployables is a scaling decision, not an
 architectural one — they can start as one binary with feature flags (as `rya
-serve` is today) and be pulled apart along these seams.
+serve` is today) and be pulled apart along these seams. §5.4 gives the same
+picture cut by *concern* rather than by service, which is the more useful view
+when arguing about where a given behaviour belongs.
 
 ### 5.2 Execution plane
 
@@ -271,6 +368,113 @@ carries the durability proofs. Redis for hot reads, dispatcher signalling, and
 stream fan-out. Object store for deployment bundles, large payloads, and file
 artifacts (`files_s3.py` exists). Container registry for built images. KMS for
 envelope-encrypting vault material.
+
+### 5.4 Division of responsibility
+
+The one-line rule: **the worker executes; the control plane decides and
+remembers.** Everything below follows from that, and any row that drifts from it
+is either a bug or a decision someone needs to record (§15 risk 5).
+
+| Concern | Control plane | Worker pool |
+|---|---|---|
+| Run lifecycle + status | creates, owns, terminates | reports its outcome |
+| Journal | appends, memoizes, validates step ordering | receives a snapshot; requests commits |
+| Handler bodies (`on_event`, `job`, `cron`, `tool`) | never | **executes** — this is its whole job |
+| Tool permission + kill switches | resolves, fail-closed | asks |
+| Arg pinning | resolves from trusted state, overwrites caller args | receives already-pinned input |
+| Scoped credential authorization | intersects tool ∩ connection ∩ user scopes | receives a handle, never the secret |
+| `@agent.tool` leaf implementation | never | executes |
+| `url:` HTTP tool | performs the call (D3) | not involved |
+| Model calls, routes, fallbacks | performs all of them; meters tokens + cost | requests completions |
+| Governed model loop | authorizes and journals each step | drives the loop |
+| Memory / knowledge / vector search | owns, persists, embeds | requests |
+| Sessions | owns | requests |
+| Approvals — request, pause, resolve, resume | records the pause, resolves it, re-dispatches | raises the pause and exits |
+| Channels (outbound email, webhook) | sends | requests |
+| Jobs / cron / delayed work | schedules, leases, retries, dead-letters | claims and executes |
+| Turn stream buffer + UI fan-out | owns; **sole path to end users** | emits frames upstream only |
+| Guard — egress allowlist | decides and enforces (proxy) | subject to it |
+| Guard — grounding gate + id-secrecy scrub | applies at commit | not involved |
+| Secret storage + redaction | vaults; redacts before anything persists | holds nothing long-lived |
+| Per-environment config | owns, versions, delivers per run (D2) | receives it; never reads ambient env |
+| Traces / usage / cost | produces the record | contributes step data |
+| Evals | runs them, gates promotion | executes handlers under eval |
+| Deployment versions + rollout | builds, pins, promotes, retains | advertises which version it is |
+| Dispatch, concurrency, fairness | decides | requests work |
+| Worker registration, lease, heartbeat | grants, expires, reclaims | registers and heartbeats |
+| Identity (JWT verify, RLS scoping) | verifies, scopes, restores on replay | carries an opaque token |
+| Retry / backoff / dead-letter decisions | decides | reports failure, nothing more |
+
+Read the middle column as *authority*, not *location*: a self-hosted pool changes
+where the compute sits without moving a single row leftward or rightward.
+
+**One row above is not true of today's code, in a way that matters.** There are
+*two* tool-execution paths, and only one is governed. `ctx.tools.call`
+(`sdk/context.py:978`) resolves permission, pins, credentials and scrub as
+described. `Engine._execute_action` (`runtime/engine.py:419-459`) — the path taken
+when an **approval resolves** — re-implements channel / HTTP / handler / mock
+dispatch with no permission check, no `guard.scrub`, and only an ad-hoc credential
+lookup. A policy service that wraps only `ctx.tools.call` would silently leave
+every approved action ungoverned. This is a live gap today, not merely a migration
+concern, and closing it is phase-0 work (§14).
+
+### 5.5 Access matrix
+
+Responsibility is what each side *does*; this is what each side can even *reach*.
+The second table is the one that makes the first enforceable.
+
+| Resource | Control plane | Worker pool |
+|---|---|---|
+| **The platform's** Postgres / store | full owner | **never** — no handle, no DSN, no database identity |
+| Journal rows | writes them | reads a per-run snapshot; writes only via commit RPC |
+| Model provider keys | holds | never sees one |
+| Connection secrets / vault | holds and uses | capability handle — *aspirational; today `ctx.connections.secret()` hands over the raw bearer, see §5.6* |
+| Object store | owns | scoped, expiring URLs when a payload must move |
+| Kill-switch + permission state | authoritative | may cache a hint; never authoritative |
+| Per-environment config | owns | receives per-run delivery |
+| Deployment bundles / registry | owns | pulls its own image |
+| Public internet | for `url:` tools | via the guard proxy (managed); its own path (self-hosted) |
+| The client's VPC — their Postgres, internal CRM | only if reachable, and only for a `url:` tool | **native access — this is why self-hosted pools exist** |
+| End users (browser, email recipient) | sole path | **never** |
+| Any other tenant's anything | RLS-bounded | no addressable surface at all |
+
+Note the shape those two tables make together: the worker is reachable *from*
+nothing and reaches *almost* nothing — except the one thing it exists for, which
+is the client's own systems. That is the whole architecture in a sentence.
+
+### 5.6 Invariants (the phase-0 review checklist)
+
+Six rules that make D1 checkable rather than aspirational. A PR that breaks one
+needs an explicit recorded decision, not a rationale in a commit message.
+
+1. The worker never holds a handle, DSN, or database identity **for the
+   platform's own state**. Its access to the *client's* systems is unrestricted —
+   that is the entire point of a self-hosted pool (§4.3), and the earlier draft of
+   this invariant wrongly forbade it. `rya-agent/src/students_store.py` connecting
+   to the client's own Postgres is *correct* under this rule; a worker reaching
+   `rya_runs` is not.
+2. The worker never holds a long-lived **platform-issued** credential. Model keys
+   never reach it at all. Upstream credentials for the client's own systems are
+   leased, short-lived and scoped — **not yet true today**, see below.
+3. No policy predicate executes worker-side.
+4. Every persisted fact **about a run** is written by the control plane.
+5. The worker has no inbound network surface — it always dials out.
+6. The worker has no path to an end user; all frames go through the platform.
+
+**Invariant 2 conflicts with a deliberate, load-bearing API today.**
+`ctx.connections.secret()` (`sdk/context.py:1368`) returns *the raw plaintext
+bearer* to handler code — documented as "for a HANDLER to build an upstream client
+with", enforcing the scope-intersection rule and seeding the redaction vault, and
+deliberately **not** journaled so a replay re-resolves it live rather than
+memoizing a credential. This is not an oversight to be tightened away: it is how
+`csa-counsellor` authenticates every live Crizac tool (a bearer minted once per
+turn and carried to leaf handlers through a `ContextVar`), and `CORE_GAPS.md` asks
+for *more* of this capability, not less. Invariant 2 as originally written would
+have deleted a working feature the only real client depends on. Three candidate
+resolutions — lease short-lived credentials with a TTL and refresh; proxy the
+upstream call platform-side so the worker never needs the secret (the real payoff
+of D3); or keep raw hand-off as an explicitly governed, audited exception. This is
+an open design item (§15), and it is a prerequisite for the CSA proof (§14).
 
 ---
 
@@ -357,6 +561,30 @@ than emulated; the worker gets thinner; and the round trip disappears. The
 direction of travel is therefore "as few `@agent.tool` handlers as the logic
 actually requires" — client-side handlers earn their place by needing local
 libraries, VPC-local data, or real computation, not merely by existing.
+
+**How big the protocol actually is — measured, not estimated.**
+`sdk/context.py` routes **38 `_step`/`_astep` call sites** through roughly **35
+distinct journaled kinds** (`memory.*`, `knowledge.*`, `session.*`, `connection.*`,
+`file.*`, `job.*`, `channel.send`, `log`, `trace.event`, `event.emit`, `ui.emit`,
+`llm.respond`, `llm.chat`, `model.call`, `tool.call`). By §5.4's own authority
+table, about **30 of those 35 move server-side** — not the handful implied by
+calling this "the main surgical split" in §16. Protocol v0 is therefore ~30
+semantic operations, and three of them are entangled in ways the protocol sketch
+above does not yet resolve:
+
+- **`guard.scrub` runs inside the journaled closure** (`sdk/context.py:1054`,
+  within the `run_tool()` passed to `_astep`) — so "execute" and the
+  platform-owned "scrub at commit" are literally the same line today. There is no
+  existing commit step to split at.
+- **Retry and repair happen inside one journaled step.**
+  `_invoke_with_recovery` (`sdk/context.py:1088-1128`) runs N backend attempts plus
+  an `@agent.repair` callback inside a single `tool.call`. The current code has
+  already made an implicit choice — *one authorization, N local attempts* — that
+  the protocol must deliberately preserve or knowingly break. Undecided.
+- **Streaming callbacks are function pointers, not messages.** `on_token` is
+  handed straight into the provider call (`sdk/context.py:494,510,610-613`), so
+  token frames fire from inside a third-party HTTP-streaming parser several frames
+  below `ctx`. None of this crosses a process boundary unmodified.
 
 **The governed model loop stays worker-driven.** The worker owns the tool
 handler code, so it runs the `ctx.llm.run` loop and calls the LLM gateway per
@@ -487,6 +715,11 @@ This is an *improvement* on today, not merely a preservation of it. Right now
 the split, governance version is a platform property that no client can pin,
 fork, or lag behind.
 
+Note what this argument does *not* rest on: nobody has to distrust the operator.
+The failure mode being designed out is skew, not malice — a worker that is
+perfectly well-intentioned and four SDK releases behind (§4.4). §5.4 and §5.5 are
+the authoritative statement of which side owns what.
+
 The single exception is tier-1 local mode (§10), which genuinely is a second
 implementation. If it survives, the rule is: **allowed to be incomplete, never
 allowed to be divergent** — unimplemented operations fail loudly instead of
@@ -503,8 +736,10 @@ above all **egress**: a laptop reaches the whole internet, a pod's egress is
 default-deny through the guard proxy, so a tool calling an undeclared host works
 in dev and fails in prod.
 
-This codebase already contains a sharper instance of the same bug class.
-`crizac_config_from_env()` returns `None` when `CRIZAC_*` is unset *or
+The client repo contains a sharper instance of the same bug class (in
+`chatstudyabroad/rya-agent`, not in `rya` itself — an earlier draft said "this
+codebase," which was wrong). `crizac_config_from_env()`
+(`src/crizac/config.py:45`) returns `None` when `CRIZAC_*` is unset *or
 incomplete*, and every Crizac-backed tool then silently falls back to the
 `data/*.json` seeds. Byte-identical code therefore runs against two different
 worlds with no signal at all — which is exactly why D2 makes run inputs
@@ -537,6 +772,15 @@ model responses pinning the loop.
 
 The journal already is the durability substrate, and it turns out to be a
 near-perfect equivalence oracle. Parity becomes a CI diff instead of an argument.
+
+**Two prerequisites, neither true today.** First, **D2 must actually land before
+D4 is meaningful** — otherwise a diff between a dev worker (with `CRIZAC_*` unset,
+so seed data) and a managed pool (configured, so live data) is dominated by
+config-driven divergence, which is the very failure mode §11.2 uses as its
+example. Second, **model determinism must be pinned**: `csa-counsellor`'s primary
+conversational route (`compose`) carries no `temperature: 0` — only `extract`
+does — and its eval judge already shows real run-to-run variance. Until both
+hold, a journal diff produces noise, not signal.
 
 ### 11.4 The claim we actually make
 
@@ -581,28 +825,76 @@ what stops the protocol from silently becoming "whatever the Python SDK does".
 
 ## 14. Migration plan
 
-Each phase ends in something shippable; `csa-counsellor` is the reference client
-throughout, and "no behaviour change for CSA" is the acceptance test for phases
-0–2.
+Each phase ends in something shippable. `csa-counsellor` is the reference client
+throughout — but see phase 1 for what it can and cannot actually prove.
 
 - **Phase 0 — draw the policy boundary (no behaviour change).** The defining task
-  of the whole migration, and where D1 is either earned or lost. Extract policy
-  decisions (permission resolution, pin resolution, credential authorization,
-  guard verdict, grounding) out of `sdk/context.py` into a service boundary, put a
-  transport abstraction under `ctx` whose in-process implementation is today's code
-  path, and freeze protocol v0 as the exact set of operations `ctx` performs. Also
-  land D2 here: config/secrets become a run input delivered by the platform
-  instead of `load_env(project_root)`. Nothing observable changes; everything
-  afterwards depends on this being drawn in the right place.
+  of the whole migration, and where D1 is either earned or lost. Five pieces of
+  work; the scope is materially larger than this plan's earlier draft claimed:
+  - Extract policy decisions (permission resolution, pin resolution, credential
+    authorization, guard verdict, grounding) out of `sdk/context.py` into a
+    service boundary whose in-process implementation is today's code path.
+  - **Close the second ungoverned tool path.** `Engine._execute_action`
+    (`runtime/engine.py:419-459`) must route through the same policy service, or
+    every approved action stays ungoverned (§5.4).
+  - Carve kill-switch state out of the generic `_runtime_config` memory scope
+    into privileged, worker-unreachable storage.
+  - Rewrite `guard.py`'s policy loading away from `cwd` + file mtime toward
+    per-environment platform state, and lift `check_egress` out of
+    `sdk/context.py`.
+  - Land D2 — at its real scope. **86 `os.environ` reads across 20 files**, of
+    which `providers/llm.py` alone has 22, called from inside
+    `ctx.llm.respond`/`run` and bypassing `ctx._env` entirely. Replacing
+    `load_env`/`ctx.secrets` (this plan's earlier scope) does not touch the
+    model-call path at all.
+
+  Then freeze protocol v0 as the ~30 semantic operations §7 measures. Nothing
+  observable changes; everything after depends on this line being in the right place.
 - **Phase 1 — remote worker + the parity harness.** A worker process that
   registers, receives runs with journal snapshots, executes handlers, and commits
-  steps over protocol v0. Ship the D4 journal-diff harness *with* it, not after —
-  it is how we know phase 1 is correct. Proof: `csa-counsellor` running in its own
-  container with no runtime imports, against a `rya serve` control plane, passing
-  the existing phase tests and evals with a clean journal diff against in-process
-  execution. Audit its 26 tools for D3 while here: every one that is a pure Crizac
-  HTTP call is a candidate to become a platform-resolved `url:` tool, and several
-  already declare their `url:`.
+  steps over protocol v0. Ship the D4 journal-diff harness *with* it — it is how
+  we know phase 1 is correct. Two things this phase must also absorb: the
+  **streaming rebuild** (`/ws` and SSE pass raw Python closures into the engine
+  in-process and cannot survive a process split; only `turns.py`'s durable seq'd
+  buffer can, so the other two get rebuilt on it), and the **test substrate**
+  (9 files construct `RuntimeContext` directly against a FileStore — including
+  `test_platform_gaps.py`, the direct coverage for exactly the primitives D1
+  relocates — and 25 more steer behaviour with `monkeypatch.setenv`).
+
+  **What CSA can and cannot prove here.** The governance half of `csa-counsellor`
+  — tool permissions, `pin:`/`adopt:`, the id-secrecy scrub, retry/repair, kill
+  switches — needs essentially no change and is a strong proof of D1. The
+  live-integration half cannot reach "no behaviour change" in this phase: roughly
+  1,500–2,000 of its ~5,900 lines (`src/crizac/*`, `src/plexe.py`,
+  `src/students_store.py`, and the credential plumbing in `src/agent.py`) depend
+  on the two primitives phase 1b designs. **Phase 1's acceptance bar is therefore
+  the governance half against seed data**, with the live-Crizac path explicitly
+  out of scope until 1b lands. An earlier draft set "no behaviour change for CSA"
+  as the bar for phases 0–2; that is not reachable, and this corrects it.
+
+  Audit tool decomposition for D3 while here, with realistic expectations: of 29
+  declared tools, 8 carry a `url:` — but those fields are *governance metadata*,
+  not routing. The real Crizac integration is a stateful, TTL-cached, multi-step
+  name-resolution cascade, which §7's own escape valve correctly keeps
+  worker-side. D3 will thin this client considerably less than earlier drafts implied.
+- **Phase 1b — the two missing primitives.** Neither exists today, and CSA's live
+  path is blocked on both:
+  1. **Client-owned data access.** A worker legitimately reaches its own databases
+     and internal services (§5.6 invariant 1 permits this). What is missing is any
+     platform-side *notion* of it — declaration, governance and audit for reads
+     and writes the platform does not mediate. Today `students_store.py` simply
+     opens a connection and nothing knows. `CORE_GAPS.md`'s tier-2
+     `rya.data.open()` ask is the client's own version of this request.
+  2. **Leaf credential leasing.** The replacement for `ctx.connections.secret()`'s
+     raw hand-off (§5.6): short-lived, scoped, refreshable, and reaching leaf
+     handlers that today receive no `ctx` at all. `CORE_GAPS.md` #3 and #4 are
+     asking for precisely this.
+
+  State it plainly: as drafted, this RFC's invariants make three of the one real
+  client's own recorded asks (#3 leaf credentials, #7 a pluggable memory sink to
+  their own Postgres, and the tier-2 data ask) *harder* than they are today. 1b is
+  where that debt is paid, and it should not be deferred behind the deployment
+  pipeline.
 - **Phase 2 — publish the SDK, split the repo.** `rya-sdk` to PyPI (or a private
   index); `chatstudyabroad/rya-agent` swaps the git-branch pin for a semver
   range. This is the phase that pays back the pain we have today.
@@ -648,8 +940,28 @@ throughout, and "no behaviour change for CSA" is the acceptance test for phases
   server; **(c)** the SDK ships a *test harness* rather than a control plane —
   enough to unit-test handler logic ("assert the handler called `course_catalogue`
   with these args"), deliberately incomplete, loud on anything unimplemented, with
-  full-agent-offline served by single-node platform-in-a-container. Current
-  leaning: (c).
+  full-agent-offline served by single-node platform-in-a-container; **(d)** go
+  further and *collapse the dev topology altogether* — local development means
+  running the platform locally in a container (`docker-compose.yml` already does
+  this), which deletes a whole pool kind from §4.1 and answers this question in the
+  same move. (d) is the largest genuine simplification available anywhere in this
+  design; it costs the zero-install quickstart and some inner-loop speed. Current
+  leaning: (c), with (d) worth costing out properly before phase 1 commits to a
+  dev pool.
+- **How does a leaf handler get an upstream credential?** Blocking for phase 1b
+  and for CSA's live path. `ctx.connections.secret()` hands over a raw long-lived
+  bearer today, by design (§5.6); leaf tools receive no `ctx` at all and get it
+  through a `ContextVar`. Candidates: short-lived scoped leases with refresh;
+  platform-side proxying so the worker never holds it (D3's real payoff); or a
+  governed, audited raw-hand-off exception. Until this is answered, invariant 2 is
+  aspirational.
+- **Does a retry re-authorize, or does one authorization cover N attempts?**
+  `_invoke_with_recovery` has already made this choice implicitly (one
+  authorization, N local attempts). The protocol must preserve or knowingly break
+  it — §7.
+- **Does the SDK-free `/queue/*` HTTP path survive?** RWAP depends on it
+  explicitly and adopts no SDK. If worker registration becomes mandatory, that
+  integration breaks; if it stays optional, we maintain two entry contracts.
 - gRPC (better streaming/typing) vs WebSocket+JSON (trivial polyglot clients)?
 - Do memory/knowledge payloads move inline or as object-store references?
 - Billing unit: run, step, model token, or worker-second?
@@ -665,17 +977,18 @@ throughout, and "no behaviour change for CSA" is the acceptance test for phases
 | Today | Platform | SDK | Notes |
 |---|---|---|---|
 | `sdk/agent.py` | — | ✅ | decorators are pure declaration |
-| `sdk/context.py` | policy + journaling half | `ctx` surface half | the main surgical split; D1 says cut here, at policy — not at the store |
-| `runtime/engine.py` | ✅ | worker-side execution loop only | lifecycle stays platform-side |
+| `sdk/context.py` | policy + journaling half | `ctx` surface half | the main surgical split; D1 says cut at policy, not at the store. Measured: ~30 of its ~35 journaled kinds move (§7) |
+| `runtime/engine.py` | ✅ | worker-side execution loop only | lifecycle stays platform-side; `_execute_action` is a second, ungoverned tool path that must be folded into the policy service (§5.4) |
 | `manifest/` | ✅ validation/admission | ✅ authoring/validation | shared schema, versioned |
 | `providers/` | ✅ | — | keys never leave the gateway |
 | `load_env()` + `ctx.secrets` | ✅ per-environment config service | delivery only | D2: `.env`-next-to-the-code stops being a run input |
 | `tools/registry.py` | ✅ permissions/registry | handler registration | |
-| `guard.py`, `seal.py`, `tenancy.py`, `auth.py` | ✅ | — | |
-| `store.py`, `store_postgres.py` | ✅ | FileStore for offline dev | |
-| `queue.py`, `turns.py` | ✅ | worker client | already the right shape |
+| `seal.py`, `tenancy.py`, `auth.py` | ✅ | — | tenancy/RLS is complete and directly reusable |
+| `guard.py` | ✅ | — | a rewrite, not a move: cwd+mtime policy loading, and `check_egress` currently called from inside `sdk/context.py` |
+| `store.py`, `store_postgres.py` | ✅ | FileStore only if the offline tier survives (§15) | |
+| `queue.py`, `turns.py` | ✅ | worker client | queue *mechanics* reusable as-is; the run-execution protocol on top is greenfield (§4) |
 | `api/`, `console/`, `mcp/` | ✅ | — | |
-| `evals.py`, `readiness.py` | ✅ promotion gates | ✅ local `--check` | eval datasets double as the D4 journal-diff trigger set |
-| `cli/` | operator subset | client subset | one binary, remote-aware |
+| `evals.py`, `readiness.py` | ✅ promotion gates | ✅ local `--check` | eval datasets double as the D4 journal-diff trigger set; both are 100% client-local today (they read `load_env` + local `store`/`agent` objects), so the server-side versions are rewrites of their inputs, not relocations |
+| `cli/` | operator subset | client subset | **unresolved: both packages want the `rya` console-script name** — see P6 |
 | `cloud.py` | — | ✅ | already the client-side connection store |
 | `clients/typescript` | — | ✅ grows into the TS SDK | |

@@ -2,7 +2,6 @@ name: support-followup-agent
 runtime: python
 entrypoint: src/agent.py
 version: 0.1.0
-environment: local
 owner: you@example.com
 instructions: >
   Receive a customer event, score churn risk, draft a retention follow-up, and

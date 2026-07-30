@@ -49,14 +49,35 @@ EXTRACTION_PROMPTS = {
 
 # ---- bank-system store: real SQL (Postgres in prod, SQLite locally) --------
 # Domain data - archive customers, renewal cases, extractions, final reports -
-# lives in proper tables: RYA_DATABASE_URL (the same RDS as the runtime) when
-# present, else a local SQLite file. Durable, queryable, survives restarts.
-# Swap any tool for a `url:` HTTP tool to hit the bank's real systems instead.
+# lives in proper tables. Durable, queryable, survives restarts. Swap any tool
+# for a `url:` HTTP tool to hit the bank's real systems instead.
+#
+# Two things this deliberately does NOT do, both called out in
+# PLATFORM_DESIGN §11:
+#
+# 1. It does not read RYA_DATABASE_URL. That is the PLATFORM's own store — runs,
+#    journal, queue, memory, tenancy, RLS. A bundle reaching into it from a leaf
+#    tool crosses the one boundary the whole design rests on (§3: no
+#    client-versioned code holds a store handle). The bank's database is a
+#    separate system and gets its own connection string.
+#
+# 2. It does not run DDL from inside a tool call behind a `global _ready` flag.
+#    One process made that look fine; N workers per (workspace, agent, version)
+#    means N racing first-call migrations. Schema is a deploy-time concern, so
+#    it runs once at import under a lock and every worker that loses the race
+#    waits rather than re-running it.
 import os
 import sqlite3
 
-DB_URL = os.environ.get("RYA_DATABASE_URL") or os.environ.get("DATABASE_URL")
+# The DOMAIN database — never the platform's. Under D8 this arrives as declared
+# per-environment config; the env read is the local-dev fallback.
+DB_URL = os.environ.get("LOAN_DEMO_DATABASE_URL")
 SQLITE_PATH = SEED_DB.with_name("bank.sqlite3")
+
+# A stable, arbitrary key for the Postgres advisory lock that serializes the
+# migration across processes.
+_MIGRATION_LOCK_ID = 0x10AC_0001
+
 _SCHEMA = [
     "CREATE TABLE IF NOT EXISTS la_archive (cif TEXT PRIMARY KEY, data TEXT NOT NULL)",
     """CREATE TABLE IF NOT EXISTS la_renewals (case_id TEXT PRIMARY KEY, cif TEXT NOT NULL,
@@ -67,7 +88,6 @@ _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS la_extractions (case_id TEXT NOT NULL, doc_type TEXT NOT NULL,
        data TEXT NOT NULL, PRIMARY KEY (case_id, doc_type))""",
 ]
-_ready = False
 
 
 def _connect():
@@ -79,20 +99,34 @@ def _connect():
     return c, "?"
 
 
-def _exec(sql, params=(), fetch=False):
-    global _ready
+def _migrate() -> None:
+    """Create the schema and seed the demo archive, exactly once across all
+    workers. Idempotent, so re-running on a fresh deploy is a no-op."""
     conn, ph = _connect()
     try:
         cur = conn.cursor()
-        if not _ready:
-            for ddl in _SCHEMA:
-                cur.execute(ddl)
-            cur.execute(f"SELECT COUNT(*) FROM la_archive")
-            if cur.fetchone()[0] == 0:  # seed the demo archive once
-                for cif, data in json.loads(SEED_DB.read_text())["archive"].items():
-                    cur.execute(f"INSERT INTO la_archive (cif, data) VALUES ({ph}, {ph})",
-                                (cif, json.dumps(data)))
-            _ready = True
+        if DB_URL:
+            # Blocks until whichever worker got here first is done. Released
+            # with the connection, so a crash mid-migration cannot wedge it.
+            cur.execute("SELECT pg_advisory_lock(%s)", (_MIGRATION_LOCK_ID,))
+        for ddl in _SCHEMA:
+            cur.execute(ddl)
+        cur.execute("SELECT COUNT(*) FROM la_archive")
+        if cur.fetchone()[0] == 0:  # seed the demo archive once
+            for cif, data in json.loads(SEED_DB.read_text())["archive"].items():
+                cur.execute(f"INSERT INTO la_archive (cif, data) VALUES ({ph}, {ph})",
+                            (cif, json.dumps(data)))
+    finally:
+        conn.close()
+
+
+_migrate()
+
+
+def _exec(sql, params=(), fetch=False):
+    conn, ph = _connect()
+    try:
+        cur = conn.cursor()
         cur.execute(sql.replace("%s", ph), params)
         return cur.fetchall() if fetch else None
     finally:

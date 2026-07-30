@@ -85,17 +85,32 @@ def test_parallel_group_completion_fires_once_postgres():
 
 
 def test_concurrent_work_once_parallelizes(tmp_path):
-    import time
-    e = _engine(tmp_path, AGENT.replace('return {"n": job.payload["n"]}',
-        'import time as _t; _t.sleep(0.4); return {"n": job.payload["n"]}').replace(
-        'range(3)', 'range(4)'))
+    """Parallelism is proven by OVERLAPPING execution intervals, not by wall
+    clock. A wall-clock threshold has to sit below the serial time (4 x 0.4s =
+    1.6s) to mean anything, which leaves so little slack that a loaded CI box
+    fails a genuinely-parallel pass. Overlap is the property under test and it
+    is immune to how fast the machine is: serial execution peaks at 1.
+    """
+    import json
+    marks = tmp_path / "marks.jsonl"
+    e = _engine(tmp_path, AGENT.replace(
+        'return {"n": job.payload["n"]}',
+        'import json as _j, pathlib as _p, time as _t\n'
+        '    _start = _t.time(); _t.sleep(0.4)\n'
+        f'    _p.Path({str(marks)!r}).open("a").write('
+        '_j.dumps([_start, _t.time()]) + "\\n")\n'
+        '    return {"n": job.payload["n"]}',
+    ).replace('range(3)', 'range(4)'))
     e.run_event("message.received", {})
-    t0 = time.time()
     ran = e.work_once(concurrency=4)
-    wall = time.time() - t0
     # 4 members (+ possibly the fired on_complete claimed in the same pass)
     assert len(ran) >= 4 and all(r["status"] == "completed" for r in ran)
-    assert wall < 1.2, f"not parallel: {wall:.2f}s"   # serial would be ~1.6s
+
+    spans = [json.loads(line) for line in marks.read_text().splitlines() if line.strip()]
+    assert len(spans) == 4, f"expected 4 member executions, got {spans}"
+    peak = max(sum(1 for s, e_ in spans if s <= t < e_) for t, _ in spans)
+    assert peak >= 2, f"members ran serially, never overlapped: {spans}"
+
     e.work_once()  # drain the on_complete if it was not claimed above
     done = [j for j in e.store.list_jobs() if j["handler"] == "done"]
     assert len(done) == 1 and done[0]["status"] == "done"

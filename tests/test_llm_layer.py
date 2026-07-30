@@ -184,8 +184,14 @@ entrypoint: agent.py
 model:
   default: mock-llm
 tools:
-  - id: gh.read
+  # Deliberately NOT implemented by @agent.tool in AGENT_PY: a scoped credential
+  # is only resolved for tools that actually egress with it (a `url:` tool or a
+  # registry backend). A local leaf handler never receives the secret, so a
+  # `provider:` on one is governance metadata and requiring a live connection
+  # for an offline leaf would be wrong — see _Tools.prepare.
+  - id: gh_issues
     permission: allowed
+    url: https://api.github.com/issues
     provider: github
     scopes: [repo:read]
 """
@@ -197,8 +203,19 @@ def test_governance_applies_inside_the_loop(tmp_path):
     ctx, _ = _ctx(tmp_path, SCOPED_MANIFEST)
 
     async def go():
-        await ctx.llm.run(input={"q": "list issues"}, tools=["gh.read"])
+        await ctx.llm.run(input={"q": "list issues"}, tools=["gh_issues"])
 
     with pytest.raises(RyaError) as e:
         asyncio.run(go())
     assert e.value.code == "E_NO_CONNECTION"
+
+
+def test_a_local_leaf_with_a_provider_needs_no_connection(tmp_path):
+    """The other half of that rule, pinned so the two cannot drift: a tool the
+    bundle implements in-process is offline, so its `provider:` is metadata and
+    the loop runs it without a live connection."""
+    ctx, _ = _ctx(tmp_path, SCOPED_MANIFEST.replace(
+        "  - id: gh_issues\n    permission: allowed\n    url: https://api.github.com/issues\n",
+        "  - id: gh.read\n    permission: allowed\n"))
+    out = asyncio.run(ctx.llm.run(input={"q": "list issues"}, tools=["gh.read"]))
+    assert out["toolCalls"][0]["result"] == {"issues": 3}

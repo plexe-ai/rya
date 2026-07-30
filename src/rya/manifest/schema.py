@@ -186,11 +186,19 @@ class ObservabilityBlock(BaseModel):
 
 
 class Manifest(BaseModel):
+    """The environment-INVARIANT description of an agent (PLATFORM_DESIGN D11).
+
+    One content-hashed bundle is promoted *between* environments — dev to
+    staging to prod — which an environment-specific manifest makes impossible.
+    Anything that differs per environment (model routes, egress allowlists,
+    credentials, config) is per-environment platform state under D8, not a field
+    here.
+    """
+
     name: str
     runtime: str = "python"
     entrypoint: str = "src/agent.py"
     version: str = "0.1.0"
-    environment: str = "local"
     owner: Optional[str] = None
     instructions: Optional[str] = None
 

@@ -10,21 +10,26 @@ opt-in via env, so local/CI stays offline and deterministic:
 - otherwise  → mock (records the send into the run trace)
 
 Plain stdlib HTTP, no SDK dependency. The send is journaled by the runtime.
+
+D8: ``env`` is the run's declared config and is passed in by the caller
+(``ctx.channels.send`` hands over ``ctx._env``). An empty mapping now means
+"nothing is configured" — it used to silently fall through to ``os.environ``, so a
+run with no declared channel config could still deliver for real.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
-from typing import Optional
+from collections.abc import Mapping
 
+from ..config import legacy_env
 from ..errors import RyaError
 
 
-def active_channel_provider(channel: str, env: Optional[dict] = None) -> str:
-    env = env or os.environ
+def active_channel_provider(channel: str, env: Mapping[str, str] | None = None) -> str:
+    env = env if env is not None else legacy_env()
     if channel == "slack" and env.get("SLACK_WEBHOOK_URL"):
         return "slack"
     if channel == "email" and env.get("RESEND_API_KEY"):
@@ -51,10 +56,10 @@ def _post(url: str, headers: dict, payload: dict, timeout: int = 30):
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:300]
         raise RyaError("E_RUNTIME", f"channel '{url}' send HTTP {e.code}: {detail}",
-                       hint="Check the channel credentials / webhook URL.")
+                       hint="Check the channel credentials / webhook URL.") from e
     except urllib.error.URLError as e:
         raise RyaError("E_RUNTIME", f"channel send failed: {e.reason}",
-                       hint="Check network egress to the channel provider.")
+                       hint="Check network egress to the channel provider.") from e
 
 
 def _text_of(message: dict) -> str:
@@ -63,9 +68,9 @@ def _text_of(message: dict) -> str:
     return str(message)
 
 
-def send(channel: str, message: dict, env: Optional[dict] = None) -> dict:
+def send(channel: str, message: dict, env: Mapping[str, str] | None = None) -> dict:
     """Deliver ``message`` on ``channel``. Returns a structured delivery receipt."""
-    env = env or os.environ
+    env = env if env is not None else legacy_env()
     provider = active_channel_provider(channel, env)
 
     if provider == "slack":

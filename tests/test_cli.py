@@ -17,8 +17,11 @@ def _run(args, cwd):
         os.chdir(old)
 
 
-def test_dev_json(project):
-    res = _run(["dev", "--json"], project)
+def test_dev_check_json(project):
+    """`rya dev --check` is the instant manifest+code validation CI and tight
+    edit loops depend on. Bare `rya dev` now starts the real two-process dev
+    deployment (PLATFORM_DESIGN §10) and does not return."""
+    res = _run(["dev", "--check", "--json"], project)
     assert res.exit_code == 0
     data = json.loads(res.stdout)
     assert data["ok"] is True

@@ -21,7 +21,9 @@ deterministic mocks.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -88,10 +90,54 @@ class LLMResponse:
 
 
 def load_env(root: Path) -> Dict[str, str]:
-    """Merge ``.env`` (project root) with the process environment."""
+    """Merge ``.env`` (project root) with the process environment.
+
+    Legacy ambient-config path. PLATFORM_DESIGN D8 replaces this with declared
+    per-environment config delivered by the platform; ``RuntimeContext`` now
+    prefers an injected ``config`` and only falls back here when none was
+    supplied (a laptop / single-tenant `rya serve`).
+    """
     values = dict(dotenv_values(root / ".env"))
     values.update({k: v for k, v in os.environ.items()})
     return values
+
+
+# ---------------------------------------------------------------------------
+# Journal content keys (PLATFORM_DESIGN D9)
+# ---------------------------------------------------------------------------
+# Replay used to match a step on a bare ordinal and compare NOTHING — not the
+# input hash, not even `kind`. That is only safe while code and journal ship
+# together, which D3 ends: a run pinned to version A can be resumed by a process
+# that already loaded version B. A step now carries a hash of what it was ASKED
+# to do, and a replay whose step N asks for something different fails closed
+# instead of silently returning another operation's result.
+
+# Fields that are descriptive rather than part of the request, and are freshly
+# generated on every invocation — including them would make every replay a drift.
+_KEY_EXCLUDED = frozenset({"loopId"})
+
+# ---------------------------------------------------------------------------
+# Privileged platform state keys (PLATFORM_DESIGN D7, §11.2)
+# ---------------------------------------------------------------------------
+POLICY_KILLSWITCHES = "killswitches"   # {"tool:<id>": {"permission": ..., ...}}
+POLICY_GUARD = "guard"                 # the egress/grounding/secrecy policy
+
+# Memory scopes a BUNDLE may not address. Kill switches used to live in the
+# `_runtime_config` scope, which `ctx.memory.set` could overwrite — so the
+# underscore prefix is now reserved for platform state and refused on write.
+RESERVED_MEMORY_PREFIX = "_"
+
+
+def _canonical(obj) -> str:
+    return json.dumps(obj, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def content_key(kind: str, label: str, data: Optional[dict]) -> str:
+    """A stable fingerprint of a step's REQUEST (never its result)."""
+    keyed = {k: v for k, v in (data or {}).items() if k not in _KEY_EXCLUDED}
+    return hashlib.sha256(
+        _canonical({"kind": kind, "label": label, "data": keyed}).encode()
+    ).hexdigest()[:16]
 
 
 def _http_tool(url: str, input: dict, auth_secret: Optional[str] = None) -> dict:
@@ -154,6 +200,7 @@ class RuntimeContext:
         on_trace=None,
         on_token=None,
         on_ui=None,
+        config=None,
     ) -> None:
         self.store = store
         # Optional live trace subscriber — fired on every trace event as it
@@ -174,6 +221,7 @@ class RuntimeContext:
         self._agent = agent
         self.project_root = project_root
         self.identity = identity  # verified user Identity, or None
+        self.config = config
         self._seq = 0
         # Id of the ctx.llm.run agent loop currently executing, if any. Stamped
         # onto that loop's model steps and the tool calls they trigger, so an
@@ -181,14 +229,25 @@ class RuntimeContext:
         # the runtime having to journal an extra (replay-visible) step.
         self._active_loop: Optional[str] = None
         self._env = load_env(project_root)
+        # D8: run inputs are DECLARED, not ambient. The platform hands a resolved
+        # RunConfig down; when none is supplied (a laptop, a bare `rya serve`) we
+        # resolve one from the project's env so there is still exactly one object
+        # the model path reads from — rather than 22 `os.environ` lookups inside
+        # `providers/llm.py` deciding which world the agent talks to.
+        if self.config is None:
+            from ..config import current_environment, resolve_run_config
+            self.config = resolve_run_config(manifest, env=self._env,
+                                             environment=current_environment(self._env))
 
         # Secret-redaction vault (pattern from openclaw's SecretVault): collect
         # secret values so they can be scrubbed from every trace/log before it is
-        # persisted or printed. Seeded with known API keys; grows as the handler
-        # reads more via ctx.secrets.get.
+        # persisted or printed. Seeded from the declared secrets; grows as the
+        # handler reads more via ctx.secrets.get.
         self._secrets_seen: set = set()
-        for _k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-            self._seed_secret(self._env.get(_k))
+        for _v in (self.config.secrets or {}).values():
+            self._seed_secret(_v)
+        for _r in (self.config.routes or {}).values():
+            self._seed_secret(getattr(_r, "api_key", None))
 
         # Public interfaces (the spec's ctx.* surface).
         self.llm = _LLM(self)
@@ -210,26 +269,117 @@ class RuntimeContext:
         self.guard = _Guard(self)
 
     # ---- core journaling ----------------------------------------------
+    def _replay(self, seq: int, kind: str, label: str, data: Optional[dict]):
+        """Resolve step ``seq`` against the recorded journal.
+
+        Returns ``(hit, result, key)``. ``hit`` is True only when a completed
+        entry exists AND its content key matches what the handler is asking for
+        now; a mismatch raises ``E_JOURNAL_DRIFT`` rather than handing back the
+        wrong operation's memoized result (D9).
+        """
+        key = content_key(kind, label, data)
+        entry = self.run["journal"].get(str(seq))
+        if entry is None or entry.get("status") != "done":
+            return False, None, key
+        recorded = entry.get("contentKey")
+        if recorded is None:
+            # Written before D9 landed. Those journals were produced by code that
+            # shipped WITH the runtime, so the ordinal was sound; accept them but
+            # still refuse an outright kind change, which is drift under any
+            # reading. New entries always carry a key.
+            if entry.get("kind") not in (None, kind):
+                raise self._drift(seq, entry, kind, label, key, legacy=True)
+            return True, entry.get("result"), key
+        if recorded != key:
+            raise self._drift(seq, entry, kind, label, key)
+        return True, entry.get("result"), key
+
+    def _drift(self, seq, entry, kind, label, key, legacy: bool = False) -> RyaError:
+        pinned = self.run.get("versionId") or self.run.get("agentVersion") or "unpinned"
+        return RyaError(
+            "E_JOURNAL_DRIFT",
+            f"Run '{self.run['id']}' step {seq} was journaled as "
+            f"{entry.get('kind')}/{entry.get('label')!r} but the code being replayed "
+            f"asks for {kind}/{label!r}"
+            + ("." if legacy else f" (recorded key {entry.get('contentKey')}, computed {key})."),
+            hint=f"The bundle no longer matches the journal. Replay this run on the "
+                 f"version it was pinned to ({pinned}), or abandon it — a replay "
+                 f"against drifted code would return another step's result.",
+        )
+
+    def _commit(self, seq: int, key: str, kind: str, label: str, result,
+                data: Optional[dict], started, ended) -> None:
+        """Record one completed step: journal entry, trace event, meter fact.
+
+        The journal APPEND is the durable commit (D10); ``save_run`` afterwards
+        keeps the run row's materialized view in step for readers that have not
+        moved to ``journal_read`` yet.
+        """
+        entry = {"seq": seq, "kind": kind, "label": label, "status": "done",
+                 "contentKey": key, "result": result,
+                 "startedAt": _iso_ms(started), "endedAt": _iso_ms(ended)}
+        self.run["journal"][str(seq)] = entry
+        self._journal_append(entry)
+        self._trace(kind, label, {**(data or {}), "result": result},
+                    started=started, ended=ended)
+        self._meter(kind, label, result)
+        self.store.save_run(self.run)
+
+    def _journal_append(self, entry: dict) -> None:
+        """Append to the durable journal. Best-effort against stores that predate
+        it (a third-party duck-typed Store); the run row still carries the
+        materialized journal, so an older backend degrades rather than breaks."""
+        append = getattr(self.store, "journal_append", None)
+        if append is None:
+            return
+        try:
+            append(self.run["id"], entry)
+        except Exception:  # pragma: no cover - never let bookkeeping kill a run
+            pass
+
+    # Step kinds that cost money. D10: billing reads this ledger, not the trace.
+    _BILLABLE = ("llm.respond", "llm.chat", "model.call")
+
+    def _meter(self, kind: str, label: str, result) -> None:
+        if kind not in self._BILLABLE or not isinstance(result, dict):
+            return
+        # Providers normalize to {"input": n, "output": n} (providers/llm.py).
+        usage = result.get("usage") or {}
+        record = {
+            "runId": self.run["id"],
+            "kind": kind,
+            "agent": self.run.get("agent"),
+            "agentVersion": self.run.get("agentVersion"),
+            "versionId": self.run.get("versionId"),
+            "model": result.get("model") or label,
+            "provider": result.get("provider"),
+            "inputTokens": int(usage.get("input") or 0),
+            "outputTokens": int(usage.get("output") or 0),
+        }
+        record["costUsd"] = self._price(record)
+        append = getattr(self.store, "meter_append", None)
+        if append is None:
+            return
+        try:
+            append(record)
+        except Exception:  # pragma: no cover - metering must never fail a run
+            pass
+
+    def _price(self, record: dict) -> float:
+        from ..observability.usage import price_for
+        return price_for(record["model"], record["inputTokens"],
+                         record["outputTokens"], self._env)
+
     def _step(self, kind: str, label: str, fn: Callable[[], Any], data: Optional[dict] = None) -> Any:
         seq = self._seq
         self._seq += 1
-        key = str(seq)
-        entry = self.run["journal"].get(key)
-        if entry is not None and entry.get("status") == "done":
-            return entry.get("result")  # memoized replay — no re-execution, no new trace
+        hit, memo, key = self._replay(seq, kind, label, data)
+        if hit:
+            return memo  # memoized replay — no re-execution, no new trace
         started = datetime.now(timezone.utc)
         result = fn()
         ended = datetime.now(timezone.utc)
-        self.run["journal"][key] = {
-            "seq": seq,
-            "kind": kind,
-            "label": label,
-            "status": "done",
-            "result": result,
-        }
-        self._trace(kind, label, {**(data or {}), "result": result},
-                    started=started, ended=ended)
-        self.store.save_run(self.run)
+        self._commit(seq, key, kind, label, result, data, started, ended)
         return result
 
     async def _astep(self, kind: str, label: str, afn, data: Optional[dict] = None):
@@ -238,18 +388,13 @@ class RuntimeContext:
         rule as the rest of the runtime."""
         seq = self._seq
         self._seq += 1
-        key = str(seq)
-        entry = self.run["journal"].get(key)
-        if entry is not None and entry.get("status") == "done":
-            return entry.get("result")
+        hit, memo, key = self._replay(seq, kind, label, data)
+        if hit:
+            return memo
         started = datetime.now(timezone.utc)
         result = await afn()
         ended = datetime.now(timezone.utc)
-        self.run["journal"][key] = {"seq": seq, "kind": kind, "label": label,
-                                    "status": "done", "result": result}
-        self._trace(kind, label, {**(data or {}), "result": result},
-                    started=started, ended=ended)
-        self.store.save_run(self.run)
+        self._commit(seq, key, kind, label, result, data, started, ended)
         return result
 
     def _trace(self, kind: str, label: str, data: dict,
@@ -320,9 +465,16 @@ class RuntimeContext:
     def _request_approval(self, title: str, body: str, action: dict) -> dict:
         seq = self._seq
         self._seq += 1
-        key = str(seq)
-        entry = self.run["journal"].get(key)
+        # Content-keyed like any other step (D9): resuming a run whose code now
+        # asks a DIFFERENT human question at this point must not silently inherit
+        # the answer a human gave to the old one. That is the sharpest case for
+        # fail-closed replay in the whole runtime.
+        key = content_key("approval", title, {"action": action})
+        entry = self.run["journal"].get(str(seq))
         if entry is not None:
+            recorded = entry.get("contentKey")
+            if recorded is not None and recorded != key:
+                raise self._drift(seq, entry, "approval", title, key)
             status = entry.get("status")
             if status == "approved":
                 return entry["result"]
@@ -332,13 +484,16 @@ class RuntimeContext:
             raise PausedForApproval(entry["result"]["approvalId"])
 
         approval = self.store.create_approval(self.run["id"], title, body, action)
-        self.run["journal"][key] = {
+        entry = {
             "seq": seq,
             "kind": "approval",
             "label": title,
             "status": "pending",
+            "contentKey": key,
             "result": {"approvalId": approval["id"]},
         }
+        self.run["journal"][str(seq)] = entry
+        self._journal_append(entry)
         self._trace("approval.requested", title, {"approvalId": approval["id"], "action": action})
         self.run["status"] = "waiting_approval"
         self.run["pendingApproval"] = approval["id"]
@@ -396,20 +551,42 @@ class RuntimeContext:
         return secret
 
     # ---- permission resolution ----------------------------------------
+    def _killswitches(self) -> dict:
+        """Operator tool overrides, from PRIVILEGED platform state.
+
+        These used to live in the `_runtime_config` *memory* scope — an ordinary
+        scope with no schema distinction from user data, which a bundle can write
+        through `ctx.memory.set`. Governance a client can edit is not governance,
+        so PLATFORM_DESIGN §11.2 carves them out into `store.policy_*`, which the
+        execution-plane role has SELECT-only access to (tenancy.py
+        `_GOVERNANCE_TABLES`) and `ctx.memory` refuses to address at all.
+
+        Raises so callers can fail CLOSED: an unreadable policy must refuse tools
+        rather than run one an operator may have just killed.
+        """
+        getter = getattr(self.store, "policy_get", None)
+        if getter is not None:
+            switches = getter(POLICY_KILLSWITCHES)
+            if switches is not None:
+                return switches
+        # Read-through to the legacy location so deployments that set a kill
+        # switch before this landed keep it until an operator writes a new one.
+        # Write-through is deliberately absent: the old scope is now read-only.
+        legacy = self.store.load_memory("_runtime_config")
+        return (legacy.get("kv") or {}) if legacy else {}
+
     def _effective_tool_permission(self, tool_id: str) -> Optional[Permission]:
         """Manifest permission, unless a runtime kill switch overrides it.
 
-        Overrides live in the `_runtime_config` memory scope (versioned,
-        append-only history) so an operator can disable a misbehaving tool
-        NOW, without a redeploy. See PUT /tools/{id}/permission."""
+        An operator can disable a misbehaving tool NOW, without a redeploy.
+        See PUT /tools/{id}/permission."""
         try:
-            rc = self.store.load_memory("_runtime_config")
-            ov = (rc.get("kv") or {}).get(f"tool:{tool_id}")
+            ov = self._killswitches().get(f"tool:{tool_id}")
             if ov and ov.get("permission"):
                 return Permission(ov["permission"])
         except Exception:
-            # An unreadable runtime config fails CLOSED: safer to refuse tools
-            # than to run one an operator may have just killed.
+            # An unreadable policy fails CLOSED: safer to refuse tools than to
+            # run one an operator may have just killed.
             return Permission.disabled
         return self.manifest.tool_permission(tool_id)
 
@@ -453,22 +630,22 @@ class _LLM:
         self._ctx = ctx
 
     def _params(self, route: Optional[str]):
-        """Resolve (model, provider, temperature, max_tokens, label) for a call.
-        ``route`` picks a named per-purpose model from model.routes (compose vs
-        extract vs classify); unset route fields inherit from the model block."""
+        """Resolve the call's ``(ModelRoute, label)``.
+
+        D8: the route comes from the run's declared config, already resolved to a
+        CONCRETE provider with its credential attached. Nothing here — and
+        nothing under it — reads ambient environment to decide which world the
+        agent talks to. ``route`` picks a named per-purpose model from
+        model.routes (compose vs extract vs classify); unset route fields
+        inherited from the model block at resolution time.
+        """
+        mroute = self._ctx.config.route(route)
         mb = self._ctx.manifest.model
-        if route is None:
-            return mb.default, mb.provider, mb.temperature, mb.max_tokens, mb.default
-        r = (mb.routes or {}).get(route)
-        if r is None:
-            raise RyaError(
-                "E_MODEL_ROUTE_NOT_FOUND",
-                f"Model route '{route}' is not declared (have: {sorted(mb.routes or {})}).",
-                hint="Add it under `model.routes:` in rya.agent.yaml.",
-            )
-        return (r.model, r.provider or mb.provider,
-                r.temperature if r.temperature is not None else mb.temperature,
-                r.max_tokens or mb.max_tokens, f"{route}:{r.model}")
+        # The label stays the DECLARED name, not the resolved one, so a journal
+        # written before and after a route's model changed still reads the same
+        # and D9's content key does not treat a config change as code drift.
+        label = mb.default if route is None else f"{route}:{(mb.routes or {})[route].model}"
+        return mroute, label
 
     async def respond(self, *, system: str, input: dict, schema: Optional[dict] = None,
                       route: Optional[str] = None,
@@ -487,10 +664,11 @@ class _LLM:
         ``{name, format, path|bytes|b64}``; relative paths resolve against the
         project root. Supported on the bedrock provider (Converse document
         blocks); the mock provider ignores them."""
+        from ..config import with_model
         from ..providers import respond as provider_respond
 
         mb = self._ctx.manifest.model
-        model, provider, temperature, max_tokens, label = self._params(route)
+        mroute, label = self._params(route)
         on_token = self._ctx._on_token if stream else None
         docs = None
         if documents:
@@ -502,11 +680,11 @@ class _LLM:
                 docs.append(d)
 
         def run():
-            # Provider chosen by manifest model.provider (auto/mock/anthropic/openai/bedrock).
+            # Provider comes from the RESOLVED route (D8) — already concrete, with
+            # its credential attached; no ambient lookup decides it here.
             try:
                 return provider_respond(
-                    system=system, input=input, model_default=model, provider=provider,
-                    temperature=temperature, max_tokens=max_tokens, schema=schema,
+                    system=system, input=input, route=mroute, schema=schema,
                     on_token=on_token, documents=docs,
                 )
             except RyaError:
@@ -514,19 +692,22 @@ class _LLM:
                 # (default route only — named routes are explicit choices).
                 if route is None and mb.fallback:
                     out = provider_respond(
-                        system=system, input=input, model_default=mb.fallback, provider=provider,
-                        temperature=temperature, max_tokens=max_tokens, schema=schema,
-                        on_token=on_token, documents=docs,
+                        system=system, input=input, route=with_model(mroute, mb.fallback),
+                        schema=schema, on_token=on_token, documents=docs,
                     )
                     out["fellBackFrom"] = mb.default
                     return out
                 raise
 
         # Journal document names only - never raw bytes (the journal is replayed
-        # and shipped to observability backends).
+        # and shipped to observability backends). The DECLARED provider is
+        # journaled rather than the resolved one: which credential a deployment
+        # happened to hold is config, and content-keying on it (D9) would make
+        # every environment promotion look like code drift.
         step_data = {"system": system, "input": input,
-                     "modelParameters": {"temperature": temperature, "max_tokens": max_tokens,
-                                         "provider": provider, "route": route}}
+                     "modelParameters": {"temperature": mroute.temperature,
+                                         "max_tokens": mroute.max_tokens,
+                                         "provider": mb.provider, "route": route}}
         if documents:
             step_data["documents"] = [d.get("name") or d.get("path") for d in documents]
         res = self._ctx._step("llm.respond", label, run, step_data)
@@ -552,7 +733,7 @@ class _LLM:
         """
         from ..providers import chat as provider_chat
 
-        model, provider, temperature, max_tokens, _label = self._params(route)
+        mroute, _label = self._params(route)
         # Only non-gated tools are autonomous; the model never sees gated actions.
         # Effective permission (manifest + runtime kill switches), so a tool an
         # operator just disabled disappears from the loop immediately.
@@ -602,15 +783,13 @@ class _LLM:
         loop_id = _new_id("loop")
         outer_loop = self._ctx._active_loop
         self._ctx._active_loop = loop_id
-        params = {"temperature": temperature, "max_tokens": max_tokens,
-                  "provider": provider, "route": route}
+        params = {"temperature": mroute.temperature, "max_tokens": mroute.max_tokens,
+                  "provider": self._ctx.manifest.model.provider, "route": route}
         try:
             for step in range(max_steps):
                 def turn(_msgs=list(messages)):
                     return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
-                                         model_default=model, provider=provider,
-                                         temperature=temperature, max_tokens=max_tokens,
-                                         on_token=on_token)
+                                         route=mroute, on_token=on_token)
 
                 # Journal the exact prompt for this step (system + the messages sent
                 # so far) so observability backends can show the real model input,
@@ -665,11 +844,24 @@ class _Memory:
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
 
-    def _scope(self, scope: Optional[str]) -> str:
+    def _scope(self, scope: Optional[str], write: bool = False) -> str:
         # "user" scope binds memory to the verified caller identity.
         if scope == "user" and self._ctx.identity is not None:
             return f"user:{self._ctx.identity.sub}"
-        return scope or "agent"
+        s = scope or "agent"
+        # §11.2: the underscore prefix is reserved for platform state. Kill
+        # switches lived in `_runtime_config`, an ordinary scope a bundle could
+        # overwrite through this very method — so writes to it are refused and
+        # the real policy lives in `store.policy_*`. Reads stay legal so the
+        # legacy read-through in `_killswitches` keeps working.
+        if write and s.startswith(RESERVED_MEMORY_PREFIX):
+            raise RyaError(
+                "E_POLICY_READONLY",
+                f"Memory scope '{s}' is reserved for platform state and is read-only.",
+                hint="Operator policy is set through the control plane "
+                     "(PUT /tools/{id}/permission), not through ctx.memory.",
+            )
+        return s
 
     async def get(self, key: str, scope: Optional[str] = None) -> Any:
         s = self._scope(scope)
@@ -682,7 +874,7 @@ class _Memory:
         return self._ctx._step("memory.get", f"{s}:{key}", run, {"scope": s, "key": key})
 
     async def set(self, key: str, value: Any, scope: Optional[str] = None) -> Any:
-        s = self._scope(scope)
+        s = self._scope(scope, write=True)
 
         def run():
             mem = self._ctx.store.load_memory(s)
@@ -701,7 +893,7 @@ class _Memory:
 
     async def append(self, collection: str, item: dict, scope: Optional[str] = None) -> dict:
         from ..providers.embeddings import embed
-        s = self._scope(scope)
+        s = self._scope(scope, write=True)
 
         def run():
             mem = self._ctx.store.load_memory(s)
@@ -747,7 +939,7 @@ class _Memory:
         """Set a named core-memory block — a small, always-in-context, agent-editable
         slot (persona, the user's profile, current task state). Truncated to `limit`
         chars so it stays cheap to keep in every prompt."""
-        s = self._scope(scope)
+        s = self._scope(scope, write=True)
 
         def run():
             mem = self._ctx.store.load_memory(s)
@@ -762,7 +954,7 @@ class _Memory:
 
     async def block_append(self, name: str, text: str, scope: Optional[str] = None,
                           limit: int = 2000) -> dict:
-        s = self._scope(scope)
+        s = self._scope(scope, write=True)
 
         def run():
             mem = self._ctx.store.load_memory(s)
@@ -801,7 +993,7 @@ class _Memory:
         instead of piling up. This is what keeps long-term memory token-efficient."""
         from ..providers.embeddings import cosine, embed
         import re
-        s = self._scope(scope)
+        s = self._scope(scope, write=True)
 
         def run():
             mem = self._ctx.store.load_memory(s)
@@ -971,19 +1163,50 @@ class _Knowledge:
         return self._ctx._step("knowledge.documents", "all", run)
 
 
+@dataclass
+class GovernedCall:
+    """One tool invocation, resolved through the full policy path.
+
+    Produced by ``_Tools.prepare`` and consumed by both callers that exist:
+    ``ctx.tools.call`` (the handler / agent-loop path) and the engine's approval
+    resolution. Before PLATFORM_DESIGN §7 there were two dispatch
+    implementations and only this one was governed.
+    """
+    tool_id: str
+    input: dict                 # pins already applied — this is what actually runs
+    permission: Permission
+    impl: str                   # agent | http | mock
+    decl: Any
+    meta: dict
+    backend: Any                # async (input) -> result
+    scrub: Any                  # result -> scrubbed result
+
+
 class _Tools:
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
 
-    async def call(self, tool_id: str, input: dict) -> dict:
+    def prepare(self, tool_id: str, input: dict, *, approved: bool = False) -> GovernedCall:
+        """Resolve permission, pins, scoped credentials and the backend for one
+        tool call. The single governed entry point (§7).
+
+        ``approved=True`` is the post-approval path: an ``approval_required``
+        tool becomes callable because a human just authorized THIS action. Every
+        other check still applies — in particular a ``disabled`` verdict still
+        wins, so an operator kill switch flipped while the approval sat pending
+        beats the stale approval rather than losing to it.
+        """
         perm = self._ctx._resolve_tool_permission(tool_id)
         if perm == Permission.disabled:
             raise RyaError(
                 "E_TOOL_PERMISSION_DENIED",
                 f"Tool '{tool_id}' is disabled.",
-                hint="Enable it under `tools:` in rya.agent.yaml.",
+                hint="Enable it under `tools:` in rya.agent.yaml."
+                     if not approved else
+                     "An operator disabled this tool after the approval was "
+                     "requested; the kill switch wins. Re-request the action.",
             )
-        if perm == Permission.approval_required:
+        if perm == Permission.approval_required and not approved:
             raise RyaError(
                 "E_TOOL_PERMISSION_DENIED",
                 f"Tool '{tool_id}' requires approval and cannot be called directly.",
@@ -1047,20 +1270,59 @@ class _Tools:
             async def backend(cur):
                 return spec.fn(cur)
 
-        retry = getattr(decl, "retry", None)
-        repair = self._ctx._agent.repair_handler(tool_id) if self._ctx._agent else None
+        return GovernedCall(tool_id=tool_id, input=input, permission=perm, impl=impl,
+                            decl=decl, meta=meta, backend=backend,
+                            scrub=self._ctx.guard.scrub)
+
+    async def _execute(self, call: GovernedCall):
+        """Run a prepared call: retry/repair, then scrub, then adoption.
+
+        Not journaled — the two callers journal differently. ``call`` wraps this
+        in one ``tool.call`` step; the approval path records the result on the
+        approval and on the already-journaled approval entry.
+        """
+        retry = getattr(call.decl, "retry", None)
+        repair = self._ctx._agent.repair_handler(call.tool_id) if self._ctx._agent else None
+        result = call.scrub(await self._invoke_with_recovery(
+            call.tool_id, call.backend, call.input, retry, repair))
+        self._apply_adoption(call.decl, result)
+        return result
+
+    async def call(self, tool_id: str, input: dict) -> dict:
+        call = self.prepare(tool_id, input)
 
         async def run_tool():
-            result = scrub(await self._invoke_with_recovery(tool_id, backend, input, retry, repair))
-            self._apply_adoption(decl, result)
-            return result
+            return await self._execute(call)
 
         # Carry the enclosing agent-loop id (if this call came from ctx.llm.run)
         # so tracing can nest the tool under the model step that requested it.
         loop = self._ctx._active_loop
-        return await self._ctx._astep("tool.call", tool_id, run_tool,
-                                      {"input": input, "permission": perm.value, "impl": impl,
-                                       **({"loopId": loop} if loop else {}), **meta})
+        return await self._ctx._astep(
+            "tool.call", tool_id, run_tool,
+            {"input": call.input, "permission": call.permission.value, "impl": call.impl,
+             **({"loopId": loop} if loop else {}), **call.meta})
+
+    async def call_approved(self, tool_id: str, input: dict) -> dict:
+        """Execute an action a human just approved, through the SAME governance.
+
+        The engine used to re-implement dispatch here with no permission check,
+        no arg-pin resolution, no ``guard.scrub`` and a credential lookup that
+        omitted the owner argument (so it was not even per-user scoped). §7 lists
+        that as one of the two rows "not true of today's code"; this is the seam
+        that closes it.
+
+        Deliberately NOT journaled: the approval resolution happens outside the
+        handler's step sequence, and inserting a step here would shift every
+        subsequent ordinal and trip D9's drift check on resume. The result is
+        recorded on the approval record and on the journaled approval entry,
+        which is where the resumed handler reads it from.
+        """
+        call = self.prepare(tool_id, input, approved=True)
+        result = await self._execute(call)
+        self._ctx._trace("approval.action", tool_id,
+                         {"input": call.input, "permission": call.permission.value,
+                          "impl": call.impl, **call.meta, "result": result})
+        return result
 
     @staticmethod
     def _error_class(exc) -> Optional[str]:
@@ -1153,10 +1415,44 @@ class _Tools:
 
 
 class _Guard:
-    """Serving-path guardrails a handler (or the runtime) can invoke."""
+    """Serving-path guardrails a handler (or the runtime) can invoke.
+
+    Every verdict in a run is made against ONE resolved policy version. The
+    policy used to be re-read from ``cwd``/``RYA_GUARD_PATH`` by file mtime on
+    each call — under the platform model a worker's cwd is an implementation
+    detail of where a bundle got extracted, mtime is not a version, and there is
+    no audit trail. It now comes from the governed store (workspace-scoped,
+    versioned, audited), falling back to the project file for `rya dev`.
+    """
 
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
+        self._resolved = None
+
+    def policy(self):
+        """The resolved ``GuardPolicy`` for this run. Cached: one policy version
+        per run, so a verdict is attributable and two calls in the same turn
+        cannot disagree because someone saved the file between them."""
+        if self._resolved is not None:
+            return self._resolved
+        from ..guard import GUARD_FILE, resolve_policy
+        store = self._ctx.store
+        gp = None
+        if hasattr(store, "policy_get"):
+            # The governed source wins. A read FAILURE resolves to a fail-closed
+            # policy (carrying `error`) and must not be second-guessed here;
+            # only "nothing provisioned" falls through.
+            gp = resolve_policy(store)
+            if not gp.enforced:
+                gp = None
+        if gp is None:
+            # Dev fallback — and explicitly THIS project's file. resolve_policy's
+            # own fallback is the legacy ambient lookup (cwd / RYA_GUARD_PATH),
+            # which under the platform model points at wherever a bundle happened
+            # to be extracted rather than at the agent being run.
+            gp = resolve_policy(str(self._ctx.project_root / GUARD_FILE))
+        self._resolved = gp
+        return gp
 
     def _tool_outputs(self) -> list:
         return [e.get("result") for e in self._ctx.run.get("journal", {}).values()
@@ -1167,40 +1463,49 @@ class _Guard:
         THIS run - the grounding gate, as a primitive.
         Returns {ok, figures, violations}."""
         from ..guard import grounding_check
-        return grounding_check(text, self._tool_outputs())
+        return grounding_check(text, self._tool_outputs(), self.policy())
 
     def _grounding_policy(self) -> dict:
-        from ..guard import load_policy, GUARD_FILE
-        policy = load_policy(str(self._ctx.project_root / GUARD_FILE)) or {}
-        return policy.get("grounding") or {}
+        from ..guard import grounding_policy
+        return grounding_policy(self.policy())
 
     def _policy(self) -> dict:
-        from ..guard import load_policy, GUARD_FILE
-        return load_policy(str(self._ctx.project_root / GUARD_FILE)) or {}
+        """The raw policy dict. Kept for callers that want the mapping rather
+        than the resolved object."""
+        return self.policy().policy
+
+    def describe(self) -> dict:
+        """Which policy made this run's verdicts — source, version, etag."""
+        return self.policy().describe()
 
     def scrub(self, obj):
         """Id-secrecy scrub: rewrite every configured secret pattern in every
         string leaf of ``obj`` to its safe token (no-op unless ``secrecy.enabled``
-        in rya.guard.yaml). Applied at the tool boundary and on outbound so a
-        secret id never reaches the model, the trace, or a channel send."""
-        from ..guard import _compile_secrecy, secrecy_scrub
-        return secrecy_scrub(obj, _compile_secrecy(self._policy()))
+        in the policy). Applied at the tool boundary and on outbound so a secret
+        id never reaches the model, the trace, or a channel send."""
+        from ..guard import secrecy_scrub
+        return secrecy_scrub(obj, self.policy())
 
     def check_secrecy(self, text: str) -> dict:
         """Report whether any configured secret pattern appears in ``text``.
         Returns {ok, hits, scrubbed} — handler-side assertion complement to the
         automatic boundary scrub."""
         from ..guard import secrecy_check
-        return secrecy_check(text, self._policy())
+        return secrecy_check(text, self.policy())
 
 
 class _Channels:
     def __init__(self, ctx: RuntimeContext) -> None:
         self._ctx = ctx
 
-    async def send(self, channel: str, message: dict) -> dict:
-        from ..providers.channels import send as channel_send
+    def _gate(self, channel: str, message: dict) -> dict:
+        """Apply every outbound guard and return the message that may leave.
 
+        Shared by the handler path (``send``) and the approval path
+        (``send_approved``) so a human-approved channel send is subject to
+        exactly the same scrub and grounding gate — §7's rule that the platform
+        decides and the bundle only supplies behaviour.
+        """
         # Id-secrecy scrub FIRST (opt-in via rya.guard.yaml `secrecy.enabled`):
         # rewrite any secret id in the outbound message to its safe token before
         # anything else sees it — the grounding check, the wire, and the trace all
@@ -1223,12 +1528,28 @@ class _Channels:
                     f"Outbound message contains ungrounded figures {check['violations']} "
                     "not present in any tool output of this run.",
                     hint="Only quote amounts returned by tools, or disable grounding in rya.guard.yaml.")
+        return message
+
+    async def send(self, channel: str, message: dict) -> dict:
+        from ..providers.channels import send as channel_send
+        message = self._gate(channel, message)
 
         def run():
             # Real Slack/email/webhook when configured via env, else mock.
             return channel_send(channel, message, self._ctx._env)
 
         return self._ctx._step("channel.send", channel, run, {"message": message})
+
+    async def send_approved(self, channel: str, message: dict) -> dict:
+        """A channel send a human approved. Same gates, no journal step — see
+        ``_Tools.call_approved`` for why the approval path must not consume an
+        ordinal in the handler's step sequence."""
+        from ..providers.channels import send as channel_send
+        message = self._gate(channel, message)
+        result = channel_send(channel, message, self._ctx._env)
+        self._ctx._trace("approval.action", f"{channel}.send",
+                         {"message": message, "impl": "channel", "result": result})
+        return result
 
 
 class _Sessions:

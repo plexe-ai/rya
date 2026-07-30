@@ -118,6 +118,8 @@ class Engine:
         project_root: Path,
         tools: Optional[ToolRegistry] = None,
         models: Optional[ModelRegistry] = None,
+        version: Optional[dict] = None,
+        environment: Optional[str] = None,
     ) -> None:
         self.manifest = manifest
         self.agent = agent
@@ -125,6 +127,13 @@ class Engine:
         self.project_root = project_root
         self.tools = tools or default_tools()
         self.models = models or default_models()
+        # D12: the immutable version this process serves. A worker is one process
+        # per (workspace, agent, version), so the version is a property of the
+        # PROCESS, not something re-resolved per run — which is exactly what makes
+        # a run's pin sound. None = the working tree (`rya dev`, single-tenant
+        # `rya serve`); those runs are unpinned and never block a retire.
+        self.version = version or None
+        self.environment = environment
         self.store.ensure()
 
     # ---- run creation --------------------------------------------------
@@ -140,10 +149,29 @@ class Engine:
 
     def _new_run(self, trigger: str, event: Optional[dict], job: Optional[dict] = None,
                  parent_run_id: Optional[str] = None) -> dict:
+        # §11.12: the workspace quota is an ADMISSION check — refuse to start a
+        # run rather than aborting one in flight. A run killed mid-journal could
+        # never replay to a terminal state, which trades a durability guarantee
+        # for a billing nicety. Overshoot is therefore bounded by one run.
+        # Sub-runs (parent_run_id) are exempt: the parent was already admitted, and
+        # refusing its continuation would strand the parent's journal.
+        if parent_run_id is None:
+            from ..quotas import require_admission
+            require_admission(self.store, kind="run")
+
+        v = self.version or {}
         run = {
             "id": self.store.new_run_id(),
             "agent": self.manifest.name,
-            "agentVersion": self.manifest.version,
+            # D12: the code identity a replay must be checked against. `agentVersion`
+            # survives as a human LABEL only — it is the author-typed
+            # `manifest.version` string, with no hash, immutability or uniqueness,
+            # and nothing branches on it. `versionId`/`bundleHash` are the identity.
+            "agentVersion": v.get("manifestVersion") or self.manifest.version,
+            "versionId": v.get("id"),
+            "bundleHash": v.get("bundleHash"),
+            "sdkVersion": v.get("sdkVersion"),
+            "environment": self.environment,
             "trigger": trigger,
             "status": "running",
             "event": event,
@@ -246,7 +274,7 @@ class Engine:
             new_store = type(st)(st.root)
             new_store.ensure()
         return Engine(self.manifest, self.agent, new_store, self.project_root,
-                      self.tools, self.models)
+                      self.tools, self.models, self.version, self.environment)
 
     def work_once(self, concurrency: int = 1) -> list:
         """Claim and run every currently-due job. Safe to run from N workers
@@ -325,8 +353,11 @@ class Engine:
         run = self._new_run("cron", event)
         return self._execute(run, handler, Event.from_dict(event))
 
-    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None, on_ui=None) -> dict:
-        ctx = RuntimeContext(
+    def _context_for(self, run: dict, identity=None, on_trace=None, on_token=None,
+                     on_ui=None) -> RuntimeContext:
+        """Build the run's ``ctx``. One constructor for both the handler path and
+        the approval path, so the approval path cannot drift out of governance."""
+        return RuntimeContext(
             store=self.store,
             manifest=self.manifest,
             run=run,
@@ -339,6 +370,9 @@ class Engine:
             on_token=on_token,
             on_ui=on_ui,
         )
+
+    def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None, on_ui=None) -> dict:
+        ctx = self._context_for(run, identity, on_trace, on_token, on_ui)
 
         # Record who this run was for, so observability backends can attribute it
         # (Langfuse `userId`) without each agent having to plumb it through.
@@ -410,53 +444,52 @@ class Engine:
         return run
 
     # ---- approvals -----------------------------------------------------
+    @staticmethod
+    def _identity_of(run: dict):
+        """Rehydrate the verified Identity a run was started under, so a resume
+        (and the approved action it executes) keeps per-user scoping."""
+        ident = run.get("identity")
+        if not ident:
+            return None
+        from ..auth import Identity
+        return Identity(sub=ident["sub"], claims=ident)
+
     def _find_approval_entry(self, run: dict, approval_id: str):
         for entry in run["journal"].values():
             if entry.get("kind") == "approval" and entry.get("result", {}).get("approvalId") == approval_id:
                 return entry
         return None
 
-    def _execute_action(self, action: dict):
-        """Run a human-approved action through the real seam where one exists:
-        a channel send goes to the real provider (Resend/Slack when configured),
-        an HTTP tool makes a real request (with its scoped credential injected and
-        the Action Guard applied), and only otherwise falls back to the registry."""
+    def _execute_action(self, run: dict, action: dict, identity=None):
+        """Run a human-approved action through the GOVERNED path.
+
+        This used to be a second, parallel dispatch implementation — no
+        permission check, no arg-pin resolution, no ``guard.scrub``, and a
+        credential lookup that omitted the ``owner`` argument so it was not even
+        per-user scoped. PLATFORM_DESIGN §7 names that as one of the two rows
+        "not true of today's code" and §11.1 makes closing it the first work.
+
+        Everything is now resolved by ``ctx.tools.prepare(..., approved=True)``:
+        the same permission resolution (a kill switch flipped while the approval
+        was pending still wins), the same pins, the same scope intersection, the
+        same scrub. A channel send goes through the same outbound gate.
+        """
         tool = (action or {}).get("tool")
         if not tool:
             return None
         inp = action.get("input", {})
-        # 1. Channel send (email.send / slack.send / <channel>.send) → real seam.
+        ctx = self._context_for(run, identity)
+
+        # A channel send (email.send / slack.send / <channel>.send) is not a
+        # manifest tool, so it has its own governed seam rather than the tool one.
         parts = tool.split(".")
         channel = parts[0]
         is_channel = len(parts) == 2 and parts[1] == "send" and (
             channel in ("email", "slack", "webhook")
             or any(getattr(c, "type", None) == channel for c in self.manifest.channels))
         if is_channel:
-            from ..providers.channels import send as channel_send
-            from ..sdk.context import load_env
-            return channel_send(channel, inp, load_env(self.project_root))
-        # 2. HTTP tool declared with a url → real request, scoped-credential-injected.
-        decl = next((t for t in self.manifest.tools if t.id == tool), None)
-        url = getattr(decl, "url", None) if decl is not None else None
-        if url:
-            from ..sdk.context import _http_tool
-            secret = None
-            provider = getattr(decl, "provider", None)
-            if provider and hasattr(self.store, "get_connection"):
-                conn = self.store.get_connection(provider)
-                secret = conn.get("secret") if conn else None
-            return _http_tool(url, inp, auth_secret=secret)
-        # 3. The agent's own @agent.tool implementation (async or sync) - this
-        # is the normal case for in-process tools like a gated DB write.
-        fn = self.agent.tool_handler(tool) if hasattr(self.agent, "tool_handler") else None
-        if fn is not None:
-            out = fn(inp)
-            if inspect.iscoroutine(out):
-                out = asyncio.run(out)
-            return out
-        # 4. Registry fallback (mock in the local slice).
-        spec = self.tools.get(tool)
-        return spec.fn(inp) if spec is not None else None
+            return _run_coro(ctx.channels.send_approved(channel, inp))
+        return _run_coro(ctx.tools.call_approved(tool, inp))
 
     def approve(self, approval_id: str, on_trace=None, on_token=None, on_ui=None) -> dict:
         approval = self.store.get_approval(approval_id)
@@ -477,11 +510,17 @@ class Engine:
                 f"Run '{run['id']}' is '{run['status']}', not waiting_approval.",
             )
 
-        # Execute the embedded action (a tool call) now that a human approved it,
-        # through the REAL seam where one exists (channel send / HTTP tool), not
-        # just the mock registry.
+        # Restore the run's identity BEFORE executing the action, not just before
+        # the resume: the approved action's scoped-credential resolution is
+        # per-user (connection ∩ user scopes), and running it with identity=None
+        # would silently fall through to a workspace-shared credential.
+        identity = self._identity_of(run)
+
+        # Execute the embedded action now that a human approved it — through the
+        # governed path (§11.1), so permission, pins, scope intersection and the
+        # id-secrecy scrub all apply exactly as they do to ctx.tools.call.
         action = approval.get("action") or {}
-        action_result = self._execute_action(action)
+        action_result = self._execute_action(run, action, identity=identity)
 
         approval["status"] = "approved"
         approval["resolvedAt"] = now_iso()
@@ -504,8 +543,8 @@ class Engine:
         run["pendingApproval"] = None
         self.store.save_run(run)
 
-        # Resume by replaying the handler against the now-resolved journal,
-        # restoring the run's identity so per-user scoping holds on resume.
+        # Resume by replaying the handler against the now-resolved journal, under
+        # the identity restored above so per-user scoping holds on resume.
         # Memoized (pre-approval) steps neither re-trace nor re-stream, so the
         # relays only carry the POST-approval continuation.
         # A run paused inside a JOB must resume through its job handler with its
@@ -518,11 +557,6 @@ class Engine:
         else:
             handler = self.agent.event_handler()
             arg = Event.from_dict(run["event"]) if run.get("event") else None
-        identity = None
-        if run.get("identity"):
-            from ..auth import Identity
-            ident = run["identity"]
-            identity = Identity(sub=ident["sub"], claims=ident)
         return self._execute(run, handler, arg, identity=identity,
                              on_trace=on_trace, on_token=on_token, on_ui=on_ui)
 

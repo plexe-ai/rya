@@ -27,6 +27,7 @@ from ..sdk.context import load_env
 from ..tools.registry import default_registry as default_tools
 from ..models.registry import default_registry as default_models
 from . import scaffold
+from ..config import current_environment
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Rya — production backend/runtime for AI agents.")
 console = Console()
@@ -36,6 +37,10 @@ err_console = Console(stderr=True)
 agents_app = typer.Typer(no_args_is_help=True, help="Inspect agents.")
 events_app = typer.Typer(no_args_is_help=True, help="Send events into the runtime.")
 runs_app = typer.Typer(no_args_is_help=True, help="Inspect runs and traces.")
+versions_app = typer.Typer(no_args_is_help=True, help="Immutable, content-hashed deployment versions.")
+envs_app = typer.Typer(no_args_is_help=True, help="Environments and their current-version pointers.")
+gate_app = typer.Typer(no_args_is_help=True, help="Promotion gates: readiness/eval admission checks per environment.")
+quotas_app = typer.Typer(no_args_is_help=True, help="Per-workspace resource quotas (runs, tokens, cost, workers).")
 approvals_app = typer.Typer(no_args_is_help=True, help="List/approve/reject human approvals.")
 tools_app = typer.Typer(no_args_is_help=True, help="Tool registry.")
 models_app = typer.Typer(no_args_is_help=True, help="Model registry.")
@@ -52,6 +57,10 @@ cloud_app = typer.Typer(no_args_is_help=True, help="Drive a hosted Rya (after `r
 app.add_typer(agents_app, name="agents")
 app.add_typer(events_app, name="events")
 app.add_typer(runs_app, name="runs")
+app.add_typer(versions_app, name="versions")
+app.add_typer(envs_app, name="envs")
+app.add_typer(gate_app, name="gate")
+app.add_typer(quotas_app, name="quotas")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tools_app, name="tools")
 app.add_typer(models_app, name="models")
@@ -242,47 +251,128 @@ def init(json: bool = typer.Option(False, "--json"), force: bool = typer.Option(
 
 
 @app.command()
-def dev(json: bool = typer.Option(False, "--json")):
-    """Load + validate the manifest and the agent code; report what's wired up."""
+def dev(check: bool = typer.Option(False, "--check",
+                                   help="Validate the manifest and agent code, then exit (no processes)."),
+        host: str = typer.Option("127.0.0.1", "--host"),
+        port: int = typer.Option(8787, "--port"),
+        json: bool = typer.Option(False, "--json")):
+    """Run the platform locally — the same two processes as production.
+
+    `rya dev` starts an `api` process and one `worker`, with the working tree as
+    the bundle: real journal, real approvals, real permission and pin
+    resolution, real guard, and the real queue hand-off between them
+    (PLATFORM_DESIGN §10). Two processes on a laptop is a small cost accepted
+    for topology parity — the local shape is the production shape, so `rya dev`
+    exercises the queue and the turn buffer rather than a simplified path that
+    only works locally.
+
+    `rya dev --check` is the instant manifest+code validation that CI and tight
+    edit loops depend on; it starts nothing.
+    """
+    root, manifest = _project()
+    agent = load_agent(manifest, root)
+    info = {
+        "agent": manifest.name,
+        "version": manifest.version,
+        "runtime": manifest.runtime,
+        "entrypoint": manifest.entrypoint,
+        "eventHandler": agent.event_handler() is not None,
+        "jobHandlers": list(agent._job_handlers.keys()),
+        "cronHandlers": list(agent._cron_handlers.keys()),
+        "tools": [t.id for t in manifest.tools],
+        "models": [m.id for m in manifest.models],
+        "triggers": [t.id for t in manifest.triggers],
+        "ready": agent.event_handler() is not None,
+    }
+
+    if check:
+        with guard(json):
+            def render():
+                console.print(f"[green]✓[/green] [bold]{manifest.name}[/bold] v{manifest.version} ready ({manifest.runtime})")
+                console.print(f"  entrypoint: {manifest.entrypoint}")
+                console.print(f"  event handler: {'yes' if info['eventHandler'] else '[red]MISSING[/red]'}")
+                console.print(f"  jobs: {', '.join(info['jobHandlers']) or '—'}")
+                console.print(f"  tools: {', '.join(info['tools']) or '—'}")
+                console.print("  send a test event: [bold]rya events send --type message.received --payload '{\"email\":\"ada@example.com\"}'[/bold]")
+            emit(json, info, render)
+        return
+
     with guard(json):
-        root, manifest = _project()
-        agent = load_agent(manifest, root)
-        info = {
-            "agent": manifest.name,
-            "version": manifest.version,
-            "runtime": manifest.runtime,
-            "entrypoint": manifest.entrypoint,
-            "eventHandler": agent.event_handler() is not None,
-            "jobHandlers": list(agent._job_handlers.keys()),
-            "cronHandlers": list(agent._cron_handlers.keys()),
-            "tools": [t.id for t in manifest.tools],
-            "models": [m.id for m in manifest.models],
-            "triggers": [t.id for t in manifest.triggers],
-            "ready": agent.event_handler() is not None,
-        }
-        def render():
-            console.print(f"[green]✓[/green] [bold]{manifest.name}[/bold] v{manifest.version} ready ({manifest.runtime})")
-            console.print(f"  entrypoint: {manifest.entrypoint}")
-            console.print(f"  event handler: {'yes' if info['eventHandler'] else '[red]MISSING[/red]'}")
-            console.print(f"  jobs: {', '.join(info['jobHandlers']) or '—'}")
-            console.print(f"  tools: {', '.join(info['tools']) or '—'}")
-            console.print("  send a test event: [bold]rya events send --type message.received --payload '{\"email\":\"ada@example.com\"}'[/bold]")
-        emit(json, info, render)
+        import os as _os
+        import signal
+        import subprocess
+        import sys as _sys
+
+        try:
+            import uvicorn
+            from ..api.app import build_app
+        except ImportError:
+            raise RyaError("E_RUNTIME", "API extra not installed.",
+                           hint="Install with: pip install 'rya[api]'")
+
+        # The worker is a real second process, exactly as in production. The api
+        # is told NOT to execute handler code (§11.7), so the hand-off under test
+        # locally is the queue — not an in-process shortcut that only works here.
+        env = {**_os.environ, "RYA_API_INLINE_WORKER": "0"}
+        worker_proc = subprocess.Popen(
+            [_sys.executable, "-m", "rya.cli.main", "worker", "--interval", "1"],
+            cwd=str(root), env=env)
+
+        if json:
+            typer.echo(jsonlib.dumps({**info, "api": f"http://{host}:{port}",
+                                      "workerPid": worker_proc.pid}))
+        else:
+            console.print(f"[green]✓[/green] [bold]{manifest.name}[/bold] v{manifest.version} "
+                          f"({manifest.runtime}) — dev deployment up")
+            console.print(f"  api:      http://{host}:{port}   console, /ws, /mcp")
+            console.print(f"  worker:   pid {worker_proc.pid} (claims turns + jobs from the queue)")
+            console.print(f"  tools:    {', '.join(info['tools']) or '—'}")
+            console.print("  Ctrl-C to stop both.")
+
+        _os.environ["RYA_API_INLINE_WORKER"] = "0"
+        try:
+            uvicorn.run(build_app(root), host=host, port=port, log_level="warning")
+        finally:
+            worker_proc.send_signal(signal.SIGINT)
+            try:
+                worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - shutdown race
+                worker_proc.kill()
 
 
 @app.command()
 def deploy(target: str = typer.Option("check", "--target", help="check | docker | fly | render"),
+           env: Optional[str] = typer.Option(None, "--env",
+                                             help="Deploy a bundle to this environment (dev | staging | prod)."),
            check: bool = typer.Option(False, "--check", help="Only run the production-readiness check, then exit."),
            force: bool = typer.Option(False, "--force", help="Deploy even if readiness blocks remain."),
            write: bool = typer.Option(True, "--write/--no-write", help="Write deploy artifacts into the project."),
+           promote_it: bool = typer.Option(True, "--promote/--no-promote",
+                                           help="With --env: also flip the environment's current-version pointer."),
+           actor: Optional[str] = typer.Option(None, "--actor", help="Who is deploying (recorded on the version)."),
+           metadata: Optional[str] = typer.Option(None, "--metadata",
+                                                  help="Provenance as k=v,k=v — e.g. gitSha=abc,ci=run/42."),
            json: bool = typer.Option(False, "--json"),
            non_interactive: bool = typer.Option(False, "--non-interactive")):
-    """Check production-readiness, then generate deploy artifacts + plan.
+    """Ship the agent. Two modes, distinguished by `--env`.
+
+    **`rya deploy --env <name>`** is the deployment pipeline (PLATFORM_DESIGN §9):
+    validate, bundle the source into an immutable content-hashed version, record
+    it, and flip the environment's current-version pointer. Rollback is the same
+    flip backwards (`rya rollback`). Readiness is a hard gate here.
+
+    **`rya deploy --target docker|fly|render`** is the original meaning: generate
+    the artifacts that stand a Rya deployment up in the first place. The two are
+    different verbs — one ships an agent onto a platform, the other stands the
+    platform up — so they stayed one command rather than pretending to be one
+    thing.
 
     `rya deploy --check` runs the readiness checklist and exits non-zero if any
     blocker remains (exit 7) — a coding agent makes this all-green to ship safely.
-    A plain `rya deploy` runs the check as a GATE first (override with --force).
     """
+    if env is not None:
+        return _deploy_bundle(env=env, promote_it=promote_it, actor=actor,
+                              metadata=metadata, force=force, json=json)
     with guard(json):
         from ..readiness import check_readiness
         from .deploy_templates import write_artifacts, deploy_plan
@@ -332,6 +422,439 @@ def deploy(target: str = typer.Option("check", "--target", help="check | docker 
         emit(json, out, render)
 
 
+def _kv(spec: Optional[str]) -> dict:
+    """Parse `k=v,k=v` into a dict — the --metadata provenance slot."""
+    out = {}
+    for part in (spec or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _deploy_bundle(*, env: str, promote_it: bool, actor: Optional[str],
+                   metadata: Optional[str], force: bool, json: bool):
+    """`rya deploy --env <name>` — the §9 pipeline.
+
+        validate manifest + readiness gate locally
+        bundle: source + lockfile + manifest + SDK version
+        record an immutable, content-hashed version
+        promote: set the environment's current version
+
+    Deploys are atomic per environment: the pointer flips once, new runs go to
+    the new version, in-flight runs finish on theirs.
+    """
+    with guard(json):
+        from .. import bundles, deployments, gates
+        from ..readiness import check_readiness
+
+        root, manifest, store = _store()
+        agent = load_agent(manifest, root)  # validates the agent code imports
+
+        # §9: "the readiness gate becomes a server-side admission check rather
+        # than a client-side courtesy". Locally it is a hard gate on the way in.
+        rep = check_readiness(manifest, store, agent, root)
+        if not rep["ready"] and not force:
+            raise RyaError(
+                "E_NOT_PRODUCTION_READY",
+                f"{rep['summary']['blocks']} readiness blocker(s) before deploying to '{env}': "
+                + "; ".join(b.get("title", str(b)) for b in rep["blocks"][:5]),
+                hint="Fix them, or pass --force to deploy anyway (recorded on the version).",
+            )
+
+        bundle = bundles.build_bundle(root)
+        # Honour a declared object store: a deployment with RYA_BUNDLES_S3_BUCKET
+        # set must upload there, or the worker that later resolves the same store
+        # would look in a bucket nothing was ever written to. Falls back to the
+        # local content-addressed directory when nothing is declared.
+        archive_store = bundles.resolve_bundle_store(root)
+        archive = bundles.store_bundle(bundle, archive_store)
+
+        # Record, attest, THEN promote — in that order, and not via
+        # create_version(environment=...). An attestation is filed against a
+        # version id (§9, gates.py), so the version must exist before the
+        # readiness result can be bound to it, and the attestation must exist
+        # before a gate that requires readiness can pass.
+        version = deployments.create_version(
+            store, agent=manifest.name, bundle=bundle, actor=actor,
+            metadata={**_kv(metadata), "readiness": rep["summary"],
+                      "forced": bool(force and not rep["ready"])})
+        gates.attest_readiness(store, version, rep, actor=actor)
+
+        gate_result = None
+        if promote_it:
+            gate_result = gates.check_promotion(store, version=version, environment=env,
+                                                actor=actor)
+            deployments.promote(store, environment=env, agent=manifest.name,
+                                version_id=version["id"], actor=actor, force=force)
+
+        data = {"ok": True, "environment": env, "agent": manifest.name,
+                "versionId": version["id"], "bundleHash": bundle.hash,
+                "fileCount": bundle.fileCount, "sizeBytes": bundle.sizeBytes,
+                "sdkVersion": bundle.sdkVersion, "lockfile": bundle.lockfile,
+                "archive": str(archive), "promoted": promote_it,
+                **({"gate": gate_result.to_dict()} if gate_result else {})}
+
+        def render():
+            console.print(f"[green]✓[/green] {manifest.name} → [bold]{env}[/bold]")
+            console.print(f"  version: {version['id']}  ({bundle.hash[:12]}…)")
+            console.print(f"  bundle:  {bundle.fileCount} files, {bundle.sizeBytes} bytes, "
+                          f"sdk {bundle.sdkVersion}")
+            if promote_it:
+                console.print(f"  promoted — new runs in {env} use this version; "
+                              "in-flight runs finish on theirs")
+            else:
+                console.print(f"  recorded but NOT promoted — `rya promote --env {env} "
+                              f"--version {version['id']}` when ready")
+        emit(json, data, render)
+
+
+@app.command()
+def promote(env: str = typer.Option(..., "--env", help="Environment to point at this version."),
+            version: str = typer.Option(..., "--version", help="Version id to promote."),
+            actor: Optional[str] = typer.Option(None, "--actor"),
+            force: bool = typer.Option(False, "--force",
+                                       help="Override the promotion gate (recorded against the version)."),
+            json: bool = typer.Option(False, "--json")):
+    """Flip an environment's current-version pointer (§9). Atomic per
+    environment: in-flight runs finish on the version they were pinned to.
+
+    Refused with E_PROMOTION_BLOCKED if the environment's promotion gate is not
+    satisfied — see `rya gate show --env <name>`."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rec = deployments.promote(store, environment=env, agent=manifest.name,
+                                  version_id=version, actor=actor, force=force)
+        emit(json, rec, lambda: console.print(
+            f"[green]✓[/green] {env} → {rec['currentVersionId']}"))
+
+
+@app.command()
+def rollback(env: str = typer.Option(..., "--env"),
+             version: Optional[str] = typer.Option(None, "--version",
+                                                   help="Land on a specific version instead of the previous one."),
+             actor: Optional[str] = typer.Option(None, "--actor"),
+             json: bool = typer.Option(False, "--json")):
+    """Roll an environment back. §9: "Rollback is a pointer flip." """
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rec = deployments.rollback(store, environment=env, agent=manifest.name,
+                                   actor=actor, to_version_id=version)
+        emit(json, rec, lambda: console.print(
+            f"[green]✓[/green] {env} rolled back to {rec['currentVersionId']}"))
+
+
+@versions_app.command("list")
+def versions_list(state: Optional[str] = typer.Option(None, "--state", help="active | retired"),
+                  json: bool = typer.Option(False, "--json")):
+    """Immutable, content-hashed versions of this agent, newest first."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rows = deployments.list_versions(store, agent=manifest.name, state=state)
+
+        def render():
+            if not rows:
+                console.print("[dim]no versions yet — `rya deploy --env dev`[/dim]")
+            for v in rows:
+                console.print(f"  {v['id']}  {v['bundleHash'][:12]}…  {v['state']:8}  "
+                              f"{v.get('createdAt', '')}  {v.get('manifestVersion') or ''}")
+        emit(json, {"versions": rows, "count": len(rows)}, render)
+
+
+@versions_app.command("retire")
+def versions_retire(version_id: str = typer.Argument(...),
+                    force: bool = typer.Option(False, "--force",
+                                               help="Retire even with runs pinned to it (their replay may fail closed)."),
+                    json: bool = typer.Option(False, "--json")):
+    """Retire a version. Fails closed while any run is still pinned to it (D12):
+    replay is only sound against the code that wrote the journal."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rec = deployments.retire(store, version_id, force=force)
+        emit(json, rec, lambda: console.print(f"[green]✓[/green] retired {version_id}"))
+
+
+@versions_app.command("pinned")
+def versions_pinned(version_id: str = typer.Argument(...), json: bool = typer.Option(False, "--json")):
+    """Runs still pinned to a version — the reason a retire was refused."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        runs = deployments.pinned_runs(store, version_id)
+        emit(json, {"runs": runs, "count": len(runs)},
+             lambda: console.print(f"{len(runs)} run(s) pinned to {version_id}"))
+
+
+@envs_app.command("list")
+def envs_list(json: bool = typer.Option(False, "--json")):
+    """Environments and the version each currently points at."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rows = deployments.list_environments(store, agent=manifest.name)
+
+        def render():
+            if not rows:
+                console.print("[dim]nothing deployed yet — `rya deploy --env dev`[/dim]")
+            for e in rows:
+                console.print(f"  {e['name']:10} → {e.get('currentVersionId') or '(none)'}"
+                              f"   updated {e.get('updatedAt', '')}")
+        emit(json, {"environments": rows}, render)
+
+
+@envs_app.command("show")
+def envs_show(env: str = typer.Argument(...), json: bool = typer.Option(False, "--json")):
+    """One environment in full: current version, history, and which older
+    versions are retained because runs are still pinned to them."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        data = deployments.describe_environment(store, env, manifest.name)
+        emit(json, data, lambda: console.print(data))
+
+
+@envs_app.command("history")
+def envs_history(env: str = typer.Argument(...), json: bool = typer.Option(False, "--json")):
+    """The promote/rollback audit trail for an environment, newest first."""
+    with guard(json):
+        from .. import deployments
+        root, manifest, store = _store()
+        rows = deployments.history(store, env, manifest.name)
+        emit(json, {"history": rows},
+             lambda: [console.print(f"  {h.get('replacedAt') or h.get('updatedAt', '')}  "
+                                    f"{h.get('versionId')}  {h.get('actor') or ''}") for h in rows])
+
+
+@gate_app.command("show")
+def gate_show(env: Optional[str] = typer.Option(None, "--env", help="Show the gate for one environment."),
+              json: bool = typer.Option(False, "--json")):
+    """The promotion gate: what an environment requires before it accepts a version.
+
+    §9's admission check. With no --env, shows every environment that has a gate
+    plus the default."""
+    with guard(json):
+        from .. import deployments, gates
+        root, manifest, store = _store()
+        names = [env] if env else sorted(
+            {e["name"] for e in deployments.list_environments(store, agent=manifest.name)}
+            | set((store.policy_get(gates.POLICY_KEY) or {}).get("environments") or {}))
+        rows = [gates.resolve_gate(store, name).describe() for name in names]
+        data = {"gates": rows, "default": gates.resolve_gate(store, "default").describe()}
+
+        def render():
+            if not rows:
+                console.print("[dim]no gates configured — every environment accepts any version.\n"
+                              "  `rya gate set --env prod --require-readiness --require-evals`[/dim]")
+            for g in rows:
+                marks = [k for k in ("requireReadiness", "requireEvals", "requireActor") if g[k]]
+                if g["requireProvenance"]:
+                    marks.append("provenance=" + ",".join(g["requireProvenance"]))
+                console.print(f"  {g['environment']:10} "
+                              + ("[green]" + " ".join(marks) + "[/green]" if marks
+                                 else "[dim]unenforced[/dim]"))
+        emit(json, data, render)
+
+
+@gate_app.command("set")
+def gate_set(env: Optional[str] = typer.Option(None, "--env",
+                                               help="Environment to gate. Omit to set the default for all."),
+             require_readiness: Optional[bool] = typer.Option(None, "--require-readiness/--no-require-readiness"),
+             require_evals: Optional[bool] = typer.Option(None, "--require-evals/--no-require-evals"),
+             min_eval_score: Optional[float] = typer.Option(None, "--min-eval-score",
+                                                            help="Minimum eval pass rate, 0..1."),
+             allow_warnings: Optional[bool] = typer.Option(None, "--allow-warnings/--no-allow-warnings"),
+             require_actor: Optional[bool] = typer.Option(None, "--require-actor/--no-require-actor"),
+             provenance: Optional[str] = typer.Option(None, "--require-provenance",
+                                                      help="Comma-separated metadata keys, e.g. gitSha,ciRunUrl."),
+             actor: Optional[str] = typer.Option(None, "--actor", help="Who is changing the gate."),
+             json: bool = typer.Option(False, "--json")):
+    """Configure what an environment requires before it will accept a promotion.
+
+    Merges into the existing policy rather than replacing it, so tightening one
+    requirement does not silently drop the others. Every change lands in the
+    append-only policy log (§12 risk 7: "who reviewed this" is a feature)."""
+    with guard(json):
+        from .. import gates
+        root, manifest, store = _store()
+        policy = dict(store.policy_get(gates.POLICY_KEY) or {})
+        target = "default" if env is None else env
+        if env is None:
+            spec = dict(policy.get("default") or {})
+        else:
+            environments = dict(policy.get("environments") or {})
+            spec = dict(environments.get(env) or {})
+
+        for wire, value in (("requireReadiness", require_readiness),
+                            ("requireEvals", require_evals),
+                            ("minEvalScore", min_eval_score),
+                            ("allowWarnings", allow_warnings),
+                            ("requireActor", require_actor)):
+            if value is not None:
+                spec[wire] = value
+        if provenance is not None:
+            keys = [k.strip() for k in provenance.split(",") if k.strip()]
+            spec["requireProvenance"] = keys
+
+        if env is None:
+            policy["default"] = spec
+        else:
+            environments = dict(policy.get("environments") or {})
+            environments[env] = spec
+            policy["environments"] = environments
+
+        gates.set_gate(store, policy, actor=actor)
+        resolved = gates.resolve_gate(store, target).describe()
+        emit(json, {"ok": True, "gate": resolved}, lambda: console.print(
+            f"[green]✓[/green] gate for [bold]{target}[/bold]: "
+            + (", ".join(k for k in ("requireReadiness", "requireEvals", "requireActor")
+                         if resolved[k]) or "unenforced")))
+
+
+@gate_app.command("clear")
+def gate_clear(actor: Optional[str] = typer.Option(None, "--actor"),
+               json: bool = typer.Option(False, "--json")):
+    """Remove all promotion gates. Recorded in the policy log."""
+    with guard(json):
+        from .. import gates
+        root, manifest, store = _store()
+        gates.set_gate(store, None, actor=actor)
+        emit(json, {"ok": True, "cleared": True},
+             lambda: console.print("[yellow]gates cleared[/yellow] — every environment now "
+                                   "accepts any version."))
+
+
+@gate_app.command("check")
+def gate_check(env: str = typer.Option(..., "--env"),
+               version: Optional[str] = typer.Option(None, "--version",
+                                                     help="Defaults to the environment's current version."),
+               actor: Optional[str] = typer.Option(None, "--actor"),
+               json: bool = typer.Option(False, "--json")):
+    """Dry-run the gate: would this version be admitted, and if not, what is missing?
+
+    Exits 7 when blocked, so CI can gate on it without parsing prose."""
+    with guard(json):
+        from .. import deployments, gates
+        root, manifest, store = _store()
+        if version:
+            rec = store.version_get(version)
+            if rec is None:
+                raise RyaError("E_VERSION_NOT_FOUND", f"No deployment version '{version}'.",
+                               hint="`rya versions list --json`")
+        else:
+            rec = deployments.current_version(store, env, manifest.name)
+            if rec is None:
+                raise RyaError("E_ENVIRONMENT_NOT_FOUND",
+                               f"Nothing is promoted to '{env}' yet, and no --version was given.",
+                               hint=f"Pass --version <id>, or `rya deploy --env {env}`.")
+        result = gates.check_promotion(store, version=rec, environment=env, actor=actor)
+
+        def render():
+            head = "[green]✓ admitted[/green]" if result.allowed else "[red]✗ blocked[/red]"
+            console.print(f"{head}  {rec['id']} → {env}")
+            for c in result.checks:
+                mark = "[green]✓[/green]" if c["ok"] else "[red]•[/red]"
+                console.print(f"  {mark} {c['check']}: {c['detail']}")
+                if not c["ok"] and c["fix"]:
+                    console.print(f"      [dim]fix:[/dim] {c['fix']}")
+        emit(json, {"versionId": rec["id"], **result.to_dict()}, render)
+        raise typer.Exit(EXIT_OK if result.allowed else 7)
+
+
+@quotas_app.command("show")
+def quotas_show(json: bool = typer.Option(False, "--json")):
+    """This workspace's limits and what it is consuming right now (§11.12)."""
+    with guard(json):
+        from .. import quotas
+        root, manifest, store = _store()
+        policy = quotas.resolve_quota(store)
+        usage = quotas.usage_snapshot(store)
+        verdict = quotas.check_admission(store, kind="any", usage=usage)
+        data = {"quota": policy.describe(), "usage": usage,
+                "violations": verdict.violations}
+
+        def render():
+            if not policy.enforced:
+                console.print("[dim]no quota configured — this workspace is unlimited.\n"
+                              "  `rya quotas set --max-concurrent-runs 10 "
+                              "--max-cost-usd-per-day 25`[/dim]")
+            rows = [("concurrent runs", usage.get("concurrentRuns"), policy.max_concurrent_runs),
+                    ("runs today", usage.get("runsToday"), policy.max_runs_per_day),
+                    ("queue depth", usage.get("queueDepth"), policy.max_queue_depth),
+                    ("tokens today", usage.get("tokensToday"), policy.max_tokens_per_day),
+                    ("USD today", usage.get("costUsdToday"), policy.max_cost_usd_per_day),
+                    ("workers", usage.get("workers"), policy.max_workers)]
+            for label, current, limit in rows:
+                cap = "∞" if limit is None else str(limit)
+                over = limit is not None and (current or 0) >= limit
+                colour = "red" if over else "green" if limit is not None else "dim"
+                console.print(f"  [{colour}]{label:18} {current}/{cap}[/{colour}]")
+        emit(json, data, render)
+
+
+@quotas_app.command("set")
+def quotas_set(max_concurrent_runs: Optional[int] = typer.Option(None, "--max-concurrent-runs"),
+               max_runs_per_day: Optional[int] = typer.Option(None, "--max-runs-per-day"),
+               max_queue_depth: Optional[int] = typer.Option(None, "--max-queue-depth"),
+               max_tokens_per_day: Optional[int] = typer.Option(None, "--max-tokens-per-day"),
+               max_cost_usd_per_day: Optional[float] = typer.Option(None, "--max-cost-usd-per-day"),
+               max_workers: Optional[int] = typer.Option(None, "--max-workers"),
+               actor: Optional[str] = typer.Option(None, "--actor"),
+               json: bool = typer.Option(False, "--json")):
+    """Set this workspace's limits. Merges into the existing quota.
+
+    Note this is the OPERATOR's command. Over the API the same write requires the
+    admin token in multi-tenant mode — a tenant that can raise its own quota does
+    not have one."""
+    with guard(json):
+        from .. import quotas
+        root, manifest, store = _store()
+        policy = dict(store.policy_get(quotas.POLICY_KEY) or {})
+        for wire, value in (("maxConcurrentRuns", max_concurrent_runs),
+                            ("maxRunsPerDay", max_runs_per_day),
+                            ("maxQueueDepth", max_queue_depth),
+                            ("maxTokensPerDay", max_tokens_per_day),
+                            ("maxCostUsdPerDay", max_cost_usd_per_day),
+                            ("maxWorkers", max_workers)):
+            if value is not None:
+                policy[wire] = value
+        quotas.set_quota(store, policy, actor=actor)
+        resolved = quotas.resolve_quota(store).describe()
+        emit(json, {"ok": True, "quota": resolved},
+             lambda: console.print(f"[green]✓[/green] quota updated: "
+                                   + ", ".join(f"{k}={v}" for k, v in resolved.items()
+                                               if v is not None and k not in ("enforced", "source"))))
+
+
+@quotas_app.command("clear")
+def quotas_clear(actor: Optional[str] = typer.Option(None, "--actor"),
+                 json: bool = typer.Option(False, "--json")):
+    """Remove all limits for this workspace. Recorded in the policy log."""
+    with guard(json):
+        from .. import quotas
+        root, manifest, store = _store()
+        quotas.set_quota(store, None, actor=actor)
+        emit(json, {"ok": True, "cleared": True},
+             lambda: console.print("[yellow]quota cleared[/yellow] — this workspace is unlimited."))
+
+
+@app.command()
+def bundle(json: bool = typer.Option(False, "--json")):
+    """Build the bundle and print its content hash without recording anything.
+
+    The CI diffing primitive: identical source always produces an identical
+    hash, so "has anything actually changed" is one command (D12)."""
+    with guard(json):
+        from .. import bundles
+        root, manifest = _project()
+        b = bundles.build_bundle(root)
+        emit(json, b.to_dict(), lambda: console.print(
+            f"{b.hash}  {b.fileCount} files  {b.sizeBytes} bytes  sdk {b.sdkVersion}"))
+
+
 @app.command(name="doctor")
 def doctor_cmd(json: bool = typer.Option(False, "--json")):
     """Static durable-execution checks: flags raw IO inside replayed handlers."""
@@ -369,6 +892,13 @@ def eval_cmd(
         'e.g. \'{"email":"counsellor@csa.test"}\'.'),
     trigger_type: str = typer.Option(
         "message.received", "--trigger-type", help="Event type to fire per dataset item."),
+    attest: bool = typer.Option(False, "--attest",
+                                help="Record the result against a deployment version, so an "
+                                     "eval-gated environment will accept it (§9)."),
+    version: Optional[str] = typer.Option(None, "--version",
+                                          help="Version to attest against. Defaults to the version "
+                                               "whose bundle hash matches the working tree."),
+    actor: Optional[str] = typer.Option(None, "--actor", help="Who ran the evals."),
     json: bool = typer.Option(False, "--json"),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ):
@@ -439,7 +969,32 @@ def eval_cmd(
                 if r.get("error"):
                     console.print(f"      [red]error:[/red] {r['error']}")
 
-        emit(json, rep, render)
+        # §9: "evals can gate promotion between staging and prod". The result is
+        # filed against a VERSION, because a gate satisfied by an eval run against
+        # some other tree is not a gate (see gates.py).
+        attested = None
+        if attest:
+            from .. import bundles, gates
+            target = version
+            if target is None:
+                # Default to the version matching the working tree's content, so
+                # `rya deploy` then `rya eval --attest` needs no id copied by hand.
+                b = bundles.build_bundle(root)
+                rec = store.version_by_hash(manifest.name, b.hash)
+                if rec is None:
+                    raise RyaError(
+                        "E_VERSION_NOT_FOUND",
+                        f"No recorded version matches this working tree ({b.hash[:12]}…).",
+                        hint="Record it first with `rya deploy --env <env> --no-promote`, or pass "
+                        "--version <id> to attest against a specific version.")
+            else:
+                rec = store.version_get(target)
+                if rec is None:
+                    raise RyaError("E_VERSION_NOT_FOUND", f"No deployment version '{target}'.",
+                                   hint="`rya versions list --json`")
+            attested = gates.attest_evals(store, rec, rep, actor=actor)
+
+        emit(json, {**rep, **({"attestation": attested} if attested else {})}, render)
         if rep["hasEvals"] and not rep["ok"]:
             raise typer.Exit(5)
 
@@ -689,7 +1244,7 @@ def status(json: bool = typer.Option(False, "--json")):
         data = {
             "agent": manifest.name,
             "version": manifest.version,
-            "environment": manifest.environment,
+            "environment": current_environment(),
             "store": store.describe(),
             "llmProvider": resolve_provider(manifest.model.provider),
             "runs": {"total": len(runs), "byStatus": counts},
@@ -700,7 +1255,7 @@ def status(json: bool = typer.Option(False, "--json")):
             "channels": len(manifest.channels),
         }
         def render():
-            console.print(f"[bold]{manifest.name}[/bold] v{manifest.version} ({manifest.environment})")
+            console.print(f"[bold]{manifest.name}[/bold] v{manifest.version} ({current_environment()})")
             console.print(f"  store: {data['store']['backend']}  |  llm: {data['llmProvider']}")
             console.print(f"  runs: {len(runs)} {counts}")
             console.print(f"  approvals pending: {data['approvalsPending']}")
@@ -730,8 +1285,8 @@ def agents_list(json: bool = typer.Option(False, "--json")):
     with guard(json):
         root, manifest = _project()
         data = {"agents": [{"name": manifest.name, "version": manifest.version,
-                            "environment": manifest.environment, "runtime": manifest.runtime}]}
-        emit(json, data, lambda: console.print(f"{manifest.name}  v{manifest.version}  ({manifest.environment})"))
+                            "environment": current_environment(), "runtime": manifest.runtime}]}
+        emit(json, data, lambda: console.print(f"{manifest.name}  v{manifest.version}  ({current_environment()})"))
 
 
 @agents_app.command("inspect")
@@ -1206,31 +1761,56 @@ def jobs_retry(job_id: str = typer.Argument(...), json: bool = typer.Option(Fals
 
 
 @app.command()
-def worker(once: bool = typer.Option(False, "--once", help="Drain due jobs once and exit."),
-           interval: int = typer.Option(2, "--interval", help="Poll seconds between drains."),
+def worker(once: bool = typer.Option(False, "--once", help="Drain due work once and exit."),
+           interval: float = typer.Option(2, "--interval", help="Poll seconds between drains."),
            max_iterations: Optional[int] = typer.Option(None, "--max-iterations", help="Stop after N polls."),
+           version: Optional[str] = typer.Option(None, "--version", help="Serve a pinned deployment version."),
+           env: Optional[str] = typer.Option(None, "--env", help="Serve whichever version this environment points at."),
+           workspace: str = typer.Option("default", "--workspace"),
+           concurrency: int = typer.Option(1, "--concurrency", help="Parallel job execution."),
+           idle_exit: float = typer.Option(0, "--idle-exit",
+                                           help="Exit after N idle seconds with an empty queue (scale to zero)."),
            json: bool = typer.Option(False, "--json")):
-    """Run a background worker that claims and executes due jobs. Run several
-    concurrently for horizontal throughput — claims are atomic on Postgres."""
+    """Run an execution-plane worker: claim and execute due turns and jobs.
+
+    This is the `worker` half of the platform (PLATFORM_DESIGN §5.2). Run
+    several concurrently for horizontal throughput — claims are atomic on
+    Postgres.
+
+    With `--version` or `--env` it serves ONE pinned, content-hashed deployment:
+    it loads that bundle, verifies its hash, advertises its handler set, refuses
+    to start on a mismatch, and claims only work pinned to it (D3, D12). Without
+    either it runs the working tree, which is `rya dev` and single-tenant serve.
+    """
     with guard(json):
-        import time as _time
-        engine = _engine()
+        from ..worker import start_worker
+
+        root, manifest, store = _store()
+        w = start_worker(project_root=root, store=store, workspace=workspace,
+                         version_id=version, environment=env,
+                         agent_name=manifest.name, concurrency=concurrency,
+                         idle_exit_seconds=idle_exit, poll_seconds=interval)
         if once:
-            ran = engine.work_once()
-            emit(json, {"ran": ran, "count": len(ran)},
-                 lambda: console.print(f"[green]✓[/green] drained {len(ran)} job(s)"))
+            w.preflight()
+            w.register()
+            try:
+                tick = w.drain_once()
+            finally:
+                w.deregister("once")
+            out = {"workerId": w.id, "ran": tick["jobs"], "turns": tick["turns"],
+                   "count": tick["count"], **w.key.describe()}
+            emit(json, out,
+                 lambda: console.print(f"[green]✓[/green] drained {tick['count']} item(s)"))
             return
         if not json:
-            console.print(f"[green]✓[/green] worker polling every {interval}s (Ctrl-C to stop)")
-        i = 0
-        while True:
-            ran = engine.work_once()
-            if ran and not json:
-                console.print(f"  ran {len(ran)} job(s)")
-            i += 1
-            if max_iterations and i >= max_iterations:
-                break
-            _time.sleep(interval)
+            pin = w.key.version_id or "working tree"
+            console.print(f"[green]✓[/green] worker {w.id} serving [bold]{w.key.agent}[/bold] "
+                          f"({pin}) — polling every {interval}s (Ctrl-C to stop)")
+        result = w.run(max_iterations=max_iterations,
+                       on_tick=None if json else lambda t: (
+                           console.print(f"  ran {t['count']} item(s)") if t["count"] else None))
+        if json:
+            emit(json, result, lambda: None)
 
 
 @app.command()

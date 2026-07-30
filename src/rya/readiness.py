@@ -41,6 +41,25 @@ def check_readiness(manifest, store, agent, project_root) -> dict:
         block("E_RUNTIME_UNSUPPORTED", f"Runtime '{manifest.runtime}' is not executable by this build.",
               "Set runtime: python in the manifest.")
 
+    # D11: the manifest is environment-INVARIANT, because one content-hashed
+    # bundle is promoted between environments. A leftover `environment:` is
+    # inert and actively misleading — a production container declaring itself
+    # `local` is exactly the failure the decision names — so the deploy gate
+    # refuses it rather than ignoring it a second time.
+    manifest_path = Path(project_root) / "rya.agent.yaml"
+    if manifest_path.is_file():
+        import yaml
+        try:
+            raw = yaml.safe_load(manifest_path.read_text()) or {}
+        except yaml.YAMLError:
+            raw = {}
+        if isinstance(raw, dict) and "environment" in raw:
+            block("E_MANIFEST_ENVIRONMENT",
+                  f"rya.agent.yaml still declares `environment: {raw['environment']}`, "
+                  "which no longer exists.",
+                  "Delete the line. One bundle is promoted between environments "
+                  "(`rya deploy --env prod`); per-environment values are platform config.")
+
     gate_policy = manifest.approvals.default  # default: required_for_external_actions
     for t in manifest.tools:
         spec = treg.get(t.id)

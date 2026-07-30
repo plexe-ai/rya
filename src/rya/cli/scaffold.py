@@ -24,7 +24,6 @@ name: {name}
 runtime: python
 entrypoint: src/agent.py
 version: 0.1.0
-environment: local
 owner: you@example.com
 instructions: >
   A production-style follow-up agent scaffolded by Rya. It looks up a customer,
@@ -280,7 +279,6 @@ name: {name}
 runtime: python
 entrypoint: src/agent.py
 version: 0.1.0
-environment: local
 owner: you@example.com
 instructions: >
   A minimal, production-shaped assistant. Real seams only: the LLM provider

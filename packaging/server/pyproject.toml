@@ -1,0 +1,88 @@
+# The platform — `rya-server` on PyPI (PLATFORM_DESIGN D16).
+#
+# D16: "Operators deploy an image, so the platform's PyPI name is near-cosmetic."
+# That is exactly why the split does not move any code: the whole value of the
+# rename is that `rya` on PyPI can mean the client SDK, and the platform still
+# imports as `rya` because §2's two processes and every module reference in the
+# tree say so.
+#
+# MUTUALLY EXCLUSIVE with the `rya` distribution — see packaging/sdk/pyproject.toml.
+# Installing both puts two dists in charge of the same `rya/__init__.py`.
+#
+# This file is the root `pyproject.toml` under another name and with the whole
+# tree included; the root one stays `rya` because it is the editable dev install
+# (§2: the dev environment is the platform) and is never published.
+# `tests/test_sdk_surface.py` asserts the two stay in step.
+#
+# Build (wheel only — see docs/PACKAGING.md):
+#     python -m build --wheel packaging/server
+#     uv build --wheel packaging/server
+
+[project]
+name = "rya-server"
+version = "0.1.0"
+description = "Rya — production backend/runtime for AI agents (the platform: api + worker)"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Plexe" }]
+keywords = ["ai", "agents", "runtime", "backend", "llm", "mcp", "approvals", "agent-infrastructure"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "cryptography>=42.0",   # encryption-at-rest for vaulted connection secrets
+]
+
+[project.urls]
+Homepage = "https://github.com/plexe-ai/rya"
+Documentation = "https://github.com/plexe-ai/rya/tree/main/docs"
+Repository = "https://github.com/plexe-ai/rya"
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0"]
+mcp = ["mcp>=1.2.0"]
+postgres = ["psycopg[binary]>=3.1"]
+llm = ["anthropic>=0.40"]
+bedrock = ["boto3>=1.34"]     # AWS Bedrock provider (Converse API, IAM-signed - no API key)
+s3 = ["boto3>=1.34"]          # Object storage: file bytes (files_s3.py) and bundle archives
+                              # (bundles.py's S3 arm). Same dependency as `bedrock`, named
+                              # separately because an operator offloading storage is not
+                              # necessarily using Bedrock as their model provider.
+deepeval = ["deepeval>=1.0"]  # LLM-output-quality eval metrics (`deepeval` scorer); needs a
+                              # judge key (OPENAI_API_KEY, or ANTHROPIC_API_KEY + the `anthropic` pkg via rya[llm])
+dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27", "ruff>=0.16"]
+
+# The platform keeps the full CLI under `rya` — an operator's muscle memory and
+# every docs/compose invocation (`rya serve`, `rya worker`) is unchanged — and
+# also exposes it as `rya-server` so a shell that has both names on PATH at
+# different times is unambiguous about which distribution is installed.
+[project.scripts]
+rya = "rya.cli.main:app"
+rya-server = "rya.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = []
+
+[tool.hatch.build.targets.wheel.force-include]
+# The whole tree, SDK modules included: `rya-server` is a superset, because the
+# platform imports `manifest/`, `sdk/agent.py` and `bundles.py` too (§14's BOTH
+# rows) and because the two dists are alternatives, never installed together.
+"../../src/rya" = "rya"

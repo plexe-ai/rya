@@ -33,6 +33,12 @@ _CODE_EXIT = {
     "E_MODEL_NOT_FOUND": EXIT_NOT_FOUND,
     "E_RUN_NOT_FOUND": EXIT_NOT_FOUND,
     "E_APPROVAL_NOT_FOUND": EXIT_NOT_FOUND,
+    # Both were already being RETURNED by the api and the CLI without being
+    # declared here, so they fell through to EXIT_GENERIC — `rya connections
+    # revoke <unknown-id>` exited 1 instead of 4, which is exactly the
+    # branch-on-the-code contract this table exists to keep.
+    "E_NOT_FOUND": EXIT_NOT_FOUND,
+    "E_SESSION_NOT_FOUND": EXIT_NOT_FOUND,
     "E_APPROVAL_NOT_PENDING": EXIT_STATE,
     "E_RUN_NOT_PAUSED": EXIT_STATE,
     "E_JOB_NOT_FOUND": EXIT_NOT_FOUND,
@@ -51,6 +57,34 @@ _CODE_EXIT = {
     "E_TOOL_UPSTREAM": EXIT_GENERIC,
     "E_TOOL_RECOVERABLE": EXIT_GENERIC,
     "E_RUNTIME": EXIT_GENERIC,
+    # ---- platform: deployments, versions, workers (PLATFORM_DESIGN D9/D12, §6) --
+    # D9: replay is only sound against the code that wrote the journal, so a step
+    # whose content key does not match the recorded one fails CLOSED rather than
+    # returning another step's memoized result.
+    "E_JOURNAL_DRIFT": EXIT_STATE,
+    # D12: a run pinned to a version that no longer exists cannot be replayed.
+    "E_VERSION_NOT_FOUND": EXIT_NOT_FOUND,
+    "E_VERSION_RETIRED": EXIT_STATE,
+    # §6: retiring a version with live pinned runs, or starting a worker whose
+    # bundle does not match the version it claims to serve.
+    "E_VERSION_IN_USE": EXIT_STATE,
+    "E_BUNDLE_MISMATCH": EXIT_STATE,
+    "E_BUNDLE_NOT_FOUND": EXIT_NOT_FOUND,
+    "E_HANDLER_SET_INCOMPLETE": EXIT_VALIDATION,
+    "E_ENVIRONMENT_NOT_FOUND": EXIT_NOT_FOUND,
+    # D7/§11.2: policy is privileged platform state; a bundle must not write it.
+    "E_POLICY_READONLY": EXIT_PERMISSION,
+    # §9: the readiness gate and eval gate are server-side ADMISSION checks, not
+    # client-side courtesies — promotion into a gated environment is refused.
+    "E_PROMOTION_BLOCKED": EXIT_VALIDATION,
+    # §6/D13: a workspace's quota (concurrent runs, runs, tokens or cost per
+    # window) is exhausted. Fairness and quotas are how one tenant is stopped
+    # from starving another; this is the code that says so.
+    "E_QUOTA_EXCEEDED": EXIT_STATE,
+    # The object store backing bundle archives is unreachable or misconfigured.
+    # Distinct from E_BUNDLE_NOT_FOUND: the artifact may well exist, we cannot
+    # reach the place it lives, and the operator fix is different.
+    "E_BUNDLE_STORE": EXIT_GENERIC,
 }
 
 

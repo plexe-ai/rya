@@ -13,11 +13,21 @@ Layout::
       jobs/<job_id>.json
       queue/<job_id>.json
       memory/<scope>.json
+      journal/<run_id>.jsonl      append-only step log (D10)
+      meter/ledger.jsonl          append-only billable-fact ledger (D10)
+      policy/<key>.json           privileged platform policy (D7)
+      policy/log.jsonl            append-only policy audit trail
+      versions/<version_id>.json  immutable content-hashed deployments (D12)
+      envs/<name>.json            environment -> current-version pointer (D11)
+      workers/<worker_id>.json    worker registration + heartbeat (§6)
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -27,6 +37,29 @@ from typing import Any, Dict, List, Optional
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fair_order(pending: List[dict], running: Dict[str, int]) -> List[dict]:
+    """Order due jobs so the least-busy ``concurrencyKey`` goes first.
+
+    PLATFORM_DESIGN §6 makes ``concurrency_key``/``concurrency_limit`` "the
+    fairness primitive — one workspace must not starve another". The *cap* half
+    was already implemented; this is the *ordering* half. Without it, a workspace
+    that enqueues ten thousand jobs owns every free slot until its backlog drains,
+    because selection was purely (priority, runAt): a caps-only scheme bounds how
+    much of the fleet one key holds at once but says nothing about who gets the
+    next slot.
+
+    Jobs sharing a key all see the same running count, so ordering WITHIN a key is
+    untouched (priority still wins, then age). Fairness only decides between
+    *different* keys — which is exactly the starvation case. The trade is explicit:
+    a high-priority job on a busy key now yields to a low-priority job on an idle
+    one. Priority orders a queue; it was never a claim on the whole fleet.
+
+    Keyless jobs count as one shared bucket, which preserves plain (priority,
+    runAt) ordering for anyone not using concurrency keys at all.
+    """
+    return sorted(pending, key=lambda j: running.get(j.get("concurrencyKey") or "", 0))
 
 
 def _new_id(prefix: str) -> str:
@@ -73,24 +106,61 @@ class FileStore:
         self.sessions_dir = self.dir / "sessions"
         self.connections_dir = self.dir / "connections"
         self.files_dir = self.dir / "files"
+        # ---- platform state (PLATFORM_DESIGN D7, D10, D11, D12, §6) ----------
+        self.journal_dir = self.dir / "journal"
+        self.meter_dir = self.dir / "meter"
+        self.policy_dir = self.dir / "policy"
+        self.versions_dir = self.dir / "versions"
+        self.envs_dir = self.dir / "envs"
+        self.workers_dir = self.dir / "workers"
 
     def ensure(self) -> None:
         for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.queue_dir,
                   self.streams_dir, self.memory_dir, self.sessions_dir, self.connections_dir,
-                  self.files_dir):
+                  self.files_dir, self.journal_dir, self.meter_dir, self.policy_dir,
+                  self.versions_dir, self.envs_dir, self.workers_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # ---- low level -----------------------------------------------------
+    # Writes are ATOMIC (temp file in the same directory + os.replace). This is
+    # not a nicety: `rya dev` runs an api process and a worker against the same
+    # FileStore, and `work_once(concurrency=N)` claims from N threads, so a
+    # reader concurrent with a writer is the normal case rather than an edge.
+    # A plain write_text() truncates first, so a reader could see a half-written
+    # or zero-length file and die with a JSONDecodeError. os.replace() swaps the
+    # directory entry in one step: a reader gets either the whole old version or
+    # the whole new one, never a torn one.
     @staticmethod
     def _read(path: Path) -> Optional[dict]:
-        if not path.is_file():
+        try:
+            raw = path.read_text()
+        except FileNotFoundError:
+            # Deleted between the caller's listing and this read (a job claimed
+            # and archived by another worker) — indistinguishable from absent.
             return None
-        return json.loads(path.read_text())
+        except IsADirectoryError:
+            return None
+        if not raw.strip():
+            # Only reachable for a file written by a pre-atomic build that
+            # crashed mid-write. Treat as absent rather than raising.
+            return None
+        return json.loads(raw)
 
     @staticmethod
     def _write(path: Path, data: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, default=str))
+        body = json.dumps(data, indent=2, default=str)
+        # Same directory as the target, so os.replace() stays within one
+        # filesystem and is therefore atomic.
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(body)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     # ---- runs ----------------------------------------------------------
     def new_run_id(self) -> str:
@@ -111,6 +181,24 @@ class FileStore:
                 runs.append(data)
         runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
         return runs
+
+    def run_counts(self, since: Optional[str] = None) -> Dict[str, int]:
+        """Runs per status, optionally only those created at/after ``since``.
+
+        Exists so a quota check (§11.12) is a counting query rather than a full
+        materialisation of every run: admission runs on the hot path, and
+        ``list_runs`` loads every run document to answer "how many".
+        """
+        counts: Dict[str, int] = {}
+        for p in self.runs_dir.glob("run_*.json"):
+            data = self._read(p)
+            if not data:
+                continue
+            if since is not None and (data.get("createdAt") or "") < since:
+                continue
+            status = data.get("status") or "?"
+            counts[status] = counts.get(status, 0) + 1
+        return counts
 
     # ---- files (uploaded documents) ------------------------------------
     # Files are immutable once saved: handlers may re-read them on replay and
@@ -306,13 +394,14 @@ class FileStore:
     def queue_claim_one(self, worker_id: str, now: str, lease_expires_at: str,
                         types: Optional[List[str]] = None) -> Optional[dict]:
         """Claim one due job (best-effort atomicity; the file store is for local
-        single-process dev). Respects per-concurrencyKey running caps."""
+        single-process dev). Respects per-concurrencyKey running caps, and picks
+        the LEAST busy key first — see ``_fair_order``."""
         running = {}
         for j in self.queue_list("running"):
             k = j.get("concurrencyKey")
             if k:
                 running[k] = running.get(k, 0) + 1
-        for job in self.queue_list("pending"):
+        for job in _fair_order(self.queue_list("pending"), running):
             if types and job.get("type") not in types:
                 continue
             if (job.get("runAt") or "") > now:
@@ -535,6 +624,293 @@ class FileStore:
                 resealed += 1
         return {"scanned": scanned, "resealed": resealed,
                 "alreadyEncrypted": already, "noSecret": empty}
+
+    # ======================================================================
+    # Platform state — the tables PLATFORM_DESIGN §11 items 2, 4, 8, 9 and 10
+    # need. Deliberately grouped and duck-typed the same way as everything
+    # above, so PostgresStore can mirror the surface without an ABC.
+    # ======================================================================
+
+    # ---- append-only journal (D10) ---------------------------------------
+    # `save_run` rewrites the whole run as one blob, which is fine for a run
+    # summary and wrong for a commit path: a step needs an APPEND. Entries are
+    # revisioned rather than overwritten, so an approval's pending -> approved
+    # transition adds a row instead of destroying the prior one. Readers take the
+    # highest revision per seq; auditors read them all.
+    @staticmethod
+    def _append_jsonl(path: Path, record: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> List[dict]:
+        if not path.is_file():
+            return []
+        out = []
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:  # a torn final write; ignore the tail
+                    continue
+        return out
+
+    def journal_append(self, run_id: str, entry: dict) -> dict:
+        path = self.journal_dir / f"{run_id}.jsonl"
+        prior = [e for e in self._read_jsonl(path) if e.get("seq") == entry.get("seq")]
+        record = {**entry, "runId": run_id,
+                  "revision": max((int(e.get("revision") or 0) for e in prior), default=-1) + 1,
+                  "appendedAt": now_iso()}
+        self._append_jsonl(path, record)
+        return record
+
+    def journal_read(self, run_id: str) -> Dict[str, dict]:
+        """The materialized journal: highest revision per seq, keyed by str(seq)
+        so it drops straight into ``run["journal"]``."""
+        latest: Dict[str, dict] = {}
+        for e in self._read_jsonl(self.journal_dir / f"{run_id}.jsonl"):
+            key = str(e.get("seq"))
+            if key not in latest or int(e.get("revision") or 0) >= int(latest[key].get("revision") or 0):
+                latest[key] = e
+        return latest
+
+    def journal_revisions(self, run_id: str) -> List[dict]:
+        """Every revision ever appended, in write order — the audit view."""
+        return self._read_jsonl(self.journal_dir / f"{run_id}.jsonl")
+
+    # ---- durable meter (D10) ---------------------------------------------
+    # Billing must not be derived from `run["trace"]`, which is a debugging
+    # artifact that gets redacted, truncated and rewritten. A billable fact is
+    # written here once, immutably, at the moment it happens.
+    def meter_append(self, record: dict) -> dict:
+        rec = {"id": _new_id("mtr"), "ts": now_iso(), **record}
+        self._append_jsonl(self.meter_dir / "ledger.jsonl", rec)
+        return rec
+
+    def meter_read(self, run_id: Optional[str] = None, since: Optional[str] = None,
+                   until: Optional[str] = None, limit: int = 1000) -> List[dict]:
+        out = []
+        for rec in self._read_jsonl(self.meter_dir / "ledger.jsonl"):
+            if run_id is not None and rec.get("runId") != run_id:
+                continue
+            if since is not None and (rec.get("ts") or "") < since:
+                continue
+            if until is not None and (rec.get("ts") or "") > until:
+                continue
+            out.append(rec)
+        return out[-limit:]
+
+    def meter_totals(self, since: Optional[str] = None, until: Optional[str] = None,
+                     group_by: Optional[str] = None) -> dict:
+        """Summed billable facts, optionally bucketed by a record field
+        (``model``, ``agent``, ``agentVersion``, ``kind``)."""
+        buckets: Dict[str, dict] = {}
+        for rec in self.meter_read(since=since, until=until, limit=10 ** 9):
+            key = str(rec.get(group_by)) if group_by else "_total"
+            b = buckets.setdefault(key, {"inputTokens": 0, "outputTokens": 0,
+                                         "costUsd": 0.0, "calls": 0})
+            b["inputTokens"] += int(rec.get("inputTokens") or 0)
+            b["outputTokens"] += int(rec.get("outputTokens") or 0)
+            b["costUsd"] += float(rec.get("costUsd") or 0.0)
+            b["calls"] += 1
+        return buckets if group_by else buckets.get("_total", {
+            "inputTokens": 0, "outputTokens": 0, "costUsd": 0.0, "calls": 0})
+
+    # ---- privileged policy (D7, §11.2) -----------------------------------
+    # Kill switches, guard policy and per-environment config are PLATFORM state.
+    # They lived in the generic `_runtime_config` memory scope, which a bundle can
+    # write through `ctx.memory.set` — governance a client can edit is not
+    # governance. These live in their own namespace with an append-only audit
+    # trail, and `ctx.memory` refuses reserved scopes (see sdk/context.py).
+    def policy_get(self, key: str) -> Optional[dict]:
+        doc = self._read(self.policy_dir / f"{key}.json")
+        return doc.get("value") if doc else None
+
+    def policy_set(self, key: str, value: Optional[dict], actor: Optional[str] = None) -> dict:
+        prior = self._read(self.policy_dir / f"{key}.json")
+        record = {
+            "key": key,
+            "value": value,
+            "version": int((prior or {}).get("version") or 0) + 1,
+            "actor": actor,
+            "previous": (prior or {}).get("value"),
+            "changedAt": now_iso(),
+        }
+        self._write(self.policy_dir / f"{key}.json", record)
+        # §12 risk 7: "who reviewed this allowlist change" is a feature, so every
+        # write lands in an append-only log the pointer write cannot destroy.
+        self._append_jsonl(self.policy_dir / "log.jsonl", record)
+        return record
+
+    def policy_all(self) -> Dict[str, Any]:
+        out = {}
+        for p in sorted(self.policy_dir.glob("*.json")):
+            doc = self._read(p)
+            if doc and doc.get("value") is not None:
+                out[doc["key"]] = doc["value"]
+        return out
+
+    def policy_history(self, key: Optional[str] = None, limit: int = 50) -> List[dict]:
+        log = self._read_jsonl(self.policy_dir / "log.jsonl")
+        if key is not None:
+            log = [r for r in log if r.get("key") == key]
+        return log[-limit:][::-1]
+
+    # ---- deployments: immutable versions (D12) ---------------------------
+    def version_create(self, record: dict) -> dict:
+        """Record an immutable, content-hashed version. Idempotent: re-recording
+        the same (agent, bundleHash) returns the existing row untouched, which is
+        what makes `rya deploy` safe to retry."""
+        existing = self.version_by_hash(record["agent"], record["bundleHash"])
+        if existing is not None:
+            return existing
+        version = {
+            "id": _new_id("ver"),
+            "state": "active",
+            "createdAt": now_iso(),
+            "retiredAt": None,
+            **record,
+        }
+        self._write(self.versions_dir / f"{version['id']}.json", version)
+        return version
+
+    def version_get(self, version_id: str) -> Optional[dict]:
+        return self._read(self.versions_dir / f"{version_id}.json")
+
+    def version_by_hash(self, agent: str, bundle_hash: str) -> Optional[dict]:
+        for p in self.versions_dir.glob("ver_*.json"):
+            doc = self._read(p)
+            if doc and doc.get("agent") == agent and doc.get("bundleHash") == bundle_hash:
+                return doc
+        return None
+
+    def version_list(self, agent: Optional[str] = None, state: Optional[str] = None) -> List[dict]:
+        out = []
+        for p in self.versions_dir.glob("ver_*.json"):
+            doc = self._read(p)
+            if doc and (agent is None or doc.get("agent") == agent) \
+                    and (state is None or doc.get("state") == state):
+                out.append(doc)
+        out.sort(key=lambda v: v.get("createdAt", ""), reverse=True)
+        return out
+
+    def version_set_state(self, version_id: str, state: str) -> Optional[dict]:
+        doc = self.version_get(version_id)
+        if doc is None:
+            return None
+        doc["state"] = state
+        doc["retiredAt"] = now_iso() if state == "retired" else None
+        self._write(self.versions_dir / f"{version_id}.json", doc)
+        return doc
+
+    # ---- promotion gate evidence (§9) ------------------------------------
+    # §9 turns the readiness gate into "a server-side admission check rather
+    # than a client-side courtesy" and lets evals gate staging→prod. An
+    # attestation is the evidence a check ran, and it is filed against a
+    # VERSION ID — which, because version_create is idempotent on
+    # (agent, bundleHash), is a 1:1 handle on the exact content. That binding is
+    # the whole security property: you cannot satisfy prod's gate by running
+    # evals against a different tree, because the attestation would be filed
+    # against a different version.
+    #
+    # Append-only for the same reason the policy log is: an override or a failed
+    # check must stay visible after a later passing one.
+    def version_attest(self, version_id: str, attestation: dict) -> dict:
+        record = {"id": _new_id("att"), "versionId": version_id,
+                  "createdAt": now_iso(), **attestation}
+        self._append_jsonl(self.versions_dir / "attestations" / f"{version_id}.jsonl", record)
+        return record
+
+    def version_attestations(self, version_id: str, kind: Optional[str] = None) -> List[dict]:
+        """Every attestation for a version, in write order (oldest first)."""
+        out = self._read_jsonl(self.versions_dir / "attestations" / f"{version_id}.jsonl")
+        return [r for r in out if kind is None or r.get("kind") == kind]
+
+    # ---- deployments: environments (D11) ---------------------------------
+    # One *current* version pointer per (environment, agent). A promote is a
+    # pointer flip and a rollback is the same flip backwards, which is why the
+    # prior pointer is kept in `history` rather than overwritten.
+    def _env_key(self, name: str, agent: str) -> str:
+        return f"{name}__{agent}".replace("/", "_")
+
+    def env_get(self, name: str, agent: str) -> Optional[dict]:
+        return self._read(self.envs_dir / f"{self._env_key(name, agent)}.json")
+
+    def env_set_current(self, name: str, agent: str, version_id: str,
+                        actor: Optional[str] = None) -> dict:
+        doc = self.env_get(name, agent) or {"name": name, "agent": agent,
+                                            "currentVersionId": None, "history": [],
+                                            "createdAt": now_iso()}
+        if doc.get("currentVersionId"):
+            doc["history"].append({"versionId": doc["currentVersionId"],
+                                   "replacedAt": now_iso(), "actor": actor})
+        doc["currentVersionId"] = version_id
+        doc["updatedAt"] = now_iso()
+        doc["actor"] = actor
+        self._write(self.envs_dir / f"{self._env_key(name, agent)}.json", doc)
+        return doc
+
+    def env_list(self, agent: Optional[str] = None) -> List[dict]:
+        out = []
+        for p in sorted(self.envs_dir.glob("*.json")):
+            doc = self._read(p)
+            if doc and (agent is None or doc.get("agent") == agent):
+                out.append(doc)
+        return out
+
+    # ---- worker registration (§6) ----------------------------------------
+    # `queue.claim` takes a bare worker_id string that is never registered or
+    # validated. A worker now registers what it actually is — bundle hash and
+    # handler set — so "the image is missing a handler" is a startup failure and
+    # an operator can see which version is live for which key.
+    def worker_register(self, record: dict) -> dict:
+        worker = {
+            "id": record.get("id") or _new_id("wrk"),
+            "status": "alive",
+            "startedAt": now_iso(),
+            "lastHeartbeatAt": now_iso(),
+            **record,
+        }
+        self._write(self.workers_dir / f"{worker['id']}.json", worker)
+        return worker
+
+    def worker_heartbeat(self, worker_id: str, **fields) -> Optional[dict]:
+        doc = self._read(self.workers_dir / f"{worker_id}.json")
+        if doc is None:
+            return None
+        doc.update(fields)
+        doc["lastHeartbeatAt"] = now_iso()
+        self._write(self.workers_dir / f"{worker_id}.json", doc)
+        return doc
+
+    def worker_deregister(self, worker_id: str, reason: Optional[str] = None) -> Optional[dict]:
+        doc = self._read(self.workers_dir / f"{worker_id}.json")
+        if doc is None:
+            return None
+        doc["status"] = "stopped"
+        doc["stoppedAt"] = now_iso()
+        doc["stopReason"] = reason
+        self._write(self.workers_dir / f"{worker_id}.json", doc)
+        return doc
+
+    def worker_list(self, agent: Optional[str] = None, version_id: Optional[str] = None,
+                    status: Optional[str] = None) -> List[dict]:
+        out = []
+        for p in self.workers_dir.glob("wrk_*.json"):
+            doc = self._read(p)
+            if not doc:
+                continue
+            if agent is not None and doc.get("agent") != agent:
+                continue
+            if version_id is not None and doc.get("versionId") != version_id:
+                continue
+            if status is not None and doc.get("status") != status:
+                continue
+            out.append(doc)
+        out.sort(key=lambda w: w.get("startedAt", ""), reverse=True)
+        return out
 
     def describe(self) -> dict:
         return {"backend": "file", "location": str(self.dir)}

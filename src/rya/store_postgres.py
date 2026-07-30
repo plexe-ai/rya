@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from .errors import RyaError
 from .store import now_iso, _new_id
 
 try:
@@ -125,6 +126,120 @@ CREATE TABLE IF NOT EXISTS rya_job_groups (
     failed BOOLEAN NOT NULL DEFAULT FALSE,
     on_complete JSONB NOT NULL
 );
+-- ---------------------------------------------------------------------------
+-- Platform state (PLATFORM_DESIGN D7, D10, D11, D12, §6).
+-- ---------------------------------------------------------------------------
+-- D10: the commit path needs an APPEND, not a rewrite of rya_runs.data. Entries
+-- are revisioned instead of updated in place, so an approval's pending ->
+-- approved transition adds a row and the prior one stays auditable.
+CREATE TABLE IF NOT EXISTS rya_journal (
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    run_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    content_key TEXT,
+    kind TEXT,
+    label TEXT,
+    status TEXT,
+    data JSONB NOT NULL,
+    appended_at TEXT,
+    PRIMARY KEY (workspace_id, run_id, seq, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_journal_run ON rya_journal (workspace_id, run_id, seq, revision DESC);
+-- D10: billing needs a ledger. observability/usage.py derives money from
+-- run["trace"], which is a redacted, rewritable debugging artifact.
+CREATE TABLE IF NOT EXISTS rya_meter (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    run_id TEXT,
+    ts TEXT NOT NULL,
+    kind TEXT,
+    agent TEXT,
+    agent_version TEXT,
+    model TEXT,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_meter_ws_ts ON rya_meter (workspace_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_meter_run ON rya_meter (workspace_id, run_id);
+-- D7 / §11.2: kill switches, guard policy and per-environment config are
+-- privileged platform state, not an ordinary memory scope a bundle can write.
+CREATE TABLE IF NOT EXISTS rya_policy (
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
+    value JSONB,
+    version INTEGER NOT NULL DEFAULT 1,
+    actor TEXT,
+    changed_at TEXT,
+    PRIMARY KEY (workspace_id, key)
+);
+-- §12 risk 7: "who reviewed this allowlist change" is a feature. Append-only.
+CREATE TABLE IF NOT EXISTS rya_policy_log (
+    id BIGSERIAL PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
+    value JSONB,
+    previous JSONB,
+    version INTEGER NOT NULL,
+    actor TEXT,
+    changed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_policy_log ON rya_policy_log (workspace_id, key, id DESC);
+-- D12: deployments are immutable, content-hashed and pinned per run.
+CREATE TABLE IF NOT EXISTS rya_versions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    agent TEXT NOT NULL,
+    bundle_hash TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT,
+    retired_at TEXT,
+    data JSONB NOT NULL
+);
+-- The immutability + uniqueness `agentVersion` never had: one row per content.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_hash ON rya_versions (workspace_id, agent, bundle_hash);
+CREATE INDEX IF NOT EXISTS idx_versions_agent ON rya_versions (workspace_id, agent, created_at DESC);
+-- §9: promotion-gate evidence. Filed against a version id, which is 1:1 with
+-- content (idx_versions_hash), so a gate cannot be satisfied by checks run
+-- against a different tree. Append-only: a failed check or an override must stay
+-- visible after a later passing one, so there is no UPDATE path.
+CREATE TABLE IF NOT EXISTS rya_version_attestations (
+    id BIGSERIAL PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    version_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ok BOOLEAN,
+    actor TEXT,
+    created_at TEXT,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_attest_version ON rya_version_attestations (workspace_id, version_id, id);
+-- D11: an environment holds ONE current version pointer; promote and rollback
+-- are the same pointer flip, so the prior pointer is retained in data.history.
+CREATE TABLE IF NOT EXISTS rya_environments (
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    current_version_id TEXT,
+    updated_at TEXT,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (workspace_id, name, agent)
+);
+-- §6: queue.claim takes a bare worker_id that is never registered or validated.
+CREATE TABLE IF NOT EXISTS rya_workers (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    agent TEXT,
+    version_id TEXT,
+    bundle_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'alive',
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_workers_key ON rya_workers (workspace_id, agent, version_id, status);
 CREATE INDEX IF NOT EXISTS idx_conn_lookup ON rya_connections (workspace_id, provider, status);
 CREATE INDEX IF NOT EXISTS idx_runs_ws ON rya_runs (workspace_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_ws ON rya_approvals (workspace_id, status);
@@ -289,6 +404,24 @@ class PostgresStore:
                 cur.execute("SELECT data FROM rya_runs WHERE workspace_id=%s AND agent=%s ORDER BY created_at DESC",
                             (self._ws, agent))
             return [r[0] for r in cur.fetchall()]
+
+    def run_counts(self, since: Optional[str] = None) -> Dict[str, int]:
+        """Runs per status, counted in the database rather than in Python.
+
+        The quota check (§11.12) runs on the admission path, so it must not pull
+        every run document back to count them. Status lives in the JSONB blob
+        rather than a column, which is a D10 residual: the decomposition covered
+        the journal, not the run header.
+        """
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if since is not None:
+            clauses.append("created_at >= %s")
+            params.append(since)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT COALESCE(data->>'status', '?'), count(*) FROM rya_runs "
+                        f"WHERE {' AND '.join(clauses)} GROUP BY 1", tuple(params))
+            return {r[0]: r[1] for r in cur.fetchall()}
 
     # ---- approvals -----------------------------------------------------
     def create_approval(self, run_id: str, title: str, body: str, action: dict) -> dict:
@@ -464,7 +597,14 @@ class PostgresStore:
                          AND (%s::text[] IS NULL OR q.type = ANY(%s::text[]))
                          AND (q.concurrency_key IS NULL OR COALESCE(r.n, 0) <
                               COALESCE(NULLIF((q.data->>'concurrencyLimit')::int, 0), 2147483647))
-                       ORDER BY q.priority DESC, q.run_at ASC, (q.data->>'seq') ASC
+                       -- Fairness first (§6: "one workspace must not starve
+                       -- another"): the least-busy concurrency key wins the next
+                       -- slot. Jobs sharing a key all see the same r.n, so
+                       -- priority/age ordering WITHIN a key is unchanged; this
+                       -- only decides between different keys. Mirrors
+                       -- store._fair_order, which documents the trade-off.
+                       ORDER BY COALESCE(r.n, 0) ASC,
+                                q.priority DESC, q.run_at ASC, (q.data->>'seq') ASC
                        FOR UPDATE OF q SKIP LOCKED LIMIT 1)
                    UPDATE rya_queue q SET status='running', lease_expires_at=%s,
                        data = q.data || jsonb_build_object(
@@ -733,3 +873,357 @@ class PostgresStore:
                 resealed += 1
         return {"scanned": scanned, "resealed": resealed,
                 "alreadyEncrypted": already, "noSecret": empty}
+
+    # ======================================================================
+    # Platform state — mirrors the FileStore surface (see store.py for the
+    # rationale behind each group). PLATFORM_DESIGN D7, D10, D11, D12, §6.
+    # ======================================================================
+
+    # ---- append-only journal (D10) ---------------------------------------
+    def journal_append(self, run_id: str, entry: dict) -> dict:
+        """One INSERT per step. The revision is computed in-statement so two
+        processes racing on the same seq (a reclaimed run and its predecessor)
+        both land a row rather than one clobbering the other."""
+        seq = int(entry.get("seq") or 0)
+        appended_at = now_iso()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_journal
+                       (workspace_id, run_id, seq, revision, content_key, kind, label,
+                        status, data, appended_at)
+                   SELECT %s, %s, %s,
+                          COALESCE((SELECT MAX(revision) + 1 FROM rya_journal
+                                    WHERE workspace_id=%s AND run_id=%s AND seq=%s), 0),
+                          %s, %s, %s, %s, %s, %s
+                   RETURNING revision""",
+                (self._ws, run_id, seq, self._ws, run_id, seq,
+                 entry.get("contentKey"), entry.get("kind"), entry.get("label"),
+                 entry.get("status"), Json(entry), appended_at),
+            )
+            revision = cur.fetchone()[0]
+        return {**entry, "runId": run_id, "revision": revision, "appendedAt": appended_at}
+
+    def journal_read(self, run_id: str) -> Dict[str, dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT ON (seq) seq, revision, data, appended_at
+                   FROM rya_journal WHERE workspace_id=%s AND run_id=%s
+                   ORDER BY seq, revision DESC""",
+                (self._ws, run_id),
+            )
+            return {str(seq): {**data, "revision": rev, "appendedAt": at}
+                    for seq, rev, data, at in cur.fetchall()}
+
+    def journal_revisions(self, run_id: str) -> List[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT seq, revision, data, appended_at FROM rya_journal
+                   WHERE workspace_id=%s AND run_id=%s ORDER BY seq, revision""",
+                (self._ws, run_id),
+            )
+            return [{**data, "revision": rev, "appendedAt": at}
+                    for _, rev, data, at in cur.fetchall()]
+
+    # ---- durable meter (D10) ---------------------------------------------
+    def meter_append(self, record: dict) -> dict:
+        rec = {"id": _new_id("mtr"), "ts": now_iso(), **record}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_meter (id, workspace_id, run_id, ts, kind, agent,
+                       agent_version, model, input_tokens, output_tokens, cost_usd, data)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (id) DO NOTHING""",
+                (rec["id"], self._ws, rec.get("runId"), rec["ts"], rec.get("kind"),
+                 rec.get("agent"), rec.get("agentVersion"), rec.get("model"),
+                 int(rec.get("inputTokens") or 0), int(rec.get("outputTokens") or 0),
+                 float(rec.get("costUsd") or 0.0), Json(rec)),
+            )
+        return rec
+
+    def meter_read(self, run_id: Optional[str] = None, since: Optional[str] = None,
+                   until: Optional[str] = None, limit: int = 1000) -> List[dict]:
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if run_id is not None:
+            clauses.append("run_id=%s")
+            params.append(run_id)
+        if since is not None:
+            clauses.append("ts >= %s")
+            params.append(since)
+        if until is not None:
+            clauses.append("ts <= %s")
+            params.append(until)
+        params.append(int(limit))
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT data FROM rya_meter WHERE {' AND '.join(clauses)} "
+                        "ORDER BY ts DESC LIMIT %s", tuple(params))
+            return [r[0] for r in cur.fetchall()][::-1]
+
+    _METER_GROUPS = {"model": "model", "agent": "agent", "kind": "kind",
+                     "agentVersion": "agent_version", "runId": "run_id"}
+
+    def meter_totals(self, since: Optional[str] = None, until: Optional[str] = None,
+                     group_by: Optional[str] = None) -> dict:
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if since is not None:
+            clauses.append("ts >= %s")
+            params.append(since)
+        if until is not None:
+            clauses.append("ts <= %s")
+            params.append(until)
+        agg = ("SUM(input_tokens), SUM(output_tokens), SUM(cost_usd), COUNT(*)")
+        where = " AND ".join(clauses)
+        with self._conn.cursor() as cur:
+            if group_by:
+                # Whitelist the column: group_by reaches this from an API query
+                # parameter, so it must never be interpolated straight into SQL.
+                col = self._METER_GROUPS.get(group_by)
+                if col is None:
+                    raise RyaError("E_VALIDATION",
+                                   f"Cannot group the meter by '{group_by}'.",
+                                   hint=f"Use one of {sorted(self._METER_GROUPS)}.")
+                cur.execute(f"SELECT {col}, {agg} FROM rya_meter WHERE {where} "
+                            f"GROUP BY {col}", tuple(params))
+                return {str(k): {"inputTokens": int(i or 0), "outputTokens": int(o or 0),
+                                 "costUsd": float(c or 0), "calls": int(n or 0)}
+                        for k, i, o, c, n in cur.fetchall()}
+            cur.execute(f"SELECT {agg} FROM rya_meter WHERE {where}", tuple(params))
+            i, o, c, n = cur.fetchone()
+            return {"inputTokens": int(i or 0), "outputTokens": int(o or 0),
+                    "costUsd": float(c or 0), "calls": int(n or 0)}
+
+    # ---- privileged policy (D7, §11.2) -----------------------------------
+    def policy_get(self, key: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT value FROM rya_policy WHERE workspace_id=%s AND key=%s",
+                        (self._ws, key))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def policy_set(self, key: str, value: Optional[dict], actor: Optional[str] = None) -> dict:
+        changed_at = now_iso()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_policy (workspace_id, key, value, version, actor, changed_at)
+                   VALUES (%s, %s, %s, 1, %s, %s)
+                   ON CONFLICT (workspace_id, key) DO UPDATE
+                       SET value=EXCLUDED.value, version=rya_policy.version + 1,
+                           actor=EXCLUDED.actor, changed_at=EXCLUDED.changed_at
+                   RETURNING version, (SELECT value FROM rya_policy p
+                                       WHERE p.workspace_id=%s AND p.key=%s)""",
+                (self._ws, key, Json(value), actor, changed_at, self._ws, key),
+            )
+            version, previous = cur.fetchone()
+            record = {"key": key, "value": value, "version": version, "actor": actor,
+                      "previous": previous, "changedAt": changed_at}
+            cur.execute(
+                """INSERT INTO rya_policy_log
+                       (workspace_id, key, value, previous, version, actor, changed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (self._ws, key, Json(value), Json(previous), version, actor, changed_at),
+            )
+        return record
+
+    def policy_all(self) -> Dict[str, Any]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM rya_policy WHERE workspace_id=%s "
+                        "AND value IS NOT NULL", (self._ws,))
+            return {k: v for k, v in cur.fetchall()}
+
+    def policy_history(self, key: Optional[str] = None, limit: int = 50) -> List[dict]:
+        with self._conn.cursor() as cur:
+            if key is None:
+                cur.execute("SELECT key, value, previous, version, actor, changed_at "
+                            "FROM rya_policy_log WHERE workspace_id=%s ORDER BY id DESC LIMIT %s",
+                            (self._ws, int(limit)))
+            else:
+                cur.execute("SELECT key, value, previous, version, actor, changed_at "
+                            "FROM rya_policy_log WHERE workspace_id=%s AND key=%s "
+                            "ORDER BY id DESC LIMIT %s", (self._ws, key, int(limit)))
+            return [{"key": k, "value": v, "previous": p, "version": ver,
+                     "actor": a, "changedAt": ts}
+                    for k, v, p, ver, a, ts in cur.fetchall()]
+
+    # ---- deployments: immutable versions (D12) ---------------------------
+    def version_create(self, record: dict) -> dict:
+        existing = self.version_by_hash(record["agent"], record["bundleHash"])
+        if existing is not None:
+            return existing
+        version = {"id": _new_id("ver"), "state": "active", "createdAt": now_iso(),
+                   "retiredAt": None, **record}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_versions (id, workspace_id, agent, bundle_hash,
+                       state, created_at, retired_at, data)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (workspace_id, agent, bundle_hash) DO NOTHING""",
+                (version["id"], self._ws, version["agent"], version["bundleHash"],
+                 version["state"], version["createdAt"], None, Json(version)),
+            )
+            if cur.rowcount == 0:  # lost the race; the other writer's row wins
+                won = self.version_by_hash(record["agent"], record["bundleHash"])
+                if won is not None:
+                    return won
+        return version
+
+    def version_get(self, version_id: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_versions WHERE id=%s AND workspace_id=%s",
+                        (version_id, self._ws))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def version_by_hash(self, agent: str, bundle_hash: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_versions WHERE workspace_id=%s AND agent=%s "
+                        "AND bundle_hash=%s", (self._ws, agent, bundle_hash))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def version_list(self, agent: Optional[str] = None, state: Optional[str] = None) -> List[dict]:
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if agent is not None:
+            clauses.append("agent=%s")
+            params.append(agent)
+        if state is not None:
+            clauses.append("state=%s")
+            params.append(state)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT data FROM rya_versions WHERE {' AND '.join(clauses)} "
+                        "ORDER BY created_at DESC", tuple(params))
+            return [r[0] for r in cur.fetchall()]
+
+    def version_set_state(self, version_id: str, state: str) -> Optional[dict]:
+        doc = self.version_get(version_id)
+        if doc is None:
+            return None
+        doc = {**doc, "state": state,
+               "retiredAt": now_iso() if state == "retired" else None}
+        with self._conn.cursor() as cur:
+            cur.execute("UPDATE rya_versions SET state=%s, retired_at=%s, data=%s "
+                        "WHERE id=%s AND workspace_id=%s",
+                        (state, doc["retiredAt"], Json(doc), version_id, self._ws))
+        return doc
+
+    # ---- promotion gate evidence (§9) ------------------------------------
+    def version_attest(self, version_id: str, attestation: dict) -> dict:
+        record = {"versionId": version_id, "createdAt": now_iso(), **attestation}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_version_attestations
+                       (workspace_id, version_id, kind, ok, actor, created_at, data)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (self._ws, version_id, record.get("kind") or "unknown",
+                 record.get("ok"), record.get("actor"), record["createdAt"], Json(record)))
+            row = cur.fetchone()
+        return {**record, "id": f"att_{row[0]}" if row else None}
+
+    def version_attestations(self, version_id: str, kind: Optional[str] = None) -> List[dict]:
+        clauses = ["workspace_id=%s", "version_id=%s"]
+        params: List[Any] = [self._ws, version_id]
+        if kind is not None:
+            clauses.append("kind=%s")
+            params.append(kind)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT id, data FROM rya_version_attestations "
+                        f"WHERE {' AND '.join(clauses)} ORDER BY id", tuple(params))
+            return [{**r[1], "id": f"att_{r[0]}"} for r in cur.fetchall()]
+
+    # ---- deployments: environments (D11) ---------------------------------
+    def env_get(self, name: str, agent: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_environments WHERE workspace_id=%s "
+                        "AND name=%s AND agent=%s", (self._ws, name, agent))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def env_set_current(self, name: str, agent: str, version_id: str,
+                        actor: Optional[str] = None) -> dict:
+        doc = self.env_get(name, agent) or {"name": name, "agent": agent,
+                                            "currentVersionId": None, "history": [],
+                                            "createdAt": now_iso()}
+        if doc.get("currentVersionId"):
+            doc.setdefault("history", []).append(
+                {"versionId": doc["currentVersionId"], "replacedAt": now_iso(), "actor": actor})
+        doc["currentVersionId"] = version_id
+        doc["updatedAt"] = now_iso()
+        doc["actor"] = actor
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_environments (workspace_id, name, agent,
+                       current_version_id, updated_at, data)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (workspace_id, name, agent) DO UPDATE
+                       SET current_version_id=EXCLUDED.current_version_id,
+                           updated_at=EXCLUDED.updated_at, data=EXCLUDED.data""",
+                (self._ws, name, agent, version_id, doc["updatedAt"], Json(doc)),
+            )
+        return doc
+
+    def env_list(self, agent: Optional[str] = None) -> List[dict]:
+        with self._conn.cursor() as cur:
+            if agent is None:
+                cur.execute("SELECT data FROM rya_environments WHERE workspace_id=%s "
+                            "ORDER BY name", (self._ws,))
+            else:
+                cur.execute("SELECT data FROM rya_environments WHERE workspace_id=%s "
+                            "AND agent=%s ORDER BY name", (self._ws, agent))
+            return [r[0] for r in cur.fetchall()]
+
+    # ---- worker registration (§6) ----------------------------------------
+    def worker_register(self, record: dict) -> dict:
+        worker = {"id": record.get("id") or _new_id("wrk"), "status": "alive",
+                  "startedAt": now_iso(), "lastHeartbeatAt": now_iso(), **record}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_workers (id, workspace_id, agent, version_id,
+                       bundle_hash, status, started_at, last_heartbeat_at, data)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status,
+                       last_heartbeat_at=EXCLUDED.last_heartbeat_at, data=EXCLUDED.data""",
+                (worker["id"], self._ws, worker.get("agent"), worker.get("versionId"),
+                 worker.get("bundleHash"), worker["status"], worker["startedAt"],
+                 worker["lastHeartbeatAt"], Json(worker)),
+            )
+        return worker
+
+    def worker_heartbeat(self, worker_id: str, **fields) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_workers WHERE id=%s AND workspace_id=%s",
+                        (worker_id, self._ws))
+            row = cur.fetchone()
+            if not row:
+                return None
+            doc = {**row[0], **fields, "lastHeartbeatAt": now_iso()}
+            cur.execute("UPDATE rya_workers SET last_heartbeat_at=%s, status=%s, data=%s "
+                        "WHERE id=%s AND workspace_id=%s",
+                        (doc["lastHeartbeatAt"], doc.get("status", "alive"), Json(doc),
+                         worker_id, self._ws))
+        return doc
+
+    def worker_deregister(self, worker_id: str, reason: Optional[str] = None) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT data FROM rya_workers WHERE id=%s AND workspace_id=%s",
+                        (worker_id, self._ws))
+            row = cur.fetchone()
+            if not row:
+                return None
+            doc = {**row[0], "status": "stopped", "stoppedAt": now_iso(), "stopReason": reason}
+            cur.execute("UPDATE rya_workers SET status='stopped', data=%s "
+                        "WHERE id=%s AND workspace_id=%s", (Json(doc), worker_id, self._ws))
+        return doc
+
+    def worker_list(self, agent: Optional[str] = None, version_id: Optional[str] = None,
+                    status: Optional[str] = None) -> List[dict]:
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        for col, val in (("agent", agent), ("version_id", version_id), ("status", status)):
+            if val is not None:
+                clauses.append(f"{col}=%s")
+                params.append(val)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT data FROM rya_workers WHERE {' AND '.join(clauses)} "
+                        "ORDER BY started_at DESC", tuple(params))
+            return [r[0] for r in cur.fetchall()]

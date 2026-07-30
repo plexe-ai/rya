@@ -36,6 +36,21 @@ x-rya-env: &rya-env
   RYA_MULTITENANT: ${RYA_MULTITENANT:-}
   RYA_ADMIN_TOKEN: ${RYA_ADMIN_TOKEN:-}
   RYA_APP_DB_PASSWORD: ${RYA_APP_DB_PASSWORD:-}
+  # Bundle archives (§5.3). The api WRITES here when `rya publish` uploads a
+  # version; a pinned worker READS from here at cold start. They are separate
+  # containers, so the store must be shared — a container-local `.rya/bundles`
+  # would leave the worker resolving a version whose artifact it cannot see.
+  #
+  # `${VAR-default}` (no colon) on purpose: setting RYA_BUNDLES_S3_BUCKET= empty
+  # in .env then genuinely falls back to the local directory arm, whereas `:-`
+  # would treat empty as unset and force MinIO back on.
+  RYA_BUNDLES_S3_BUCKET: ${RYA_BUNDLES_S3_BUCKET-rya-bundles}
+  RYA_BUNDLES_S3_ENDPOINT: ${RYA_BUNDLES_S3_ENDPOINT-http://minio:9000}
+  # Must be non-empty even for MinIO, which ignores it: botocore raises
+  # NoRegionError before it ever looks at the endpoint.
+  RYA_BUNDLES_S3_REGION: ${RYA_BUNDLES_S3_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-miniosecret}
   # Legacy single-tenant model config. Prefer per-environment platform config.
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
@@ -57,11 +72,42 @@ services:
     volumes:
       - rya_pgdata:/var/lib/postgresql/data
 
+  # The bundle archive store: an S3-compatible object store the api and the
+  # workers share. `rya publish` PUTs the content-addressed archive here and a
+  # pinned worker GETs it, verifying the hash before importing anything (D12).
+  #
+  # The bucket is created by `mkdir` rather than an `mc mb` init container: on the
+  # filesystem backend a top-level directory in the data dir IS a bucket, so this
+  # stays one service instead of two.
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/${RYA_BUNDLES_S3_BUCKET-rya-bundles} &&
+                 minio server /data --address ":9000" --console-address ":9001"'
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minio}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-miniosecret}
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      # Loopback-only: this holds every version's source. 9001 is the console —
+      # useful for watching an archive object appear as you publish.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - rya_minio:/data
+
   rya:
     build: .
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     environment:
       <<: *rya-env
@@ -79,8 +125,15 @@ services:
       timeout: 4s
       retries: 6
     volumes:
-      # Mount your agent project here (must contain rya.agent.yaml).
-      - ./examples/followup_agent:/project
+      # Mount your agent project here (must contain rya.agent.yaml). Point
+      # RYA_PROJECT at another tree to serve a different agent — e.g.
+      # RYA_PROJECT=../rya-examples/chat-agent.
+      - ${RYA_PROJECT:-./examples/followup_agent}:/project
+      # Platform state (unpacked bundle cache, local archives) gets its own volume
+      # rather than landing in the mounted source tree. The containers run as root,
+      # so without this the worker leaves root-owned files inside the developer's
+      # working copy that they cannot delete.
+      - rya_project_state:/project/.rya
 
   # The execution plane. Claims chat turns and jobs from the queue, loads the
   # bundle, and runs handler code. The api process runs none, so without this
@@ -96,10 +149,49 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment: *rya-env
     volumes:
-      - ./examples/followup_agent:/project
+      - ${RYA_PROJECT:-./examples/followup_agent}:/project
+      - rya_project_state:/project/.rya
     command: ["rya", "worker", "--interval", "2", "--concurrency", "4"]
+
+  # The same execution plane, PINNED to whatever version `prod` points at.
+  #
+  # `docker compose --profile pinned up -d worker-pinned`
+  #
+  # Behind a profile because it is a different operating model, not a better one:
+  # this worker serves ONE content-hashed bundle (D3 — the process IS the
+  # version), so it ignores the mounted working tree and a re-publish needs a
+  # restart to be picked up. That is what makes it the right thing to run after
+  # `rya publish`, and the wrong thing for an edit-and-reload loop.
+  #
+  # It crash-loops until the first promotion, because resolving an environment
+  # with no current version is an error (E_ENVIRONMENT_NOT_FOUND) rather than a
+  # wait — hence `restart: unless-stopped`, which turns that into "comes up when
+  # you publish".
+  #
+  # The project is still mounted: `rya worker` reads a local manifest to learn
+  # which agent and environment to resolve. The CODE comes from the bundle, which
+  # is unpacked into /project/.rya/bundles/unpacked/<hash> and hash-verified
+  # before a single handler is imported.
+  worker-pinned:
+    build: .
+    profiles: ["pinned"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment: *rya-env
+    volumes:
+      - ${RYA_PROJECT:-./examples/followup_agent}:/project
+      - rya_project_state:/project/.rya
+    command: ["rya", "worker", "--env", "prod", "--interval", "2", "--concurrency", "4"]
 
 volumes:
   rya_pgdata:
+  rya_minio:
+  rya_project_state:

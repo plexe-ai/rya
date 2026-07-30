@@ -6,7 +6,10 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install --no-cache-dir '.[api,postgres,llm,mcp]'
+# `s3` (boto3) is not optional in practice for a multi-process deployment: the api
+# and the workers are separate containers, so bundle archives have to live in a
+# shared object store. Without it `rya publish` fails with E_BUNDLE_STORE.
+RUN pip install --no-cache-dir '.[api,postgres,llm,mcp,s3]'
 
 # The agent project (rya.agent.yaml + src/agent.py) is mounted at /project.
 WORKDIR /project

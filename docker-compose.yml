@@ -1,20 +1,44 @@
-# Rya OSS self-host: `cp .env.example .env && docker compose up`
-# Brings up Postgres + the Rya runtime (serve) + a background worker for jobs.
-# Point the volumes at your own agent project (must contain rya.agent.yaml).
+# Rya self-host: `cp .env.example .env && docker compose up`
+#
+# ONE DEPLOYMENT, TWO PROCESSES (PLATFORM_DESIGN §2). Both are the same platform
+# image against the same Postgres; they are run modes, not microservices, and
+# they coordinate through the queue table rather than by calling each other:
+#
+#   api     control plane — REST/WS/SSE, auth, scheduler, policy, guard, vault,
+#           LLM gateway, approvals, console, MCP. Executes NO handler code.
+#   worker  execution plane — loads the bundle, owns ctx/journal/replay, claims
+#           from the queue, executes handlers.
 #
 # Production checklist (set these in .env): RYA_TOKEN (auth), RYA_SECRET_KEY
 # (encrypt secrets at rest), RYA_WEBHOOK_SECRET (signed inbound), and — for
 # multi-tenant — RYA_MULTITENANT=1 + RYA_ADMIN_TOKEN + RYA_APP_DB_PASSWORD.
+#
+# ---------------------------------------------------------------------------
+# D8: run inputs are DECLARED, not ambient.
+#
+# Everything below is DEPLOYMENT identity — which database, which environment,
+# how this process authenticates. That is legitimately environmental: it answers
+# "which deployment am I?", not "what may this run do?".
+#
+# What must NOT live here is per-agent, per-environment RUN config: model routes,
+# egress allowlists, tool credentials, prices. Those are platform state, set
+# through the control plane so they are versioned, access-controlled and audited
+# ("who reviewed this allowlist change" is a feature — §12 risk 7). A provider
+# key passed here is the legacy single-tenant path; it is read once at
+# resolution and recorded with `source: env` provenance.
+# ---------------------------------------------------------------------------
 x-rya-env: &rya-env
   RYA_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-  RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+  RYA_ENVIRONMENT: ${RYA_ENVIRONMENT:-prod}
   RYA_TOKEN: ${RYA_TOKEN:-}
   RYA_SECRET_KEY: ${RYA_SECRET_KEY:-}
   RYA_WEBHOOK_SECRET: ${RYA_WEBHOOK_SECRET:-}
   RYA_MULTITENANT: ${RYA_MULTITENANT:-}
   RYA_ADMIN_TOKEN: ${RYA_ADMIN_TOKEN:-}
   RYA_APP_DB_PASSWORD: ${RYA_APP_DB_PASSWORD:-}
+  # Legacy single-tenant model config. Prefer per-environment platform config.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
 
 services:
   postgres:
@@ -39,7 +63,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment: *rya-env
+    environment:
+      <<: *rya-env
+      # A dedicated worker service exists below, so the api process runs no
+      # handler code (§11.7). Leaving the inline worker on would be harmless —
+      # claims are leased, so the two would not double-execute a job — but it
+      # would blur the boundary this split exists to draw, and make the local
+      # topology differ from production for no benefit.
+      RYA_API_INLINE_WORKER: "0"
     ports:
       - "8787:8787"
     healthcheck:
@@ -51,8 +82,14 @@ services:
       # Mount your agent project here (must contain rya.agent.yaml).
       - ./examples/followup_agent:/project
 
-  # Background worker — drains the job queue (delayed jobs, cron, retries).
-  # `rya serve` does NOT process jobs; without this, scheduled work never runs.
+  # The execution plane. Claims chat turns and jobs from the queue, loads the
+  # bundle, and runs handler code. The api process runs none, so without this
+  # nothing executes — that is the isolation boundary, not an oversight (§11.7).
+  #
+  # Scale horizontally by raising `replicas`: claims are atomic
+  # (FOR UPDATE SKIP LOCKED) and per-key concurrency caps keep one workspace
+  # from starving another. Add `--version <id>` or `--env <name>` to serve one
+  # pinned, content-hashed deployment (D3, D12).
   worker:
     build: .
     restart: unless-stopped
@@ -62,7 +99,7 @@ services:
     environment: *rya-env
     volumes:
       - ./examples/followup_agent:/project
-    command: ["rya", "worker", "--interval", "2"]
+    command: ["rya", "worker", "--interval", "2", "--concurrency", "4"]
 
 volumes:
   rya_pgdata:

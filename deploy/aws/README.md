@@ -1,25 +1,54 @@
-# Rya on AWS — single-tenant deployment
+# Rya on AWS — a deployment you own
 
-This is the Infrastructure-as-Code for the vision's reference posture: a
-**single-tenant** Rya deployment in the customer's own AWS account, with no
-shared blast radius. [`template.yaml`](template.yaml) is a SAM/CloudFormation
-template that provisions the whole topology.
+Infrastructure-as-Code for a Rya deployment in the customer's own AWS account,
+with no shared blast radius. [`template.yaml`](template.yaml) is a
+SAM/CloudFormation template that provisions the whole topology.
+
+**Single-tenant stack, multi-tenant runtime** — worth separating, because the two
+words point at different boundaries. *One customer* owns this stack, which is why
+self-hosting is a residency control: the journal, memory, conversation history and
+sealed credentials stay in this account and region (PLATFORM_DESIGN §8). *Inside*
+it, `RYA_MULTITENANT=1` turns on workspaces and Postgres RLS, so one stack can
+carry many projects with data isolation between them (D13).
+
+D13 is also explicit about the limit: separate processes plus RLS contain a
+**buggy** tenant — a runaway loop, a leak, a crash. They do not contain a
+**hostile** one, because the worker tasks share a kernel. Node-level isolation is
+an accepted residual, not a solved problem.
 
 ## What it provisions
 
 | Concern | Resource |
 |---|---|
 | Identity at the edge | **Cognito** User Pool + App Client (RS256 JWTs, verified via JWKS) |
-| Runtime (control + data plane) | **ECS Fargate** (ARM64) behind an **ALB**, `DesiredCount` tasks, scales horizontally |
+| Control plane (`api`) | **ECS Fargate** (ARM64) behind an **ALB**, `DesiredCount` tasks. REST/WS/SSE, auth, policy, guard, vault, console, MCP |
+| Execution plane (`worker`) | **ECS Fargate**, `WorkerCount` tasks, no ALB target and no inbound port. Loads bundles and runs handler code |
 | State | **RDS Postgres** with row-level security; per-user RLS keyed on `app.user_id` |
 | Hot reads | **ElastiCache** Serverless (Redis) |
 | Secrets | **Secrets Manager** (DB password generated; `RYA_JWT_SECRET` generated; model keys populated post-deploy) — pulled into the task via `ValueFrom`, never committed |
-| Privileged writes | **single-purpose mutator Lambda** behind an HTTP API with a Cognito JWT authorizer — re-validates the caller's JWT before any DB write |
 | Logs | CloudWatch Logs |
 
-The runtime container runs with `RYA_MULTITENANT=1` and `RYA_JWKS_URL` pointing at
-the Cognito pool, so the same image you build from the repo `Dockerfile` enforces
-JWT identity + per-user RLS in production.
+**Two services, one image.** `api` and `worker` are run modes of the same
+container, against the same Postgres, coordinating through the queue table — not
+microservices, and there is no service-to-service call to configure
+(PLATFORM_DESIGN §2, D4). The split is load-bearing: the api process executes **no
+handler code**, which is what makes per-tenant isolation mean something (§11.7).
+It also means the worker is not optional — with `WorkerCount=0` the stack accepts
+events, enqueues them, and never runs them.
+
+Scale them independently: `DesiredCount` follows request load, `WorkerCount`
+follows queue depth. Per-key concurrency caps stop one workspace starving another
+(§6), and per-workspace quotas (`rya quotas set`) bound runs, tokens and cost.
+
+The containers run with `RYA_MULTITENANT=1` and `RYA_JWKS_URL` pointing at the
+Cognito pool, so the same image you build from the repo `Dockerfile` enforces JWT
+identity + per-user RLS in production.
+
+### Not provisioned
+
+| Concern | Status |
+|---|---|
+| Privileged writes via a **single-purpose mutator Lambda** | **Pattern only — returns 501.** The function is deployed but deliberately unimplemented: verifying an RS256 JWT against Cognito's JWKS needs a crypto library that CloudFormation `InlineCode` cannot carry. It fails closed rather than returning `{"ok": true}` to everything, which is what it used to do. The template comment above `MutatorFunction` specifies what a real implementation must do. **Do not treat this stack as having that control.** |
 
 ## Deploy (two commands)
 
@@ -32,7 +61,8 @@ sam build
 sam deploy --guided \
   --parameter-overrides \
     ContainerImage=<account>.dkr.ecr.<region>.amazonaws.com/rya:latest \
-    VpcId=vpc-… PublicSubnetIds=subnet-…,subnet-… PrivateSubnetIds=subnet-…,subnet-…
+    VpcId=vpc-… PublicSubnetIds=subnet-…,subnet-… PrivateSubnetIds=subnet-…,subnet-… \
+    RyaEnvironment=prod DesiredCount=2 WorkerCount=2
 ```
 
 After deploy, populate the model API keys in the `<stack>/app` secret, then the

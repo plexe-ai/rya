@@ -31,7 +31,7 @@ _AMBIENT_PROVIDER_KEYS = (
     # bundle and file tests reach for S3 — the same class of ambient-input bug D8
     # exists to kill, just aimed at storage instead of models.
     "RYA_BUNDLES_S3_BUCKET", "RYA_BUNDLES_S3_PREFIX", "RYA_BUNDLES_S3_REGION",
-    "RYA_FILES_S3_BUCKET",
+    "RYA_BUNDLES_S3_ENDPOINT", "RYA_FILES_S3_BUCKET", "RYA_FILES_S3_ENDPOINT",
 )
 
 

@@ -292,6 +292,35 @@ def test_unpack_rejects_a_missing_archive(tmp_path):
     assert exc.value.code == "E_BUNDLE_NOT_FOUND"
 
 
+def test_unpack_caps_the_uncompressed_total(tmp_path):
+    """Gzip's ratio is an amplification factor, so a small upload says nothing
+    about what it expands to. The cap is checked before any byte is written."""
+    info = tarfile.TarInfo("big.bin")
+    archive = _hostile_archive(tmp_path / "bomb.tar.gz", info, payload=b"\0" * 5000)
+    dest = tmp_path / "dest"
+
+    with pytest.raises(RyaError) as exc:
+        unpack(archive, dest, max_total_bytes=1000)
+    assert exc.value.code == "E_VALIDATION"
+    assert "5000" in exc.value.message
+    assert not (dest / "big.bin").exists()  # nothing landed
+
+
+def test_unpack_allows_a_total_within_the_cap(tmp_path):
+    info = tarfile.TarInfo("small.bin")
+    archive = _hostile_archive(tmp_path / "ok.tar.gz", info, payload=b"\0" * 100)
+    dest = unpack(archive, tmp_path / "dest", max_total_bytes=1000)
+    assert (dest / "small.bin").read_bytes() == b"\0" * 100
+
+
+def test_unpack_without_a_cap_is_unchanged(project, tmp_path):
+    """The local `rya deploy` path unpacks an archive it just built and passes no
+    cap; that default must stay uncapped rather than becoming a hidden limit."""
+    bundle = build_bundle(project)
+    archive = pack(bundle, tmp_path / "b.tar.gz")
+    assert build_bundle(unpack(archive, tmp_path / "dest")).hash == bundle.hash
+
+
 def test_source_symlinks_are_not_bundled(project):
     link = project / "src" / "linked.py"
     try:

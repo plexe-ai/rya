@@ -92,6 +92,13 @@ SDK_OPTIONAL_THIRD_PARTY: dict[str, str] = {
         "which is a platform concern; the client path is `build_bundle`/`pack`. "
         "Same root cause as the rya.bundles -> rya.config entry below."
     ),
+    "botocore": (
+        "`bundles._s3_client` — arrives with boto3, same function and same "
+        "rationale as the entry above. Needed because `s3.addressing_style` has "
+        "no environment variable in botocore, so an S3-compatible endpoint "
+        "(MinIO/Ceph/R2) must be given path-style addressing via "
+        "`botocore.config.Config` at client construction."
+    ),
 }
 
 # ---------------------------------------------------------------------------

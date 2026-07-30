@@ -21,7 +21,17 @@ def _client():
     import boto3
     region = (os.environ.get("RYA_BEDROCK_REGION") or os.environ.get("AWS_REGION")
               or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
-    return boto3.client("s3", region_name=region)
+    kwargs: dict = {"region_name": region}
+    # Deliberately duplicated from bundles._s3_client rather than shared: that
+    # module is in the client SDK's surface (packaging/surface.py) and this one is
+    # platform-only, so a common helper would drag one into the other's wheel.
+    # Same rationale, same three lines — keep them in step.
+    endpoint = (os.environ.get("RYA_FILES_S3_ENDPOINT") or "").strip()
+    if endpoint:
+        from botocore.config import Config
+        kwargs["endpoint_url"] = endpoint
+        kwargs["config"] = Config(s3={"addressing_style": "path"})
+    return boto3.client("s3", **kwargs)
 
 
 def key_for(file_id: str) -> str:

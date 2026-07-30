@@ -432,11 +432,17 @@ def _check_member(member: tarfile.TarInfo) -> None:
         reject("not a regular file or directory")
 
 
-def unpack(archive: Path, dest: Path) -> Path:
+def unpack(archive: Path, dest: Path, *, max_total_bytes: int | None = None) -> Path:
     """Extract a bundle archive into ``dest`` (created if absent). Returns ``dest``.
 
     Members are validated *first* and extracted by hand — no ``extractall`` — so
     a hostile member cannot land before the archive is rejected.
+
+    ``max_total_bytes`` caps the *uncompressed* total and is checked before any
+    byte is written. A local ``rya deploy`` unpacks an archive it just built, so
+    it leaves this unset; the publish endpoint accepts archives from the network,
+    where gzip's compression ratio is an amplification factor and "the upload was
+    under the limit" says nothing about what it expands to.
     """
     archive = Path(archive)
     if not archive.is_file():
@@ -453,6 +459,15 @@ def unpack(archive: Path, dest: Path) -> Path:
         members = tf.getmembers()
         for m in members:
             _check_member(m)
+        if max_total_bytes is not None:
+            total = sum(max(0, int(m.size or 0)) for m in members)
+            if total > max_total_bytes:
+                raise RyaError(
+                    "E_VALIDATION",
+                    f"Bundle expands to {total} bytes, over the {max_total_bytes}-byte limit.",
+                    hint="Trim the project (a `.ryaignore` excludes data and fixtures from the "
+                    "bundle), or raise the limit on the platform.",
+                )
         for m in members:
             target = dest / m.name
             # Belt and braces after the name checks: the realised path must still
@@ -505,6 +520,9 @@ def verify(path_or_archive: Path, expected_hash: str) -> None:
 S3_BUCKET_ENV = "RYA_BUNDLES_S3_BUCKET"
 S3_PREFIX_ENV = "RYA_BUNDLES_S3_PREFIX"
 S3_REGION_ENV = "RYA_BUNDLES_S3_REGION"
+# S3-compatible stores that are not S3: MinIO, Ceph, R2. Empty means real AWS,
+# which must keep boto3's own endpoint resolution — see `_s3_client`.
+S3_ENDPOINT_ENV = "RYA_BUNDLES_S3_ENDPOINT"
 
 DEFAULT_S3_PREFIX = "bundles"
 
@@ -549,6 +567,7 @@ class BundleStore:
     bucket: str = ""             # s3
     prefix: str = DEFAULT_S3_PREFIX
     region: str = ""             # "" = boto3's own resolution chain
+    endpoint: str = ""           # "" = real AWS; set for MinIO/Ceph/R2
 
     @property
     def is_local(self) -> bool:
@@ -558,7 +577,10 @@ class BundleStore:
         """A location an operator can act on — it lands in error messages."""
         if self.is_local:
             return str(self.root)
-        return f"s3://{self.bucket}/{self.prefix.strip('/')}"
+        base = f"s3://{self.bucket}/{self.prefix.strip('/')}"
+        # Appended only when set: an operator debugging a real-AWS deployment
+        # should not have to read past an empty "@".
+        return f"{base} @ {self.endpoint}" if self.endpoint else base
 
 
 def resolve_bundle_store(
@@ -590,6 +612,7 @@ def resolve_bundle_store(
             bucket=bucket,
             prefix=(env.get(S3_PREFIX_ENV) or DEFAULT_S3_PREFIX).strip(),
             region=(env.get(S3_REGION_ENV) or "").strip(),
+            endpoint=(env.get(S3_ENDPOINT_ENV) or "").strip(),
         )
     if project_root is None:
         raise RyaError(
@@ -633,8 +656,23 @@ def _s3_client(store: BundleStore):
             hint="Install boto3 (`pip install 'rya[s3]'`) on every "
             f"api and worker image, or unset {S3_BUCKET_ENV} to keep bundle archives local.",
         ) from exc
+    kwargs: dict = {"region_name": store.region or None}
+    if store.endpoint:
+        # Path-style addressing has to be passed HERE, not configured ambiently:
+        # botocore gives `s3.addressing_style` no environment variable at all
+        # (its DEFAULT_S3_CONFIG_VARS entry has an empty env slot), so the only
+        # ways to set it are ~/.aws/config or this Config object. Left at the
+        # default, the endpoint ruleset templates a custom endpoint as
+        # `{scheme}://{Bucket}.{authority}` for any non-IP host — so bucket
+        # `rya-bundles` at http://minio:9000 becomes http://rya-bundles.minio:9000
+        # and fails to resolve. Real AWS wants the virtual-host form, which is
+        # why this branch is keyed on an endpoint being declared at all.
+        from botocore.config import Config
+
+        kwargs["endpoint_url"] = store.endpoint
+        kwargs["config"] = Config(s3={"addressing_style": "path"})
     try:
-        return boto3.client("s3", region_name=store.region or None)
+        return boto3.client("s3", **kwargs)
     except Exception as exc:  # bad region, unresolvable credentials chain, ...
         raise _store_unreachable(store, "connect to", exc) from exc
 

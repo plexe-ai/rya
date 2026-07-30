@@ -92,7 +92,8 @@ def no_ambient_bucket(monkeypatch):
     assertion below about the *local* default would flip if a developer had
     RYA_BUNDLES_S3_BUCKET exported.
     """
-    for name in (bundles.S3_BUCKET_ENV, bundles.S3_PREFIX_ENV, bundles.S3_REGION_ENV):
+    for name in (bundles.S3_BUCKET_ENV, bundles.S3_PREFIX_ENV, bundles.S3_REGION_ENV,
+                 bundles.S3_ENDPOINT_ENV):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -127,6 +128,76 @@ def test_a_declared_bucket_selects_the_object_store(tmp_path):
     assert (store.kind, store.bucket, store.prefix, store.region) == (
         "s3", BUCKET, "ws/42/bundles", "eu-west-1")
     assert store.describe() == f"s3://{BUCKET}/ws/42/bundles"
+
+
+def test_a_declared_endpoint_lands_on_the_store(tmp_path):
+    """An S3-compatible store that is not S3 (MinIO/Ceph/R2) is declared, and the
+    endpoint reaches an operator through `describe()` because "the bucket is
+    unreachable" is a different fix depending on *which* bucket."""
+    store = resolve_bundle_store(
+        tmp_path,
+        env={bundles.S3_BUCKET_ENV: BUCKET,
+             bundles.S3_ENDPOINT_ENV: "http://minio:9000",
+             bundles.S3_REGION_ENV: "us-east-1"},
+    )
+    assert store.endpoint == "http://minio:9000"
+    assert store.describe() == f"s3://{BUCKET}/bundles @ http://minio:9000"
+
+
+def test_no_endpoint_keeps_describe_clean(tmp_path):
+    store = resolve_bundle_store(tmp_path, env={bundles.S3_BUCKET_ENV: BUCKET})
+    assert store.endpoint == ""
+    assert "@" not in store.describe()
+
+
+def _fake_boto3(monkeypatch) -> dict:
+    """Stand in for boto3 AND botocore: neither is installed in the dev venv (the
+    `s3` extra is a platform-image concern), and `_s3_client` imports both.
+    Returns the dict the captured client kwargs land in."""
+    import types
+
+    captured: dict = {}
+
+    def fake_client(service, **kwargs):
+        captured.update(service=service, **kwargs)
+        return object()
+
+    class Config:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    botocore = types.ModuleType("botocore")
+    botocore_config = types.ModuleType("botocore.config")
+    botocore_config.Config = Config
+    monkeypatch.setitem(sys.modules, "boto3",
+                        types.SimpleNamespace(client=fake_client))
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+    return captured
+
+
+def test_an_endpoint_forces_path_style_addressing(monkeypatch):
+    """The reason this is passed at construction rather than configured: botocore
+    gives `s3.addressing_style` no environment variable, and the default
+    virtual-host form would turn bucket `b` at http://minio:9000 into
+    http://b.minio:9000 — which does not resolve on a container network."""
+    captured = _fake_boto3(monkeypatch)
+    bundles._s3_client(BundleStore(kind="s3", bucket=BUCKET,
+                                   endpoint="http://minio:9000", region="us-east-1"))
+
+    assert captured["endpoint_url"] == "http://minio:9000"
+    assert captured["config"].s3["addressing_style"] == "path"
+    assert captured["region_name"] == "us-east-1"
+
+
+def test_no_endpoint_leaves_boto3_endpoint_resolution_alone(monkeypatch):
+    """Real AWS wants the virtual-host form, so the override must not leak into
+    the default path."""
+    captured = _fake_boto3(monkeypatch)
+    bundles._s3_client(BundleStore(kind="s3", bucket=BUCKET, region="eu-west-1"))
+
+    assert "endpoint_url" not in captured and "config" not in captured
+    assert captured["region_name"] == "eu-west-1"
 
 
 def test_an_explicit_root_beats_a_declared_bucket(tmp_path):

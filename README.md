@@ -95,6 +95,18 @@ rya deploy --env prod           # bundle + record an immutable version + promote
 rya rollback --env prod         # a pointer flip back
 ```
 
+From a **client repo** — one that installed only the `rya` SDK and has no database
+or bucket access — the same pipeline runs over HTTP:
+
+```bash
+rya login https://rya.yourco.com --key rya_sk_…
+rya publish --env prod          # content-hash + upload + record + promote
+```
+
+The platform rebuilds the hash from the bytes it received and refuses a mismatch,
+so the content is the address either way. What `publish` cannot do is attest
+readiness — see the honesty list below.
+
 A deploy bundles your source, lockfile, manifest and SDK version into an
 **immutable, content-hashed version**, records it, and flips the environment's
 current-version pointer. New runs go to the new version; in-flight runs finish
@@ -187,9 +199,14 @@ Specifically not done:
 
 - **No managed cloud.** Self-host it; that is also what makes self-hosting a
   residency control.
-- **No bundle upload over HTTP.** `rya deploy` writes to a local archive root or a
-  declared S3 bucket, so the deploying machine needs access to one of those. There
-  is no `POST /versions` yet.
+- **Publishing over HTTP cannot attest readiness.** `rya publish` uploads a bundle
+  to `POST /agents/{id}/versions` and needs neither the database nor the bucket, so
+  a client repo with only the SDK can ship. But the control plane does not import
+  bundles (D13), so it cannot evaluate readiness and files no attestation — the
+  response says `"attested": false`, and an environment gated on
+  `--require-readiness` will refuse the version. There is also no
+  `rya attest readiness`, so `rya deploy --env` from a machine with `rya-server`
+  remains the only way to satisfy that gate.
 - **The AWS mutator Lambda is a pattern, not an implementation.** It returns 501
   by design rather than pretending; see [`deploy/aws`](deploy/aws/README.md).
 - **Two routes still execute handler code in the api process.** `POST
@@ -198,10 +215,23 @@ Specifically not done:
   than the promoted content-hashed bundle). `POST /approvals/{id}/approve` resumes
   a paused run the same way. The durable turn path is correct; these are not.
   `python scripts/e2e_platform.py` asserts all of this as open GAPs.
+
+  `rya publish` makes the approval half of this sharper rather than worse: the api
+  imports its mounted entrypoint once at startup, so once a bundle can be published
+  from somewhere else, the code resuming an approval can differ from the code that
+  paused it — including by nothing more than an edit made after the api booted. It
+  **fails closed**: the journal's content keys stop matching and the run ends
+  `E_JOURNAL_DRIFT` (D9) instead of replaying against drifted code. Restarting the
+  api on the promoted bundle clears it. Approvals belong on the worker.
 - **Crashed workers are still reported `alive`.** `lastHeartbeatAt` is written and
   never read, so `GET /workers` overstates the fleet after a SIGKILL.
 - **Node isolation is an accepted residual.** Process isolation plus RLS contains a
   buggy tenant, not a hostile one — workers share a kernel.
-- **`rya serve` is one agent per deployment.** The deployment routes accept an
-  agent id in the path but resolve the manifest's own name, so the
-  workspace → agent → environment tree is currently one agent wide.
+- **`rya serve` is one agent per deployment.** `build_app` resolves a single
+  `rya.agent.yaml` at startup, so the routes accept an agent id in the path but
+  resolve the manifest's own name — the workspace → agent → environment tree is one
+  agent wide. `rya publish` is where this stops being cosmetic: it refuses a bundle
+  declaring a different name, because a version filed under a name this deployment
+  does not serve would be listed by nothing and run by nobody. A second agent means
+  a second deployment (its own api, worker and manifest); they can share one
+  Postgres and one bundle store. See [docs/architecture.md](docs/architecture.md).

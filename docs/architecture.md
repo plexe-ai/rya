@@ -35,16 +35,39 @@ resume to completion in another (proven in `tests/test_postgres_store.py`).
 Likewise the LLM seam (`ctx.llm`) is provider-pluggable: deterministic mock by
 default, real Claude when `ANTHROPIC_API_KEY` is set — same agent code either way.
 
+**Bundle artifacts get the same treatment.** `RYA_BUNDLES_S3_BUCKET` selects an
+object store for the immutable, content-hashed archives a deploy produces; unset
+falls back to a local archive root under `.rya/`. `RYA_BUNDLES_S3_ENDPOINT` points
+the S3 arm at MinIO, Ceph or R2 — declaring it also forces path-style addressing,
+because the default virtual-host form would resolve `<bucket>.<host>` and no such
+name exists on a container network. Leave it blank for real S3.
+
+The local arm only works when the api and the workers share a filesystem, which in
+compose they do not — which is why there is a `minio` service, and why `s3` is not
+an optional extra in the `Dockerfile`.
+
 ### Self-host (OSS)
 
 ```bash
 git clone <rya repo> && cd rya
 cp .env.example .env          # optionally add ANTHROPIC_API_KEY
-docker compose up             # Postgres + rya serve on :8787
+docker compose up             # Postgres + MinIO + api on :8787 + one worker
 ```
 
-That brings up Postgres and the single-worker runtime serving the mounted agent.
-Point the `rya` service's volume at your own project to run yours.
+That brings up Postgres, the bundle archive store, the control-plane api, and one
+execution-plane worker. The split is load-bearing rather than incidental: the api
+service sets `RYA_API_INLINE_WORKER=0`, so it runs **no** handler code, and without
+the `worker` service nothing executes at all.
+
+Set `RYA_PROJECT=../your-agent` in `.env` to serve your own project — one variable,
+because the api and every worker mount the same tree and pointing only one of them
+somewhere new would leave them serving different code. Platform state
+(`/project/.rya`: the unpacked bundle cache, local archives) lives in the
+`rya_project_state` volume instead of your working copy, so the containers' root
+-owned files never land in your checkout.
+
+`docker compose --profile pinned up worker-pinned` adds a worker that serves
+whichever version `prod` points at, rather than the mounted tree.
 
 ## What the managed cloud adds (not in the OSS core)
 
@@ -62,7 +85,7 @@ Point the `rya` service's volume at your own project to run yours.
 The boundary is deliberate: everything needed to *build and run* an agent is
 open source; the cloud sells *operating it at scale without ops*.
 
-## Execution model (today: single worker)
+## Execution model
 
 ```
 event ─► control plane (API) ─► run created ─► worker executes handler
@@ -74,9 +97,55 @@ event ─► control plane (API) ─► run created ─► worker executes handl
                                   resume ◄── replay handler, memoized ◄─┘
 ```
 
-One worker process runs all agents (no per-tenant sandbox yet). Per-run
-isolation (Modal / Fly Machines / sandboxed containers) is the next hardening
-step before untrusted multi-tenant code.
+### One deployment serves exactly one agent
+
+This is the sharpest constraint in the system and the easiest one to trip over.
+
+`build_app(root)` resolves a single `rya.agent.yaml` at startup and imports one
+agent from it; `rya worker` reads the same manifest to learn which agent and
+environment it serves. So the `{agent_id}` in every route is **decorative** — each
+handler resolves `manifest.name` regardless of what the path says.
+`POST /agents/{id}/versions` is the one place that stops shrugging at this and
+rejects a bundle declaring a different name, because a version filed under a name
+this deployment does not serve would be listed by nothing and executed by nobody.
+
+Serving a second agent means a second deployment: another api process, another
+worker, its own mounted manifest, its own port. They can share one Postgres and one
+bundle store — versions and environment pointers are keyed per agent — so the cost
+is processes and ports, not infrastructure:
+
+```yaml
+rya-chat:       { environment: { RYA_PROJECT: ../agents/chat    }, ports: ["8787:8787"] }
+worker-chat:    { command: ["rya","worker","--env","prod"] }
+rya-support:    { environment: { RYA_PROJECT: ../agents/support }, ports: ["8788:8787"] }
+worker-support: { command: ["rya","worker","--env","prod"] }
+```
+
+Multi-agent routing inside one process is not a configuration we have withheld; it
+does not exist. Adding it means `build_app` stops resolving a single manifest,
+which reaches every route, the console and the worker's version resolution.
+
+### Where the plane boundary actually falls
+
+The boundary is about **importing code**, not about touching state.
+`POST /agents/{id}/versions` runs in the api process: it verifies the uploaded
+bytes, writes the archive to the bundle store, records the version and can flip an
+environment pointer — without importing a single handler. The price is stated in
+the response rather than hidden: readiness is not evaluated and no attestation is
+filed (`"attested": false`), so an environment gated on readiness refuses the
+promotion.
+
+Two routes do still execute handler code in the api process — `POST
+/agents/{id}/events` and `POST /approvals/{id}/approve` — which the README's
+honesty list tracks and `scripts/e2e_platform.py` asserts as open gaps.
+
+### Scaling and isolation
+
+Workers scale horizontally: claims are atomic (`FOR UPDATE SKIP LOCKED`), so N
+replicas never double-claim, and `--idle-exit` scales to zero. What is still
+missing is *per-run* isolation (Modal / Fly Machines / sandboxed containers):
+today one worker process executes every workspace's handlers for its agent, which
+is the hardening step owed before running untrusted multi-tenant code.
 
 ## Multi-tenancy (Postgres)
 

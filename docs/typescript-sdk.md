@@ -11,6 +11,10 @@ registry, because governed execution (permission resolution, the journal, the
 guard verdict, approvals) is server-side and a TS reimplementation would be a
 second thing to keep honest.
 
+One half of that contract is Python's: the deploy token is spendable by
+`rya publish`, not from here. This client **drives** an agent and **operates** its
+versions; it does not ship one.
+
 Zero runtime dependencies: global `fetch` and web streams, both built in from
 Node 18. It runs unchanged in the browser, a worker, or an edge runtime.
 
@@ -22,7 +26,7 @@ cd clients/typescript && npm install && npm run build
 
 | Surface | Why a TS client gets it |
 |---------|-------------------------|
-| **The agent platform** | Events, runs, traces, approvals, sessions, files, usage, versions/environments. The app driving the agent is the client. |
+| **The agent platform** | Events, runs, traces, approvals, sessions, files, usage. Plus versions and environments to *read, promote, roll back and retire* — **not create**; publishing is Python's (see below). The app driving the agent is the client. |
 | **Durable streaming (D6)** | Every stream is a tail over the durable turn buffer, resumed by `Last-Event-ID`. A dropped socket is a cursor, not a lost turn. |
 | **The durable job API (D14)** | `/queue/*` is deliberately SDK-free so foreign code can drive it, and the design names TypeScript DAG workers as the consumer. |
 
@@ -151,6 +155,7 @@ the attempt budget and defeat the server's backoff.
 | Not exposed | Why |
 |-------------|-----|
 | Defining agents, tools, `ctx` | §3: governed execution is platform code. Python owns it. |
+| `publish` (`POST /agents/{id}/versions`) | Publishing is not an HTTP call, it is a *build*: walk the project, honour `.ryaignore`, and reproduce a content hash that folds in the **Python** SDK version. A TS reimplementation would disagree with the platform about the digest of byte-identical trees and fail `E_BUNDLE_MISMATCH` — a second hash function to keep honest, for a step that runs in CI where `rya publish` already lives. `promote`/`rollback`/`retireVersion` *are* here because a TS app operates versions; it does not create them. |
 | `/ws` | D6 makes the durable buffer the one streaming path; resumable SSE strictly dominates a socket that loses frames on drop, and `WebSocket` is not a stable global on Node 18. |
 | `/v1/signup`, `/v1/login`, `/v1/workspaces`, `/v1/projects`, key and member CRUD | §2: a client repo gets a *token*. A client that can mint its own workspace keys is a control plane, not a client. That is dashboard and CLI territory. |
 | `/evals`, `/evals/run` | Runs against the project directory on the server's disk, single-tenant only (it 400s in the hosted mode a TS client would talk to). A CLI/CI concern. |

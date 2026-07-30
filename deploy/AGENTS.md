@@ -7,11 +7,19 @@ AWS topology and deploy steps.
 
 - `aws/template.yaml` - SAM/CloudFormation for the reference **single-tenant**
   posture: ECS Fargate (ARM64) behind an ALB, RDS Postgres with RLS, Cognito
-  identity, ElastiCache, Secrets Manager, a JWT-revalidating mutator Lambda,
-  CloudWatch logs. Runs with `RYA_MULTITENANT=1` + `RYA_JWKS_URL`.
+  identity, ElastiCache, Secrets Manager, a mutator Lambda that is a **501 stub**
+  (it revalidates nothing — see `aws/README.md`), CloudWatch logs. Runs with
+  `RYA_MULTITENANT=1` + `RYA_JWKS_URL`.
 - `aws/Dockerfile.baked` - runtime image that scaffolds the default agent.
 - `aws/Dockerfile.project` - runtime image that bakes a SPECIFIC project dir
   (`--build-arg PROJECT=examples/...`), for deploying a real agent.
+
+**`rya publish` does not work against the AWS stack.** The template provisions no
+bundle bucket, `TaskRole` is scoped to the files bucket only, and the worker runs a
+bare `rya worker` (unpinned), so a publish records a version whose archive the
+worker cannot read. The agent reaches AWS by being **baked into the image**; the
+upload path is a compose/self-host capability today. `aws/README.md` has the
+three-part fix under "Not provisioned".
 
 ## Deploy recipe (image update)
 

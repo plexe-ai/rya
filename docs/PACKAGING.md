@@ -116,9 +116,18 @@ rya init             # scaffold in place
 rya check            # manifest + handler set, starts nothing (§10)
 rya bundle           # the D12 content hash, computed by the same code the
                      # platform verifies with
+rya publish          # upload that bundle to a deployment as an immutable
+                     # version (§9 over HTTP — no database or bucket needed).
+                     # Cannot attest readiness: readiness.py is platform code,
+                     # and the control plane does not import bundles either.
 rya login / logout / whoami
 rya skills install
 ```
+
+`publish` is also registered in `cli/main.py`, so it survives in `rya-server`. That
+is not cosmetic: an editable install of the platform replaces the SDK and repoints
+the `rya` console script, which is exactly what a developer dev-linking an example
+repo against a local checkout does.
 
 ## `ctx` in a client repo
 

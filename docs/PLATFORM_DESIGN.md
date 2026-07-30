@@ -92,10 +92,22 @@ execution-plane instance — and because it also runs platform code, it carries 
 parts of the control plane that must be local to the run: the journal, replay,
 and `ctx`.
 
-**This shape already exists in the repo.** `docker-compose.yml:36-52` runs
-`rya serve` and `:56-65` runs `rya worker --interval 2`. The change is not a new
-architecture — it is `rya worker` becoming per-tenant and loading a *versioned
-bundle* instead of a mounted directory.
+**This shape already exists in the repo.** `docker-compose.yml:104-136` is the
+api (the `rya` service — image `CMD` is `rya serve`, with
+`RYA_API_INLINE_WORKER: "0"` so it executes no handler code), `:146-158` is the
+queue-consuming worker (`rya worker --interval 2 --concurrency 4`, scaled by
+raising its replica count), `:179-192` is `worker-pinned` (profile `pinned`, `rya worker --env
+prod` — one content-hashed bundle per process, so a re-publish needs a restart),
+and `:82-102` is `minio`, the archive store both sides share. The change is not a
+new architecture — it is `rya worker` becoming per-tenant and loading a
+*versioned bundle* instead of a mounted directory.
+
+A worker that loads a versioned bundle **now exists**: `--version` / `--env` pins
+it, and `worker.resolve_bundle_root` fetches the archive, unpacks it into a
+content-addressed cache and re-verifies the hash before importing anything. What
+is still missing is the *scheduling* of those processes — one per (workspace,
+agent, version), started and stopped on demand rather than declared in a compose
+file or an ECS `DesiredCount`. See §6.
 
 **These are not microservices, and the distinction is load-bearing.** They share
 one database, there is no service-to-service call between them (they coordinate
@@ -194,7 +206,7 @@ whatever version the client happened to pin.
 | Guard | egress allowlist, grounding gate, id-secrecy scrub | `guard.py` — a rewrite: policy loads from `cwd`/`RYA_GUARD_PATH` by file mtime (`:40-44`, `:52-61`) |
 | Vault | connection secrets, per-user credentials, envelope encryption | `seal.py`, `ctx.connections` |
 | Stream service | durable turn buffers, fan-out, resume by `Last-Event-ID` | `turns.py`, `api/app.py:668-715` |
-| Build service | bundle → version record → runnable artifact | — |
+| Build service | bundle → version record → runnable artifact | `bundles.py` + `POST /agents/{id}/versions` (`api/app.py`), driven by `rya publish`. Verify-rebuild-record-promote, with no import of the bundle — so readiness stays unattested on this path (see §9) |
 | Console / MCP | operator UI, remote MCP | `console/`, `mcp/` |
 
 There is **no dispatcher**. The api process enqueues; workers claim (D4).
@@ -229,7 +241,15 @@ signatures.
 ### 5.3 State
 
 Postgres stays primary — runs, journal, queue, memory, tenancy, RLS. Object store
-for bundles, large payloads and file artifacts (`files_s3.py` exists). The
+for bundles, large payloads and file artifacts — **two arms, not one**. Bundle
+archives have their own (`bundles.py`'s `BundleStore`: either a local
+content-addressed directory or S3, resolved once and shared by the publishing api
+and the reading worker, since separate containers cannot share a container-local
+`.rya/bundles`); file artifacts keep `files_s3.py`. Both now honour an endpoint
+override — `RYA_BUNDLES_S3_ENDPOINT` and `RYA_FILES_S3_ENDPOINT` — which also
+forces **path-style addressing**, because MinIO, Ceph and R2 do not serve
+virtual-host buckets and botocore exposes no environment variable for the
+addressing style. The
 `open_store()` seam (`store.py:36-58`) survives *inside the platform*: hermetic
 tests select `FileStore`, deployments select Postgres.
 
@@ -261,9 +281,23 @@ hosted product has N workspaces × M agents × V live versions.
   `cancelRequested` flag on heartbeat — cooperative, bounded by the heartbeat
   interval, with no new mechanism.
 
-None of this exists today: there is no worker registration, no capability
-advertisement and no bundle digest anywhere in the tree. `queue.py`'s `claim`
-takes a bare `worker_id` string that is never registered or validated.
+**What exists and what does not.** Worker registration, capability advertisement
+and bundle digests all exist now — `worker.py` registers a process against its
+`(workspace, agent, version)` key with its handler set, heartbeats, deregisters
+with a reason, and is listable over `GET /workers`; the bare `worker_id` that
+`queue.claim` took is now a minted, registered identity; `preflight` fails closed
+on a handler-set hole or a version/manifest disagreement; a process reports its
+cold start against `COLD_START_TARGET_MS`, and `--idle-exit` makes it leave when
+its own claimable queue depth is zero.
+
+What remains greenfield is **scheduling**: nothing *starts* a worker on demand,
+nothing varies replica count with queue depth, and nothing pre-warms a promoted
+version. Every process above is started by a human, a compose file or an ECS
+`DesiredCount`, so scale-to-zero is currently one-way — a worker can exit idle,
+and then that key is simply unserved until someone starts another. The
+process-side halves of §6 are built; the supervisor that decides when to run them
+is not, and it is where the idle-cost argument that opens this section actually
+gets settled.
 
 ---
 
@@ -290,17 +324,23 @@ The rule: **the platform decides and remembers; the bundle supplies behaviour.**
 | Identity (JWT verify, RLS scoping) | verifies, scopes, restores on replay | — |
 | Frames to end users | sole path, via the turn buffer | emits into the buffer |
 
-**Two rows are not true of today's code, and closing them is the first work:**
+**One row was not true of today's code; it has since been closed:**
 
-- **There are two tool-execution paths and only one is governed.**
-  `ctx.tools.call` (`sdk/context.py:978`) resolves permission, pins, credentials
-  and scrub. `Engine._execute_action` (`runtime/engine.py:419-459`) — the path
-  taken when an **approval resolves** — re-implements dispatch with no permission
-  check and no `guard.scrub`; grepping `permission|scrub|_authorize_connection`
-  across `engine.py` returns zero hits. Its credential lookup (`:441-444`) also
-  omits the `owner` argument, so it is not even per-user scoped. `README.md:74-76`
-  and `docs/DEEP_DIVE.md:167-168` currently overclaim on this basis.
-- **`guard.scrub` runs inside the journaled closure** (`sdk/context.py:1054`), so
+- ~~**There are two tool-execution paths and only one is governed.**~~ **Closed.**
+  `Engine._execute_action` used to re-implement dispatch with no permission check,
+  no arg pins and no `guard.scrub`, and with a credential lookup that omitted
+  `owner` so it was not per-user scoped. It now delegates to
+  `ctx.tools.call_approved` / `ctx.channels.send_approved`, which route through
+  `_Tools.prepare(..., approved=True)` — the same permission resolution (a kill
+  switch flipped while the approval was pending still wins), the same pins, the
+  same scope intersection, the same scrub. `prepare()` refuses an
+  `approval_required` tool with `E_TOOL_PERMISSION_DENIED` unless `approved=True`,
+  and `ctx.tools.call` never passes it — so `README.md` and `docs/DEEP_DIVE.md` no
+  longer overclaim. §11.1 was the work; it is done.
+
+**One row is still not true of today's code:**
+
+- **`guard.scrub` runs inside the journaled closure** (`sdk/context.py`), so
   "execute" and "scrub before commit" are the same expression. There is no commit
   seam to hook.
 
@@ -360,21 +400,58 @@ conversation history and sealed credentials in Frankfurt.
 
 ## 9. Deployment lifecycle
 
+Two paths run the same pipeline, and which one produced a version is visible in
+the ledger:
+
 ```
-rya deploy
-  ├─ validate manifest + readiness gate locally
+rya deploy --env <name>            (operator; has the store and the archive root)
+  ├─ validate manifest + readiness gate LOCALLY, hard gate on the way in
   ├─ bundle: source + lockfile + manifest + SDK version
-  ├─ upload; platform records an immutable, content-hashed version
-  ├─ promote: set the environment's current version
+  ├─ record an immutable, content-hashed version
+  ├─ attest readiness against that version id  (gates.attest_readiness)
+  ├─ check the promotion gate, then promote
   └─ roll out: start workers on the new version, drain old,
                keep versions alive while runs are pinned to them
+               (retention is enforced; STARTING the workers is still manual — §6)
+
+rya publish [--env <name>]         (client repo; no database, no bucket)
+  ├─ validate manifest + handler set locally (`rya check`-level only)
+  ├─ bundle + pack, POST the archive with ?hash=
+  ├─ platform REBUILDS the hash from the received bytes, refuses a mismatch
+  │  (E_BUNDLE_MISMATCH) — the content proves the version, not the sidecar
+  ├─ record an immutable version; NO readiness attestation is filed
+  ├─ check the promotion gate, then promote
+  └─ response says so: "attested": false, "notAttested": ["readiness"]
 ```
 
 Deploys are **atomic per environment** — the current-version pointer flips once,
 new runs go to the new version, in-flight runs finish on theirs. **Rollback is a
-pointer flip.** The **readiness gate** (`readiness.py`) becomes a server-side
-admission check rather than a client-side courtesy, and **evals**
-(`rya.evals.yaml`) can gate promotion between staging and prod.
+pointer flip.** **Evals** (`rya.evals.yaml`) can gate promotion between staging
+and prod (`rya eval --attest`).
+
+**The readiness *gate* is server-side; the readiness *evidence* is not.** These
+are worth separating, because only the first half is done. `gates.py` resolves a
+per-environment policy and reads **per-version attestations** — a promotion into
+an environment whose gate requires readiness fails closed, server-side, on stored
+evidence bound to a bundle hash. That is a real admission check, not a courtesy.
+But nothing on the platform ever *produces* that evidence: `check_readiness`
+needs a loaded agent, so the only caller that files an attestation is
+`rya deploy --env`, which runs the check **locally** in the operator's process
+(`cli/main.py`). The HTTP path cannot, because D13 forbids the control plane
+importing tenant code, and it says so rather than implying otherwise.
+
+So **which path produced a version matters**, and the ledger is the only place
+that records it (`metadata.publishedVia: "http"`). A `prod` gate that requires
+readiness is, today, a gate that requires `rya deploy --env` — `rya publish`
+cannot satisfy it at all.
+
+Closing this means one of two things, and **neither exists**: run readiness in an
+**isolated process** outside the api (a sandboxed subprocess or a short-lived
+worker that imports the bundle and reports a signed result), or accept a **signed
+client attestation** and downgrade the gate's meaning from "the platform checked"
+to "a key we trust says it checked". There is also no out-of-band escape hatch:
+`gates.py`'s own failure hint points at `rya attest readiness --version <id>`, a
+command that **has never been implemented**.
 
 ---
 
@@ -409,9 +486,10 @@ server points at an environment rather than a directory.
 Ordered so each item ships independently and the early ones are worth doing even
 if the rest never happens.
 
-1. **Close the ungoverned approval path.** Route `Engine._execute_action` through
-   the same policy resolution as `ctx.tools.call`. Security fix; removes a live
-   overclaim from the README.
+1. ✅ **Close the ungoverned approval path.** `Engine._execute_action` now routes
+   through `ctx.tools.call_approved` / `ctx.channels.send_approved`, i.e. the same
+   `prepare()` policy resolution as `ctx.tools.call`. Security fix; the README's
+   overclaim is no longer one (§7).
 2. **Carve kill-switch state** out of the generic `_runtime_config` memory scope
    into privileged storage the bundle cannot write.
 3. **Content-key journal steps (D9)** and fail closed on drift.
@@ -425,14 +503,37 @@ if the rest never happens.
 7. **Sever handler execution from the api process.** `_sweeper_loop` and `_jobs_loop`
    (`api/app.py:281-292`, `:315-326`) run every tenant's code in the API process.
    Required before D13 means anything.
-8. **Worker + bundle loading** — load a pinned version, report its
-   content hash, advertise handlers, refuse to start on a mismatch, claim from the
-   queue.
+8. ✅ **Worker + bundle loading** — `worker.py`. `rya worker --version <id>` or
+   `--env <name>` resolves a pinned version, fetches the archive from the local
+   directory or the object store, unpacks it into a content-addressed cache and
+   **re-verifies the hash before importing anything** — on a cache hit too, since
+   the unpacked tree is a mutable directory. `check_handler_set` refuses to start
+   when the manifest declares a tool the bundle cannot serve
+   (`E_HANDLER_SET_INCOMPLETE`), and preflight fails closed if the version record
+   and the loaded manifest name different agents (`E_BUNDLE_MISMATCH`). Workers
+   register, heartbeat with stats, deregister with a reason, and are listable over
+   `GET /workers`; claiming is version-pinned, so a turn pinned to another version
+   is not this worker's work. The legacy working-tree mode is retained for `rya
+   dev` and single-tenant `rya serve`.
 9. **Worker lifecycle (§6)** — start on demand, scale on queue depth, scale to
    zero with a cold-start target, reclaim on lease expiry, retain pinned versions.
-10. **Deployment pipeline (D11, D12)** — bundles, immutable versions,
-    environments, promote, rollback, version-pinned claiming, retention.
-11. **Package split (D16)** — thin `rya-sdk` published; platform as `rya-server`.
+10. 🟡 **Deployment pipeline (D11, D12)** — built: content-hashed bundles with an
+    SDK-version-folded digest and `.ryaignore` (`bundles.py`), immutable versions,
+    environments, promote, rollback, retire, version-pinned claiming, and retention
+    while runs are pinned (`deployments.py`), plus promotion gates on per-version
+    attestations (`gates.py`) — over **both** publish paths, `rya deploy --env`
+    locally and `rya publish` over HTTP. Remaining: **server-side readiness
+    evidence** (§9 — the gate is server-side, the evidence is not, and
+    `rya attest readiness` does not exist) and the §6 lifecycle, which is item 9.
+11. ✅ **Package split (D16)** — thin `rya-sdk` published; platform as `rya-server`.
+    `packaging/{sdk,server}/pyproject.toml` build the two distributions from one
+    tree with no module relocated; `packaging/surface.py` declares the SDK surface
+    in code, including the deferred exceptions and allowed edges; and
+    `tests/test_sdk_surface.py` walks the real import graph and fails when an SDK
+    module reaches platform code or when packaging drifts from the declaration.
+    `docs/PACKAGING.md` records the split. Both distributions own the `rya` console
+    script (`cli.client:app` vs. `cli.main:app`), so `uvx rya create` survives
+    verbatim. *Not* done: actually uploading either wheel to PyPI.
 12. **Hosted operation (D13)** — per-workspace scheduling, quotas, fairness,
     console grown to workspace → project → environment → version → runs.
 13. **TypeScript SDK**, and a second client repo built by someone who has never
@@ -442,8 +543,12 @@ Two things to fix in the reference clients while doing this:
 `examples/loan-renewal/src/agent.py:58` reads `RYA_DATABASE_URL` to open **the
 platform's own store** from inside leaf tools, and runs schema DDL from a leaf
 tool behind a `global _ready` flag (`:87-95`) — N workers means N racing
-first-call migrations. `docker-compose.yml`'s `x-rya-env` block (9 ambient
-variables) and `deploy/aws/template.yaml` (which calls itself a "reference
+first-call migrations. `docker-compose.yml`'s `x-rya-env` block (**15** ambient
+variables now, up from 9 when this was written — the additions are the bundle
+store and its object-store credentials: `RYA_BUNDLES_S3_BUCKET`, `_S3_ENDPOINT`,
+`_S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, which the api and the
+workers must share or a published version resolves to an archive the worker cannot
+read) and `deploy/aws/template.yaml` (which calls itself a "reference
 posture" at `:5` and whose `MutatorFunction` at `:354-367` is a stub) both need
 reworking under D8.
 
@@ -456,10 +561,17 @@ reworking under D8.
    isolation is the answer and it is not in v1.
 2. **Bundle/journal drift.** Mitigated by D9 and D12 — content-keyed steps,
    version pinning, retention, fail closed.
-3. **The deployment pipeline and process lifecycle are entirely greenfield.** No
-   worker registration, no capability advertisement, no bundle digest exists
-   today. This is the real work and it should not be underestimated because the
-   architecture got simpler.
+3. **The process lifecycle is still greenfield, and it is the scheduling half.**
+   The deployment pipeline is built (§11 item 10) and so are worker registration,
+   capability advertisement and bundle digests (§11 item 8) — that part of this
+   risk is closed. What is not built is the **supervisor**: starting a process per
+   (workspace, agent, version) on demand, scaling it on that key's queue depth,
+   and scaling to zero against a tracked cold-start target. **Do not read the
+   shipped pipeline as evidence the lifecycle is nearly done** — publishing a
+   version and *operating* a fleet of version-pinned processes across N workspaces
+   × M agents × V versions are different problems, and the second one is the one
+   the hosted product's margin lives in. It should not be underestimated because
+   the architecture got simpler, or because the pipeline in front of it landed.
 4. **Cold start.** Scale-to-zero trades idle cost for latency on the first run of
    an idle key. Track it; pre-warm production environments.
 5. **Two product surfaces to maintain (D14).** Every future feature needs a "does

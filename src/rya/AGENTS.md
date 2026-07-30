@@ -24,6 +24,9 @@ permissions, pins, and the Action Guard are enforced in `sdk.context`.
 - `models/` - custom-model registry.
 - `approvals/` - the pause/resume signal (PausedForApproval).
 - `api/` - FastAPI control plane: REST, webhooks, WebSocket, SSE, console, MCP mount.
+  Bound to ONE agent: `build_app(root)` resolves a single `rya.agent.yaml` at
+  startup and every route resolves `manifest.name`, so `agent_id` in the paths is
+  decorative and a bundle for another agent is refused. One deployment per agent.
 - `observability/` - structured logs, token/cost usage, run export (Langfuse/OTLP).
 - `mcp/` - MCP server so coding agents drive Rya; `ops` = plain testable functions.
 - `cli/` - the `rya` CLI (Typer), project scaffolding, deploy templates. Two
@@ -40,7 +43,7 @@ permissions, pins, and the Action Guard are enforced in `sdk.context`.
 - `queue.py` - durable external-worker job queue (enqueue/claim/lease/heartbeat/complete, retries, DLQ, concurrency caps).
 - `turns.py` - durable chat turns over the queue (leased, reclaimable, resumable stream buffer + post-approval continuation).
 - `guard.py` - Action Guard egress firewall + grounding gate.
-- `bundles.py` - the client bundle: build, content-hash (D12), pack/unpack/verify, local or S3 archive store.
+- `bundles.py` - the client bundle: build, content-hash (D12), pack/unpack/verify, local or S3-compatible archive store (`RYA_BUNDLES_S3_ENDPOINT` for MinIO/Ceph/R2, which also forces path-style addressing).
 - `deployments.py` - immutable versions + environment pointers: promote, rollback, retire, retention (D11/D12/§9).
 - `worker.py` - the execution-plane process: loads a pinned bundle, advertises handlers, registers, heartbeats, scales to zero (§6).
 - `gates.py` - promotion gates: readiness/eval evidence as a server-side admission check, attested against a version (§9).
@@ -53,7 +56,7 @@ permissions, pins, and the Action Guard are enforced in `sdk.context`.
 - `readiness.py` - the `rya deploy --check` production-readiness gate.
 - `snapshot.py` - `rya context` + the console aggregate (`GET /console`).
 - `provision.py` - `rya provision`: stand up + report the base infra inventory.
-- `cloud.py` - client for driving a hosted Rya (`rya login` / `rya cloud`).
+- `cloud.py` - client for driving a hosted Rya (`rya login` / `rya cloud`) and for uploading a bundle to it (`rya publish` -> `POST /agents/{id}/versions`). Preserves the server's `E_*` code across the network rather than flattening it to `E_REMOTE`.
 - `errors.py` - stable `E_*` error codes + semantic exit codes (branch on these, don't scrape prose).
 
 ## Rules for changing this package

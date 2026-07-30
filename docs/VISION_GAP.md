@@ -1,8 +1,17 @@
 # RYA — Vision vs. Built: Honest Gap & Roadmap
 
-**Date:** 2026-06-18
+**Date:** 2026-06-18 · **Re-audited:** 2026-07-29
 **Compares:** the RYA platform vision (positioning doc) against the actual
 `rya` repository as built and tested in this codebase.
+
+> **Why the re-audit.** Sections 1–6 were written against the pre-Phase-A/B/C
+> state; the roadmap at the bottom was then updated in place as things shipped,
+> and the earlier sections were never revised. The document therefore spent six
+> weeks contradicting itself — marking per-user JWT identity, vector retrieval,
+> Langfuse export, the SAM template and the TS client as gaps in §1/§5 and in
+> "Claims to correct," while ticking each one ✅ in its own roadmap. Corrections
+> are struck through rather than deleted, so the record of what was true when
+> stays legible. Counts (tests, MCP tools) were re-measured against the code.
 
 This is deliberately conservative. Where the vision describes something we have
 not built, it says so plainly. "Verified" means there is a passing test or a
@@ -10,7 +19,18 @@ reproduced live run in this session, not just code that looks right.
 
 **Legend:** ✅ built & verified · 🟡 partial · ❌ not built · 💼 business/GTM (not code)
 
-Current test state: **36 passing, 6 Postgres-gated skipped.**
+Current test state (re-measured 2026-07-29): **321 collected — 283 passing, 37
+skipped, 1 failing.** Skips are Postgres-gated (`RYA_TEST_DATABASE_URL`) plus the
+live-provider and DeepEval tests. The one failure is
+`test_llm_layer.py::test_governance_applies_inside_the_loop`, which needs a model
+that actually emits a tool call: the offline mock never calls one, so
+`E_NO_CONNECTION` is never raised.
+
+**Run it with no provider keys in the environment.** With `ANTHROPIC_API_KEY` set,
+16 tests fail and the suite takes 179s instead of 19s, because
+`providers/llm.py:36-54` resolves `auto` → `anthropic` from the key's mere
+*presence* — so tests written against the deterministic mock silently talk to the
+live API. That is the ambient-config bug class, reproduced in our own suite.
 
 ---
 
@@ -23,10 +43,19 @@ Current test state: **36 passing, 6 Postgres-gated skipped.**
   ([manifest/schema.py](../src/rya/manifest/schema.py)); workspaces + hashed API
   keys map a caller to a tenant ([tenancy.py](../src/rya/tenancy.py)).
 - **Gap:** permissions are flat per-tool *levels* (`read_only/allowed/approval_required/disabled`),
-  not a graph (agent→tool→scope→user). No per-session `Identity{...}` handshake
-  derived from a verified user JWT — auth resolves a *workspace*, not a *user*.
-- **Takes (M–L):** a JWT/identity layer (ties into §3); a permission model richer
-  than four enum levels; bind identity into `ctx` per run.
+  not a graph (agent→tool→scope→user).
+  ~~No per-session `Identity{...}` handshake derived from a verified user JWT —
+  auth resolves a *workspace*, not a *user*.~~ **Closed** — this was written before
+  Phase B/C and contradicted its own roadmap below. Per-user identity exists:
+  [auth.py](../src/rya/auth.py) verifies HS256 (stdlib) and RS256/JWKS (`[auth]`
+  extra); `ctx.identity` carries `sub`/`scopes` per run; `rya_runs` and
+  `rya_conversations` have per-user RLS keyed on `app.user_id`
+  ([tenancy.py](../src/rya/tenancy.py)); and a tool declaring `require_user` fails
+  closed with `E_NO_IDENTITY` rather than falling through to a workspace-shared
+  credential.
+- **Takes (M–L):** a permission model richer than four enum levels. *(The
+  JWT/identity half of this item is done; what remains of §3's enterprise story is
+  the mutator/Cognito topology, not identity itself.)*
 
 ### Runtime — 🟡 partial
 - **Vision:** long-lived Fargate fleet, durable, pause/resume, retries, timeouts,
@@ -164,16 +193,18 @@ restarts on Postgres. Matches the vision.
 
 - **CLI** — ✅ `create/dev/deploy/runs trace/approvals/...`, `--json` everywhere,
   semantic exit codes, `--non-interactive`. Verified.
-- **MCP server** — ✅ 19 `rya_*` tools incl. `rya_context`. Verified.
+- **MCP server** — ✅ 25 `rya_*` tools incl. `rya_context`. Verified.
 - **Skills** — ✅ two progressive-disclosure modules (`rya`, `rya-ops`).
-- **SDK** — ✅ Python (typed); ❌ TS.
+- **SDK** — ✅ Python (typed); ✅ TS **client** ([clients/typescript](../clients/typescript)
+  — typed `RyaClient`, strict `tsc` clean, runtime-proven against a live `rya
+  serve`). There is no TS *runtime* — you cannot author an agent in TypeScript.
 - **REST API** — 🟡 control-plane shape exists; not a full partner API.
 - **First five minutes** — ✅ `uvx rya create … → rya dev → event → trace`
   verified from the built wheel (not yet published to PyPI).
 
-This section of the vision is the closest to reality. The main caveats: TS SDK
-absent, REST is partial, and `uvx rya` works from the artifact but the package
-isn't published.
+This section of the vision is the closest to reality. The main caveats: there is
+a TS *client* but no TS *runtime*, REST is partial, and `uvx rya` works from the
+artifact but the package isn't published.
 
 ---
 
@@ -192,15 +223,39 @@ isn't published.
 
 ## Claims to correct before this doc goes external
 
-These read as built but are not, in this repo:
+> **Re-audited 2026-07-29.** Five of the seven items below were written against the
+> pre-Phase-A/B state and were then silently invalidated by the roadmap at the
+> bottom of this same document — which was updated in place while these sections
+> were not. Each is corrected against the code rather than deleted, so the record
+> of what was true when stays legible. Each item now carries its own verdict.
 
-1. "Runs on a container backplane … scales horizontally on CPU." → single worker today.
-2. "Cognito … RS256 JWTs verified on every request," "single-purpose Lambdas re-validate the user's JWT," "RLS on every table" scoped per user. → we have workspace-RLS + token/API-key auth, not per-user JWT.
-3. "CloudFormation and SAM templates; every deploy is two commands." → Docker/fly/render artifacts only.
-4. "Vector retrieval." → substring search.
-5. "Self-hosted Langfuse for traces." → in-store traces only.
-6. "Shipped … in production, under real traffic." → not this repo.
-7. The five `./diagrams/*.png` are referenced but absent.
+1. ~~"Runs on a container backplane … scales horizontally on CPU."~~ **Partly
+   closed** — Phase B/5 built an atomic `FOR UPDATE SKIP LOCKED` claim queue and a
+   horizontally scalable `rya worker`. What remains unbuilt is the *deployed*
+   backplane, not the concurrency primitive.
+2. **Still true, in part.** Per-user JWT and per-user RLS *are* built (see §1 and
+   Phase B/6, C/9). What is not built is the **Cognito + API-Gateway +
+   per-mutator-Lambda** topology: `deploy/aws/template.yaml` declares it and is
+   cfn-lint clean, but `MutatorFunction` is a **stub** whose body returns
+   `{"ok": true, "pattern": "single-purpose-mutator"}`.
+3. ~~"CloudFormation and SAM templates; every deploy is two commands."~~
+   **Half closed** — the SAM template exists and lints (Phase C/10). It has never
+   been deployed; `sam deploy` needs a billable AWS account. So: authored, not
+   proven.
+4. ~~"Vector retrieval." → substring search.~~ **Closed, with a caveat worth
+   keeping.** `ctx.memory.search` and `ctx.knowledge.search` embed and rank by
+   cosine over real vectors ([providers/embeddings.py](../src/rya/providers/embeddings.py)).
+   The caveat: the *offline default* is a deterministic hashing vectorizer, so
+   cosine there reflects **lexical overlap, not semantics**; true semantic
+   retrieval needs `OPENAI_API_KEY` (`text-embedding-3-small`). There is also a
+   lexical fallback scoring 0.1 when vectors are absent or length-mismatched.
+5. ~~"Self-hosted Langfuse for traces." → in-store traces only.~~ **Closed** —
+   Phase A/2 shipped a Langfuse + generic-webhook exporter
+   ([observability/export.py](../src/rya/observability/export.py)), verified against
+   a live local server.
+6. **Still true.** "Shipped … in production, under real traffic" is not true of
+   this repository.
+7. **Still true.** The five `./diagrams/*.png` are referenced but absent.
 
 None of this means the vision is wrong — it means the doc currently mixes *built*
 and *intended* without a line between them. Drawing that line (or splitting into
@@ -269,8 +324,14 @@ developer surface**: manifest, SDK, durable approvals, retries, real LLM and
 channel seams, Postgres persistence with multi-tenant RLS, a token-authed
 signed-webhook server, and a container deploy proven against external Postgres —
 all test-covered. What the vision adds on top is the **enterprise security and
-cloud-deployment architecture** (per-user JWT identity, Lambda-isolated mutators,
-RLS-as-the-user, CloudFormation single-tenant in the customer's cloud) and the
-**production track record** — and those are largely unbuilt in this repo. The
-developer-surface half of the doc is real; the enterprise-architecture half is
-the roadmap.
+cloud-deployment architecture** and the **production track record**.
+
+*Updated 2026-07-29:* that enterprise list has thinned since this paragraph was
+written. **Per-user JWT identity and RLS-as-the-user are built and verified**
+(auth.py, `ctx.identity`, `app.user_id` policies on `rya_runs`/`rya_conversations`),
+and the **CloudFormation single-tenant template is authored and cfn-lint clean**.
+What genuinely remains unbuilt is narrower: **Lambda-isolated mutators** (declared
+in IaC, but `MutatorFunction` is a stub), an **actual cloud deployment** (`sam
+deploy` needs a billable account), and the **production track record**. The
+developer-surface half of the doc is real; the enterprise half is now roughly half
+real and half roadmap.

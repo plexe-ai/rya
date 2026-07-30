@@ -70,6 +70,11 @@ Handlers receive a context exposing every primitive:
 | `ctx.traces.event(name, data)` | Custom trace spans |
 | `ctx.secrets.get(name)` | Secret values (never persisted/traced) |
 | `ctx.events.emit(type, payload)` | Emit an event |
+| `ctx.knowledge.add/search/documents` | RAG: ingest → chunk → embed → retrieve |
+| `ctx.sessions.get_or_create/append/history/get/search` | Durable chat sessions |
+| `ctx.files.get/list/read/as_document` | Uploaded files; `as_document` feeds knowledge |
+| `ctx.connections.get/secret/list/upsert` | Scoped per-user credentials (see `secret()`'s caveat) |
+| `ctx.guard.check_grounding/scrub/check_secrecy` | Grounding gate, id-secrecy scrub |
 
 ## Tool permissions
 

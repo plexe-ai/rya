@@ -214,7 +214,7 @@ The same operations over three surfaces; see [mcp.md](mcp.md), [devex.md](devex.
 - **CLI** — every command takes `--json`/`--non-interactive`; failures return
   `{ok:false, error:{code, message, hint, exit_code}}`. Exit codes are semantic
   (§16) so an agent branches without parsing prose.
-- **MCP** — `rya mcp` (stdio), **20 `rya_*` tools** including `rya_context`
+- **MCP** — `rya mcp` (stdio), **25 `rya_*` tools** including `rya_context`
   (orient) and `rya_check_readiness` (the gate). Register with `{"command":"rya","args":["mcp"]}`.
 - **Skills** — `rya skills install` writes two progressive-disclosure modules:
   `rya` (authoring) and `rya-ops` (operating).
@@ -314,8 +314,19 @@ prompts for the token when auth is on.
 
 ## 15. Testing
 
-`pytest` — **72 pass, 7 Postgres-gated** (run those with
-`RYA_TEST_DATABASE_URL=…`). Coverage includes: manifest validation, the durable
+`pytest` — **321 collected: 283 pass, 37 skipped, 1 failing** (re-measured
+2026-07-29). Skips are Postgres-gated (run those with `RYA_TEST_DATABASE_URL=…`)
+plus the live-provider and DeepEval tests.
+
+Two things to know before running it. **Unset provider keys first** — with
+`ANTHROPIC_API_KEY` present, `providers/llm.py:36-54` resolves `auto` →
+`anthropic` from the key's mere presence, so 16 tests written against the
+deterministic mock silently hit the live API (179s instead of 19s). And
+**`rya[mcp]` must be `<2`**: `pyproject.toml` declares `mcp>=1.2.0` with no upper
+bound, but `mcp` 2.0.0 removed `streamablehttp_client`, which breaks both
+`test_remote_mcp.py` tests.
+
+Coverage includes: manifest validation, the durable
 pause/resume slice (file + Postgres, cross-process), per-user RLS, JWT, real
 tool/channel HTTP delivery, the signed-webhook + auth flows, the
 production-readiness gate, the console aggregate, and the **Action Guard**

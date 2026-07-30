@@ -107,7 +107,7 @@ the **real** provider seam.
 
 ## 4. The primitives (`ctx.*`)
 
-Fifteen primitives, all journaled:
+Seventeen primitives, all journaled:
 
 | Primitive | What it does |
 |---|---|
@@ -120,12 +120,14 @@ Fifteen primitives, all journaled:
 | `ctx.jobs` | Schedule background work (`job.schedule`; executed by `rya worker`) |
 | `ctx.cron` | Recurring schedules |
 | `ctx.approvals` | `request(title, body, action)` → pause the run for a human |
-| `ctx.sessions` | Conversation/session handling (`get_or_create`, `append`) |
-| `ctx.connections` | Scoped, encrypted third-party credentials |
+| `ctx.sessions` | Conversation/session handling (`get_or_create`, `append`, `history`, `get`, `search`) |
+| `ctx.connections` | Scoped, encrypted third-party credentials (`get`, `list`, `upsert`, `secret`) |
 | `ctx.logs` | Structured logs (into the trace) |
 | `ctx.traces` | Trace access |
 | `ctx.secrets` | Secret access (auto-redacted from traces) |
 | `ctx.events` | Emit/consume events |
+| `ctx.files` | Uploaded files: `get`, `list`, `read`, `as_document` (feeds `ctx.knowledge`) |
+| `ctx.guard` | `check_grounding` (grounding gate), `scrub`/`check_secrecy` (id-secrecy) |
 
 ---
 
@@ -262,7 +264,7 @@ workspaces keys cloud
 | Approvals | `GET /approvals`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/reject` |
 | Onboarding | `POST /v1/signup`, `POST /v1/login`, `GET /v1/me`, `POST /v1/workspaces` |
 | Admin | `POST /v1/projects` (gated by `RYA_ADMIN_TOKEN`; fails closed if unset) |
-| Guard / evals | `GET|PUT /guard`, `POST /guard/test`, `GET /evals`, `POST /evals/run` |
+| Guard / evals | `GET`/`PUT` `/guard`, `POST /guard/test`, `GET /evals`, `POST /evals/run` |
 | Read surfaces | `GET /connections`, `GET /knowledge`, `POST /knowledge/search`, `GET /sessions`, `GET /tools`, `GET /models`, `GET /channels` |
 | Inbound | `POST /inbound`, `POST /slack/events` |
 | Remote MCP | `/mcp` (mounted last so its catch-all doesn't shadow API routes) |
@@ -320,7 +322,11 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 
 ## 16. Current state — honest
 
-**Test suite: 137 passed, 9 skipped** (Postgres-gated + the live DeepEval test).
+**Test suite: 321 collected — 283 passed, 37 skipped, 1 failing** (re-measured
+2026-07-29; skips are Postgres-gated plus the live-provider and DeepEval tests).
+Run with provider keys **unset** — a present `ANTHROPIC_API_KEY` silently routes
+mock-expecting tests to the live API and 16 then fail; and pin `mcp<2`, since
+`mcp` 2.0.0 removed `streamablehttp_client`.
 
 **Verified working (not claims — exercised):**
 - **Live on AWS** (ECS Fargate + RDS, multi-tenant). Self-serve signup → workspace
@@ -373,5 +379,5 @@ src/rya/
   cloud.py cli.py
 deploy/aws/        template.yaml (SAM), Dockerfile.baked
 docs/              this doc + the companions
-tests/             137 tests
+tests/             49 files, 321 tests
 ```

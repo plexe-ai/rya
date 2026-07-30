@@ -11,6 +11,12 @@ laptop, a self-hosted box, and the cloud.
 The core is the runtime, SDK, manifest, CLI, MCP server, and the **pluggable
 state store**. The store is the seam that makes one codebase serve every tier:
 
+> **Being relocated, not removed.** `PLATFORM_DESIGN.md` (D1/D5) keeps this seam
+> but moves it *below the policy boundary* — inside the platform, out of reach of
+> `ctx` — because a client-versioned process must not own state. D19 then scopes
+> `FileStore` to hermetic tests, so the local platform runs Postgres and "a laptop
+> needs no database" is no longer one of the properties this seam buys.
+
 ```
 ctx / engine ──► open_store(root) ──┬─► FileStore     (.rya/ JSON)   zero-config local dev
                                     └─► PostgresStore  (JSONB)        self-host + cloud
@@ -104,4 +110,14 @@ Isolation is enforced at two layers (see `tenancy.py`, `store_postgres.py`):
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-\* Recommended license for the core; not yet committed in-repo — a product decision.
+\* **Committed.** An Apache-2.0 `LICENSE` has been in-repo all along, so the older
+note here ("not yet committed in-repo — a product decision") was already wrong when
+written. The product decision it referred to is now settled too: **D10** in
+[PLATFORM_DESIGN.md](PLATFORM_DESIGN.md) selects Apache-2.0 for *both* halves of
+the platform/SDK split, with copyright kept consolidated so a source-available
+relicence stays available if a hosting threat ever appears.
+
+Note that the layer map above is **superseded in one respect**: it places
+multi-tenancy (RLS) in the proprietary managed-cloud box, but `tenancy.py` ships in
+the OSS core under that same Apache grant. Under D10 there is no proprietary tier
+to move it to — the boxes now describe *what we operate*, not *what is closed*.

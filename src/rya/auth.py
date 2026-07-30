@@ -51,6 +51,34 @@ class Identity:
         return {"sub": self.sub, "email": self.email, "scopes": self.scopes}
 
 
+def issue_jwt(sub: str, email: Optional[str] = None, ttl_seconds: int = 12 * 3600,
+              extra: Optional[dict] = None) -> str:
+    """Mint a short-lived HS256 JWT with RYA_JWT_SECRET - the session-to-JWT
+    bridge. The control plane authenticates a session, then vouches for the
+    user to the data plane with this token, so runs and approvals record WHO
+    acted. Raises when only JWKS verification is configured (identity must
+    then come from the external IdP)."""
+    secret = os.environ.get("RYA_JWT_SECRET")
+    if not secret:
+        raise RyaError("E_VALIDATION", "Cannot mint a user token: RYA_JWT_SECRET is not set.",
+                       hint="With RYA_JWKS_URL-only setups, user tokens come from your IdP.")
+    header = {"alg": "HS256", "typ": "JWT"}
+    now = int(time.time())
+    payload = {"sub": sub, "iat": now, "exp": now + ttl_seconds, "iss": "rya"}
+    if email:
+        payload["email"] = email
+    payload.update(extra or {})
+    segs = [_b64url_encode(json.dumps(h, separators=(",", ":")).encode())
+            for h in (header, payload)]
+    signing = ".".join(segs).encode()
+    sig = hmac.new(secret.encode(), signing, hashlib.sha256).digest()
+    return ".".join(segs + [_b64url_encode(sig)])
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
 def _b64url_decode(seg: str) -> bytes:
     return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
 
@@ -62,9 +90,15 @@ def _verify_hs256(token: str, secret: str) -> dict:
         raise RyaError("E_UNAUTHORIZED", "Malformed JWT.", hint="Expected a three-part JWT.")
     signing_input = f"{header_b64}.{payload_b64}".encode()
     expected = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
-        raise RyaError("E_UNAUTHORIZED", "JWT signature verification failed.")
-    claims = json.loads(_b64url_decode(payload_b64))
+    try:
+        if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+            raise RyaError("E_UNAUTHORIZED", "JWT signature verification failed.")
+        claims = json.loads(_b64url_decode(payload_b64))
+    except (ValueError, UnicodeDecodeError, Exception) as e:
+        if isinstance(e, RyaError):
+            raise
+        raise RyaError("E_UNAUTHORIZED", "Malformed JWT.",
+                       hint="Token segments must be base64url-encoded JSON.")
     exp = claims.get("exp")
     if exp is not None and time.time() > exp:
         raise RyaError("E_UNAUTHORIZED", "JWT is expired.")

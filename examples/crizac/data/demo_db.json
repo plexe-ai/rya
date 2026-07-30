@@ -1,0 +1,14 @@
+{
+  "applicationsThisMonth": 412,
+  "students": {
+    "ST-1001": {"name": "Ananya Sharma", "country": "India", "target": "UK", "fundsVerified": true, "gapYears": 0},
+    "ST-1002": {"name": "Rohan Mehta", "country": "India", "target": "Canada", "fundsVerified": false, "gapYears": 3},
+    "ST-1003": {"name": "Fatima Noor", "country": "Bangladesh", "target": "UK", "fundsVerified": true, "gapYears": 1}
+  },
+  "courses": [
+    {"id": "C-201", "name": "MSc Data Science", "university": "University of Leeds", "country": "UK", "fee": "GBP 28,000"},
+    {"id": "C-202", "name": "MSc Computer Science", "university": "Coventry University", "country": "UK", "fee": "GBP 18,500"},
+    {"id": "C-203", "name": "MBA Global Business", "university": "University of Greenwich", "country": "UK", "fee": "GBP 19,000"},
+    {"id": "C-204", "name": "MSc Business Analytics", "university": "Trent University", "country": "Canada", "fee": "CAD 26,700"}
+  ]
+}

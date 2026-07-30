@@ -1,0 +1,11 @@
+[project]
+name = "la-renewal-agent"
+version = "0.1.0"
+description = "BBG loan-renewal agent - runs on the Rya agent backend"
+requires-python = ">=3.10"
+dependencies = [
+    # Rya is the runtime this agent runs inside (rya serve / rya eval).
+    # Private repo - install with a token or SSH:
+    "rya[api,postgres,llm,bedrock] @ git+https://github.com/plexe-ai/rya.git",
+    "pypdf>=4.0",   # chunked extraction for oversized PDFs
+]

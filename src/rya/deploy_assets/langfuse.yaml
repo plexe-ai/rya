@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Self-hosted Langfuse v3 inside the VPC for Rya trace/eval export. One Fargate
+  task runs langfuse-web, langfuse-worker, postgres, clickhouse and redis as
+  co-containers (awsvpc: they share localhost, mirroring the reference
+  docker-compose). Postgres and ClickHouse persist to EFS; event/media blobs go
+  to a real S3 bucket via the task role (no static keys). Single task by
+  design - this is the observability box, not the system of record; losing it
+  loses dashboards, never agent state.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  PostgresPassword:
+    Type: String
+    NoEcho: true
+  ClickhousePassword:
+    Type: String
+    NoEcho: true
+  RedisPassword:
+    Type: String
+    NoEcho: true
+  Salt:
+    Type: String
+    NoEcho: true
+  EncryptionKey:
+    Type: String
+    NoEcho: true
+    Description: 64 hex chars.
+  NextAuthSecret:
+    Type: String
+    NoEcho: true
+  ProjectPublicKey:
+    Type: String
+    Description: Langfuse project public key, provisioned headlessly on first boot.
+  ProjectSecretKey:
+    Type: String
+    NoEcho: true
+  AdminEmail:
+    Type: String
+    Default: admin@rya.local
+  AdminPassword:
+    Type: String
+    NoEcho: true
+  TaskCpu:
+    Type: String
+    Default: "2048"
+  TaskMemory:
+    Type: String
+    Default: "8192"
+
+Resources:
+  BlobBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-blobs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-data"
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  MountTargetC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [2, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  PostgresAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: { Uid: "70", Gid: "70" }
+      RootDirectory:
+        Path: /postgres
+        CreationInfo: { OwnerUid: "70", OwnerGid: "70", Permissions: "700" }
+
+  ClickhouseAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: { Uid: "101", Gid: "101" }
+      RootDirectory:
+        Path: /clickhouse
+        CreationInfo: { OwnerUid: "101", OwnerGid: "101", Permissions: "755" }
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Langfuse ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Langfuse task
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Langfuse EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: blob-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${BlobBucket.Arn}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt BlobBucket.Arn
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-langfuse"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: pgdata
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig: { AccessPointId: !Ref PostgresAccessPoint }
+        - Name: chdata
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig: { AccessPointId: !Ref ClickhouseAccessPoint }
+      ContainerDefinitions:
+        - Name: postgres
+          Image: postgres:16-alpine
+          Essential: true
+          Environment:
+            - { Name: POSTGRES_USER, Value: langfuse }
+            - { Name: POSTGRES_PASSWORD, Value: !Ref PostgresPassword }
+            - { Name: POSTGRES_DB, Value: langfuse }
+          MountPoints:
+            - { SourceVolume: pgdata, ContainerPath: /var/lib/postgresql/data }
+          HealthCheck:
+            Command: ["CMD-SHELL", "pg_isready -U langfuse"]
+            Interval: 10
+            Timeout: 5
+            Retries: 10
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: langfuse
+        - Name: clickhouse
+          Image: clickhouse/clickhouse-server:24.8-alpine
+          Essential: true
+          User: "101:101"
+          EntryPoint:
+            - /bin/sh
+            - -c
+            - >
+              echo '<clickhouse><listen_host>0.0.0.0</listen_host></clickhouse>'
+              > /etc/clickhouse-server/config.d/listen_ipv4.xml && exec /entrypoint.sh
+          Environment:
+            - { Name: CLICKHOUSE_DB, Value: default }
+            - { Name: CLICKHOUSE_USER, Value: clickhouse }
+            - { Name: CLICKHOUSE_PASSWORD, Value: !Ref ClickhousePassword }
+          MountPoints:
+            - { SourceVolume: chdata, ContainerPath: /var/lib/clickhouse }
+          Ulimits:
+            - { Name: nofile, SoftLimit: 262144, HardLimit: 262144 }
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+            Interval: 10
+            Timeout: 5
+            Retries: 10
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: langfuse
+        - Name: redis
+          Image: redis:7-alpine
+          Essential: true
+          Command: ["redis-server", "--requirepass", !Ref RedisPassword]
+          HealthCheck:
+            Command: ["CMD-SHELL", !Sub "redis-cli -a ${RedisPassword} ping | grep -q PONG"]
+            Interval: 10
+            Timeout: 5
+            Retries: 10
+            StartPeriod: 15
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: langfuse
+        - Name: langfuse-web
+          Image: langfuse/langfuse:3
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+          DependsOn:
+            - { ContainerName: postgres, Condition: HEALTHY }
+            - { ContainerName: clickhouse, Condition: HEALTHY }
+            - { ContainerName: redis, Condition: HEALTHY }
+          Environment:
+            - Name: DATABASE_URL
+              Value: !Sub "postgresql://langfuse:${PostgresPassword}@127.0.0.1:5432/langfuse"
+            - { Name: SALT, Value: !Ref Salt }
+            - { Name: ENCRYPTION_KEY, Value: !Ref EncryptionKey }
+            - { Name: NEXTAUTH_SECRET, Value: !Ref NextAuthSecret }
+            - Name: NEXTAUTH_URL
+              Value: !Sub "http://${LoadBalancer.DNSName}"
+            - { Name: TELEMETRY_ENABLED, Value: "false" }
+            - { Name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES, Value: "false" }
+            - { Name: CLICKHOUSE_URL, Value: "http://127.0.0.1:8123" }
+            - { Name: CLICKHOUSE_MIGRATION_URL, Value: "clickhouse://127.0.0.1:9000" }
+            - { Name: CLICKHOUSE_USER, Value: clickhouse }
+            - { Name: CLICKHOUSE_PASSWORD, Value: !Ref ClickhousePassword }
+            - { Name: CLICKHOUSE_CLUSTER_ENABLED, Value: "false" }
+            - { Name: REDIS_HOST, Value: "127.0.0.1" }
+            - { Name: REDIS_PORT, Value: "6379" }
+            - { Name: REDIS_AUTH, Value: !Ref RedisPassword }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET, Value: !Ref BlobBucket }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_REGION, Value: !Ref "AWS::Region" }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_PREFIX, Value: events/ }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET, Value: !Ref BlobBucket }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_REGION, Value: !Ref "AWS::Region" }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_PREFIX, Value: media/ }
+            - { Name: LANGFUSE_INIT_ORG_ID, Value: rya }
+            - { Name: LANGFUSE_INIT_ORG_NAME, Value: Rya }
+            - { Name: LANGFUSE_INIT_PROJECT_ID, Value: rya-agents }
+            - { Name: LANGFUSE_INIT_PROJECT_NAME, Value: Rya Agents }
+            - { Name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY, Value: !Ref ProjectPublicKey }
+            - { Name: LANGFUSE_INIT_PROJECT_SECRET_KEY, Value: !Ref ProjectSecretKey }
+            - { Name: LANGFUSE_INIT_USER_EMAIL, Value: !Ref AdminEmail }
+            - { Name: LANGFUSE_INIT_USER_NAME, Value: Admin }
+            - { Name: LANGFUSE_INIT_USER_PASSWORD, Value: !Ref AdminPassword }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: langfuse
+        - Name: langfuse-worker
+          Image: langfuse/langfuse-worker:3
+          Essential: true
+          DependsOn:
+            - { ContainerName: postgres, Condition: HEALTHY }
+            - { ContainerName: clickhouse, Condition: HEALTHY }
+            - { ContainerName: redis, Condition: HEALTHY }
+          Environment:
+            - Name: DATABASE_URL
+              Value: !Sub "postgresql://langfuse:${PostgresPassword}@127.0.0.1:5432/langfuse"
+            - { Name: SALT, Value: !Ref Salt }
+            - { Name: ENCRYPTION_KEY, Value: !Ref EncryptionKey }
+            - { Name: NEXTAUTH_SECRET, Value: !Ref NextAuthSecret }
+            - Name: NEXTAUTH_URL
+              Value: !Sub "http://${LoadBalancer.DNSName}"
+            - { Name: TELEMETRY_ENABLED, Value: "false" }
+            - { Name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES, Value: "false" }
+            - { Name: CLICKHOUSE_URL, Value: "http://127.0.0.1:8123" }
+            - { Name: CLICKHOUSE_MIGRATION_URL, Value: "clickhouse://127.0.0.1:9000" }
+            - { Name: CLICKHOUSE_USER, Value: clickhouse }
+            - { Name: CLICKHOUSE_PASSWORD, Value: !Ref ClickhousePassword }
+            - { Name: CLICKHOUSE_CLUSTER_ENABLED, Value: "false" }
+            - { Name: REDIS_HOST, Value: "127.0.0.1" }
+            - { Name: REDIS_PORT, Value: "6379" }
+            - { Name: REDIS_AUTH, Value: !Ref RedisPassword }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET, Value: !Ref BlobBucket }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_REGION, Value: !Ref "AWS::Region" }
+            - { Name: LANGFUSE_S3_EVENT_UPLOAD_PREFIX, Value: events/ }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET, Value: !Ref BlobBucket }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_REGION, Value: !Ref "AWS::Region" }
+            - { Name: LANGFUSE_S3_MEDIA_UPLOAD_PREFIX, Value: media/ }
+            - { Name: LANGFUSE_INIT_ORG_ID, Value: rya }
+            - { Name: LANGFUSE_INIT_ORG_NAME, Value: Rya }
+            - { Name: LANGFUSE_INIT_PROJECT_ID, Value: rya-agents }
+            - { Name: LANGFUSE_INIT_PROJECT_NAME, Value: Rya Agents }
+            - { Name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY, Value: !Ref ProjectPublicKey }
+            - { Name: LANGFUSE_INIT_PROJECT_SECRET_KEY, Value: !Ref ProjectSecretKey }
+            - { Name: LANGFUSE_INIT_USER_EMAIL, Value: !Ref AdminEmail }
+            - { Name: LANGFUSE_INIT_USER_NAME, Value: Admin }
+            - { Name: LANGFUSE_INIT_USER_PASSWORD, Value: !Ref AdminPassword }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: langfuse
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /api/public/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, MountTargetA, MountTargetB, MountTargetC]
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-svc"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 420
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - ContainerName: langfuse-web
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  LangfuseUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  BlobBucketName:
+    Value: !Ref BlobBucket

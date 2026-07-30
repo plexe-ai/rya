@@ -10,6 +10,17 @@ blocks) -> reference-report schema derivation -> deterministic field filter ->
 composed report with `[source: doc.field]` citations, hard-stopped by the
 grounding gate if any figure is unsourced -> approval-gated `la.update_record`.
 
+## Install
+
+The agent runs inside [Rya](https://github.com/plexe-ai/rya) - the durable
+agent backend. Two ways to get it:
+
+```bash
+pip install .        # pulls rya from GitHub (needs repo access) + pypdf
+# or, in production: the Docker image bakes rya + this project together
+# (deploy/aws/Dockerfile.project in the rya repo) - nothing to install.
+```
+
 ## Run it
 
 ```bash

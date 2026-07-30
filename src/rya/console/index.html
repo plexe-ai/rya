@@ -49,6 +49,9 @@
   .nav button svg{width:15px;height:15px;stroke-width:1.9;color:var(--text-3);flex:none}.nav button:hover svg,.nav button.on svg{color:var(--ink)}
   .nav button .ct{margin-left:auto;font-size:11px;font-weight:500;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--text-3)}
   .nav button .ct.amber{color:var(--amber)}
+  .pwr{display:flex;align-items:center;gap:6px;padding:8px 10px;font-size:11px;color:var(--text-3);border-top:1px solid var(--line)}
+  .pwr svg{width:14px;height:14px;flex:none}.pwr b{font-weight:600;color:var(--text-2)}
+  .ws-logo img{width:100%;height:100%;object-fit:contain;border-radius:4px;background:#fff}
   .side-foot{margin-top:auto;display:flex;align-items:center;gap:9px;padding:8px;border-top:1px solid var(--border)}
   .ava{width:24px;height:24px;border-radius:50%;background:var(--ink);display:grid;place-items:center;color:#fff;font-size:10.5px;font-weight:600;flex:none}
   .side-foot .me{font-size:12.5px;font-weight:500;color:var(--ink)}.side-foot .em{font-size:11px;color:var(--text-3);margin-top:-2px}
@@ -217,7 +220,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <button class="ws" aria-label="Workspace"><div class="ws-logo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name" id="wsName">—</div><div class="ws-sub" id="wsSub">loading…</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
+    <button class="ws" aria-label="Workspace"><div class="ws-logo" id="wsLogo"><i data-lucide="git-commit-vertical"></i></div><div><div class="ws-name" id="wsName">—</div><div class="ws-sub" id="wsSub">loading…</div></div><span class="chev"><i data-lucide="chevrons-up-down"></i></span></button>
     <div class="agent-pick"><span class="ai"><i data-lucide="bot"></i></span><div><div class="nm" id="sideAgent">—</div><div class="en" id="sideEnv">loading…</div></div><span class="dot"></span></div>
     <div class="grp">Build</div>
     <nav class="nav" id="nav">
@@ -242,14 +245,19 @@
     <nav class="nav" id="nav2">
       <button data-v="runs"><i data-lucide="scan-line"></i>Runs &amp; traces</button>
       <button data-v="conversations"><i data-lucide="messages-square"></i>Conversations<span class="ct" data-ct="sessions"></span></button>
-      <button data-v="approvals"><i data-lucide="user-check"></i>Approvals<span class="ct amber" data-ct="approvals"></span></button>
       <button data-v="evals"><i data-lucide="flask-conical"></i>Evals</button>
-      <button data-v="guard"><i data-lucide="shield-half"></i>Action Guard</button>
       <button data-v="jobs"><i data-lucide="clock"></i>Jobs &amp; cron</button>
       <button data-v="queue"><i data-lucide="list-ordered"></i>Queue &amp; turns<span class="ct" data-ct="queue"></span></button>
+    </nav>
+    <div class="grp">Govern</div>
+    <nav class="nav" id="nav4">
+      <button data-v="governance"><i data-lucide="shield-check"></i>Governance<span class="ct amber" data-ct="violations"></span></button>
+      <button data-v="approvals"><i data-lucide="user-check"></i>Approvals<span class="ct amber" data-ct="approvals"></span></button>
+      <button data-v="guard"><i data-lucide="shield-half"></i>Action Guard</button>
       <button data-v="secrets"><i data-lucide="key-round"></i>Secrets<span class="ct" data-ct="secrets"></span></button>
       <button data-v="team"><i data-lucide="users"></i>Team &amp; access</button>
     </nav>
+    <div class="pwr">Powered by <svg viewBox="0 0 532 507" aria-hidden="true"><path fill="currentColor" d="M247 0h38v88h-38z"/><path fill="currentColor" d="M266 0l52 88h-104z"/><rect fill="currentColor" x="60" y="118" width="412" height="330" rx="165"/><rect fill="currentColor" x="0" y="228" width="70" height="120" rx="30"/><rect fill="currentColor" x="462" y="228" width="70" height="120" rx="30"/><rect fill="currentColor" x="80" y="438" width="372" height="69" rx="34"/><rect fill="var(--bg,#fff)" x="100" y="158" width="332" height="250" rx="125"/><rect fill="currentColor" x="172" y="228" width="56" height="110" rx="28"/><rect fill="currentColor" x="304" y="228" width="56" height="110" rx="28"/></svg><b>Plexe</b> · Rya runtime</div>
     <div class="side-foot"><div class="ava" id="meAva">RY</div><div><div class="me" id="meName">—</div><div class="em" id="meEmail">—</div></div><button class="btn sm" style="margin-left:auto;padding:5px 8px" aria-label="Sign out / change token" title="Sign out" onclick="signOut()"><i data-lucide="log-out"></i></button></div>
   </aside>
 
@@ -268,14 +276,8 @@
     <div class="scroll">
       <div class="view wrap" id="v-overview">
         <div class="stats" id="stats"></div>
-        <div class="secrow"><span class="l">Backend primitives</span><span class="r">declared in the manifest · provisioned by the coding agent</span></div>
+        <div class="secrow"><span class="l">Primitives</span><span class="r">from the manifest</span></div>
         <div class="pgrid" id="pgrid"></div>
-        <div class="secrow"><span class="l">Provisioned by your coding agent</span></div>
-        <div class="ca">
-          <div class="cacard"><div class="caic"><i data-lucide="terminal"></i></div><h4>CLI</h4><p><span class="mono">uvx rya</span> — every command emits JSON with stable error codes.</p></div>
-          <div class="cacard"><div class="caic"><i data-lucide="puzzle"></i></div><h4>MCP <span class="tag">25 tools</span></h4><p>Claude Code, Codex &amp; Cursor configure every primitive natively.</p></div>
-          <div class="cacard"><div class="caic"><i data-lucide="graduation-cap"></i></div><h4>Skills</h4><p>Progressive-disclosure guides so agents don't guess the workflow.</p></div>
-        </div>
         <div class="term"><div class="win-bar"><div class="win-dots"><i></i><i></i><i></i></div><span class="win-name">live state · GET /console</span></div><pre id="ctxTerm">…</pre></div>
       </div>
 
@@ -298,6 +300,7 @@
       <div class="view wrap hidden" id="v-queue"><div class="h2">Queue &amp; durable turns</div><div class="sub">Durable jobs claimed by external workers in any language — leases, retries with backoff, dead-letter, cancellation. Chat turns are queue jobs too: click one to inspect its durable stream.</div><div id="queueStats"></div><div id="queueBody" style="margin-top:16px"><div class="empty">Loading queue…</div></div><div id="turnStreamBody"></div></div>
       <div class="view wrap hidden" id="v-secrets"><div class="h2">Secrets</div><div class="sub">Names only, never values — they never reach the agent.</div><div id="secretsBody"></div></div>
       <div class="view wrap hidden" id="v-evals"><div class="h2">Evals</div><div class="sub">Behavioural checks — each case fires a real event and scores the run. Gate a deploy on it with <span class="mono">rya eval</span>.</div><div style="margin-bottom:16px"><button class="btn dark sm" id="evalRunBtn" onclick="runEvals()"><i data-lucide="play"></i>Run evals</button></div><div id="evalsBody"><div class="empty">Loading cases…</div></div></div>
+      <div class="view wrap hidden" id="v-governance"><div class="h2">Governance</div><div class="sub">Enforced in the runtime. Blocks, not warnings.</div><div id="govBody"><div class="empty">Loading...</div></div></div>
       <div class="view wrap hidden" id="v-guard"><div class="h2">Action Guard</div><div class="sub">Every outbound request the agent makes is checked against the SSRF blocklist and the rules below, then forwarded or blocked — before it leaves the process. Edits take effect immediately.</div><div id="guardBody"><div class="empty">Loading policy…</div></div></div>
       <div class="view wrap hidden" id="v-team"><div class="h2">Team &amp; access</div><div class="sub">Who can open this workspace, the API keys minted for it, and your account. Removing a member also revokes every key they minted.</div><div id="teamBody"><div class="empty">Loading…</div></div></div>
     </div>
@@ -341,8 +344,8 @@
 const API = (new URLSearchParams(location.search).get('api') || '').replace(/\/$/,'');
 const TKEY = 'rya_token';
 const getToken = () => localStorage.getItem(TKEY) || '';
-const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','deploy','versions','workers','quotas','runs','conversations','approvals','evals','guard','jobs','queue','secrets','team'];
-const NAVBTNS = '#nav button,#nav2 button,#nav3 button';
+const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','deploy','versions','workers','quotas','runs','conversations','approvals','evals','guard','jobs','queue','secrets','team','governance'];
+const NAVBTNS = '#nav button,#nav2 button,#nav3 button,#nav4 button';
 let STATE = null, wasLive = null, lastFocus = null;
 const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 // JS-string-escape for ids interpolated into inline handlers (defense-in-depth).
@@ -358,6 +361,15 @@ async function api(path,opts){
   if (!r.ok){ let e; try{ e=(await r.json()).detail||{}; }catch{ e={}; } throw new Error(e.message||('HTTP '+r.status)); }
   return r.status===204 ? null : r.json();
 }
+async function openWorkspacePicker(){
+  showAuth();
+  if(SESSION){
+    try{ const d=await fetch(API+'/v1/me',{headers:{'Authorization':'Bearer '+SESSION}}).then(r=>r.json());
+      if(d.workspaces&&d.workspaces.length){ renderWorkspaces(d.workspaces); return; }
+    }catch(e){}
+  }
+}
+document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.ws'); if(b) b.addEventListener('click',openWorkspacePicker);});
 function showAuth(){ const w=document.getElementById('authwrap'); if(w.style.display==='grid')return; lastFocus=document.activeElement; w.style.display='grid';
   fetch(API+'/v1/info').then(r=>r.json()).then(configAuth).catch(()=>{});
   setTimeout(()=>{const e=document.getElementById('suEmail'); if(e&&!e.closest('.apanel').classList.contains('hidden'))e.focus(); else document.getElementById('tokInput').focus();},50); }
@@ -477,14 +489,21 @@ function showRuntimeDown(msg){
   icons();
 }
 function render(s){
-  document.title='Rya · '+s.agent.name;
-  document.getElementById('agentName').textContent=s.agent.name;
+  const br=s.branding;
+  document.title=(br?br.name:'Rya')+' · '+s.agent.name;
+  if(br){
+    if(br.logo) document.getElementById('wsLogo').innerHTML='<img src="'+br.logo+'" alt="">';
+    document.getElementById('wsName').textContent=br.name;
+    document.getElementById('wsSub').textContent=br.tagline;
+  }
+  const vw=(s.viewer&&s.viewer.workspace&&s.viewer.workspace!=='default')?s.viewer.workspace:null;
+  document.getElementById('agentName').textContent=(br&&vw)?vw:s.agent.name;
   document.getElementById('sideAgent').textContent=s.agent.name;
   document.getElementById('sideEnv').textContent='v'+s.agent.version+' · '+s.agent.environment;
   document.getElementById('wsSub').textContent=s.agent.environment+' · '+s.runtime.store;
   // Real viewer identity (no hardcoded placeholders).
   const v=s.viewer||{}; const ws=(v.workspace&&v.workspace!=='default')?v.workspace:'Default workspace';
-  document.getElementById('wsName').textContent=ws;
+  if(!br) document.getElementById('wsName').textContent=ws;
   const who=v.user||(v.mode==='multi-tenant'?'workspace key':'operator');
   document.getElementById('meName').textContent=who;
   document.getElementById('meEmail').textContent=v.mode||'';
@@ -504,33 +523,35 @@ function render(s){
   setCt('knowledge',((s.knowledge&&s.knowledge.documents.length)||0));
   setCt('connections',(s.connections||[]).length);
   setCt('approvals',s.stats.approvalsPending, s.stats.approvalsPending>0);
+  setCt('violations',(s.governance&&s.governance.violations.length)||0,(s.governance&&s.governance.violations.length>0));
+  renderGovernance(s);
 
   const st=s.stats, gated=s.tools.filter(t=>t.permission==='approval_required').length;
+  const llmSub=st.costUsd!=null?('$'+Number(st.costUsd).toFixed(st.costUsd<1?4:2)):'across all runs';
   document.getElementById('stats').innerHTML=[
     tile('play','Runs',st.runs,(st.byStatus.completed||0)+' completed'),
     tile('user-check','Approvals',st.approvalsPending,'pending review',st.approvalsPending>0),
-    tile('coins','Tokens',(st.inputTokens+st.outputTokens).toLocaleString(),st.costUsd!=null?('$'+Number(st.costUsd).toFixed(st.costUsd<1?4:2)):'mock LLM'),
+    tile('coins','Tokens',(st.inputTokens+st.outputTokens).toLocaleString(),llmSub),
     tile('clock','Jobs queued',st.jobsPending,'background'),
   ].join('');
 
   document.getElementById('pgrid').innerHTML=[
-    prim('fingerprint','Identity','runs','Owner, version & permission graph — bound to every run.',[s.runtime.multiTenant?'per-user RLS':'single-tenant','v'+s.agent.version]),
-    prim('box','Runtime','runs','Durable execution — pauses, resumes, retries, times out.',[s.agent.handlers.event?'handler ✓':'no handler', s.runtime.store]),
+    prim('fingerprint','Identity','runs','Bound to every run.',[s.runtime.multiTenant?'per-user RLS':'single-tenant','v'+s.agent.version]),
+    prim('box','Runtime','runs','Pauses, resumes, retries.',[s.agent.handlers.event?'handler ✓':'no handler', s.runtime.store]),
     // The deployment hierarchy's entry point: environment → version → runs.
-    prim('git-branch','Deployments','deploy','Immutable, content-hashed versions. An environment is a pointer to one — promote flips it, rollback flips it back.',
-      [DEPLOY.envs.length+' environments',DEPLOY.versions.length+' versions']),
-    prim('database','Memory','memory','Core blocks (always in context) + consolidated long-term facts with vector recall.',[((s.memory.blocks||[]).length)+' blocks',(s.memory.facts||0)+' facts','+'+s.memory.collections.length+' collections']),
-    prim('book-open-text','Knowledge','knowledge','RAG over ingested documents — chunked, embedded, retrieved for grounding.',[((s.knowledge&&s.knowledge.documents.length)||0)+' docs',((s.knowledge&&s.knowledge.chunks)||0)+' chunks']),
-    prim('plug','Tools','tools','Typed, permissioned, audited. The agent never sees a credential.',[s.tools.length+' registered',gated+' gated']),
-    prim('layers','Model gateway','models','Foundation + custom models — permissioned, versioned, traced.',[s.runtime.llmProvider,...s.models.map(m=>m.id).slice(0,2)]),
-    prim('messages-square','Conversations','conversations','Durable sessions & messages — threaded per channel, retrievable for context.',[(st.sessions||0)+' sessions',(st.messages||0)+' messages']),
-    prim('user-check','Approvals','approvals','Human-in-the-loop gates. Runs pause durably and resume.',[st.approvalsPending+' pending'],st.approvalsPending>0),
-    prim('zap','Events & jobs','jobs','Webhooks, cron, delayed work, retries, dead-letter.',['cron ×'+s.triggers.filter(t=>t.type==='cron').length, st.jobsPending+' queued']),
-    prim('list-ordered','Queue & turns','queue','Durable jobs for external workers in any language - leases, retries, dead-letter. Chat turns included.',['polyglot workers','durable streams']),
-    prim('send','Channels','channels','Webhook, Slack, email behind one interface.',s.channels.map(c=>c.type+(c.enabled?'':' (off)'))),
-    prim('key-square','Connected credentials','connections','Scoped, vaulted creds — injected at call time, enforced by the intersection rule. The agent never sees a secret.',[((s.connections||[]).length)+' connections',(s.tools.filter(t=>t.provider).length)+' scoped tools']),
-    prim('activity','Observability','runs','Every run is a forensic trace. Token & cost accounting.',['traces on']),
-    prim('key-round','Secrets','secrets','Names only, never values. Backed by Secrets Manager.',[s.secrets.length+' keys']),
+    prim('git-branch','Deployments','deploy','Content-hashed versions; an environment points at one.',[DEPLOY.envs.length+' environments',DEPLOY.versions.length+' versions']),
+    prim('database','Memory','memory','Blocks + long-term facts.',[((s.memory.blocks||[]).length)+' blocks',(s.memory.facts||0)+' facts','+'+s.memory.collections.length+' collections']),
+    prim('book-open-text','Knowledge','knowledge','RAG over documents.',[((s.knowledge&&s.knowledge.documents.length)||0)+' docs',((s.knowledge&&s.knowledge.chunks)||0)+' chunks']),
+    prim('plug','Tools','tools','Typed, permissioned, audited.',[s.tools.length+' registered',gated+' gated']),
+    prim('layers','Model gateway','models','Permissioned, versioned, traced.',[s.runtime.llmProvider,...s.models.map(m=>m.id).slice(0,2)]),
+    prim('messages-square','Conversations','conversations','Durable sessions per channel.',[(st.sessions||0)+' sessions',(st.messages||0)+' messages']),
+    prim('user-check','Approvals','approvals','Human gates. Runs pause, resume.',[st.approvalsPending+' pending'],st.approvalsPending>0),
+    prim('zap','Events & jobs','jobs','Cron, retries, dead-letter.',['cron ×'+s.triggers.filter(t=>t.type==='cron').length, st.jobsPending+' queued']),
+    prim('list-ordered','Queue & turns','queue','Durable jobs, any language.',['polyglot workers','durable streams']),
+    prim('send','Channels','channels','Webhook, Slack, email.',s.channels.map(c=>c.type+(c.enabled?'':' (off)'))),
+    prim('key-square','Connected credentials','connections','Vaulted, injected at call time.',[((s.connections||[]).length)+' connections',(s.tools.filter(t=>t.provider).length)+' scoped tools']),
+    prim('activity','Observability','runs','Forensic traces, cost accounting.',['traces on']),
+    prim('key-round','Secrets','secrets','Names only, never values.',[s.secrets.length+' keys']),
   ].join('');
 
   document.getElementById('ctxTerm').textContent =
@@ -575,6 +596,47 @@ function render(s){
   icons();
 }
 function tile(ic,k,v,vs,amber){return `<div class="stat"><div class="k"><i data-lucide="${ic}"></i>${k}</div><div class="v ${amber?'amber':''}">${v}</div><div class="vs">${esc(vs)}</div></div>`;}
+function renderGovernance(s){
+  const g=s.governance; if(!g){document.getElementById('govBody').innerHTML=empty('Unavailable.');return;}
+  const E=g.enforcement, P=g.policy;
+  const TIPS={'Egress guard':'every outbound request checked before it leaves the process',
+    'Grounding gate':'outbound figures must trace to tool outputs',
+    'Approver identity':'approvals must carry a verified user',
+    'Per-user identity':'verified JWT bound to every run',
+    'Tenant isolation':'Postgres row-level security per workspace',
+    'Secrets sealed':'encrypted at rest, redacted in traces'};
+  const gate=(name,on)=>`<div class="stat" title="${esc(TIPS[name]||'')}"><div class="k"><i data-lucide="${on?'shield-check':'shield-off'}"></i>${name}</div>
+    <div class="v" style="font-size:15px;color:${on?'var(--green,#0f7b6c)':'var(--amber)'}">${on?'enforced':'off'}</div></div>`;
+  const gates=[gate('Egress guard',E.egressGuard),gate('Grounding gate',E.groundingGate),
+    gate('Approver identity',E.approverIdentity),gate('Per-user identity',E.perUserIdentity),
+    gate('Tenant isolation',E.multiTenantRls),gate('Secrets sealed',E.secretsSealed)].join('');
+  const pol=`<div class="secrow"><span class="l">Policy</span><span class="r mono">${esc(P.hash)}</span></div>
+    <div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">
+      ${tile('user-check','Gated',P.toolsGated,'approval required')}
+      ${tile('ban','Denied',P.toolsDenied,'blocked')}
+      ${tile('pin','Pinned args',P.pinnedArgTools,'server-set')}
+      ${tile('shield-half','Egress rules',P.egressRules,P.egressDefault?('default '+P.egressDefault):'not configured')}
+    </div>`;
+  const sw=g.switches||{active:[],history:[]};
+  const swHtml=`<div class="secrow"><span class="l">Kill switches</span><span class="r">immediate · no redeploy</span></div>`+
+    (sw.active.length?table(['Tool','Now','Since','v'],sw.active.map(o=>[
+      `<span class="mono">${esc(o.tool)}</span>`,`<span class="pb ${PB[o.permission]||''}">${esc(o.permission)}</span>`,
+      esc((o.ts||'').replace('T',' ').slice(0,16)),'v'+o.version]))
+    :empty('No overrides.'))+
+    (sw.history.length?`<div class="secrow"><span class="l">History</span><span class="r">append-only</span></div>`+
+      table(['When','Tool','Change','Reason'],sw.history.map(h=>[
+        esc((h.ts||'').replace('T',' ').slice(0,16)),`<span class="mono">${esc(h.tool)}</span>`,
+        esc(h.cleared?('restored '+h.permission):(h.previous+' -> '+h.permission)),esc(h.reason||'')])):'');
+  const vio=`<div class="secrow"><span class="l">Violations</span><span class="r">blocked by the runtime</span></div>`+
+    ((g.violations||[]).length?table(['When','What','Run','Detail'],g.violations.map(v=>[
+      esc((v.ts||'').replace('T',' ').slice(0,16)),`<span class="mono">${esc(v.kind)}</span>`,
+      `<span class="mono">${esc((v.runId||'').slice(0,14))}</span>`,esc(v.detail||'')]))
+    :empty('None recorded.'));
+  document.getElementById('govBody').innerHTML=
+    `<div class="secrow"><span class="l">Enforcement</span></div>
+     <div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">${gates}</div>`+pol+swHtml+vio;
+  icons();
+}
 function prim(ic,name,go,line,tags,amber){return `<button class="pcard" onclick="show('${go}')"><div class="ph"><span class="pic"><i data-lucide="${ic}"></i></span><h3>${esc(name)}</h3><span class="pstat ${amber?'amber':''}"></span></div><div class="pline">${esc(line)}</div><div class="ptags">${tags.filter(Boolean).map(t=>`<span class="ptag">${esc(t)}</span>`).join('')}</div></button>`;}
 function table(head,rows){if(!rows.length)return empty('Nothing here yet.');return `<table class="tbl"><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;}
 function empty(m,ic){return `<div class="empty"><i data-lucide="${ic||'inbox'}"></i>${esc(m)}</div>`;}

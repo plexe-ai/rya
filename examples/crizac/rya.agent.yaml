@@ -1,0 +1,86 @@
+# Crizac agent runtime - one durable runtime behind the whole fleet.
+#
+# Per the vision doc, each audience gets its own agent (counsellor, student,
+# insights, visa & CAS, university, finance) - each runs as a WORKSPACE on
+# this runtime: isolated runs, approvals, keys and governance per agent,
+# one shared enforcement envelope.
+
+name: crizac-agent-runtime
+runtime: python
+entrypoint: src/agent.py
+version: 0.1.0
+owner: crizac-platform
+environment: production
+instructions: >
+  Serve Crizac's education journey end to end: search and shortlist courses,
+  answer questions grounded in CAMS data, screen applications, and file them.
+  Filing an application, prefiling a loan, or submitting a CAS record always
+  requires human approval. Never state an eligibility or financial figure
+  that does not come from a tool result.
+
+timeout_seconds: 300
+
+model:
+  provider: bedrock
+  default: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  temperature: 0.2
+  routes:
+    intent:   { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.0, max_tokens: 400 }
+    answer:   { model: "us.anthropic.claude-haiku-4-5-20251001-v1:0", temperature: 0.2, max_tokens: 1500 }
+
+memory:
+  type: managed
+  collections: [students]
+
+tools:
+  - id: cams.lookup_student
+    description: Look up a student profile in CAMS.
+    permission: allowed
+    input_schema:
+      type: object
+      properties: { studentId: { type: string } }
+      required: [studentId]
+
+  - id: courses.search
+    description: Search the contracted university catalogue.
+    permission: allowed
+    input_schema:
+      type: object
+      properties:
+        query: { type: string }
+        country: { type: string }
+      required: [query]
+
+  - id: data.query
+    description: Read-only analytical query over CAMS (insights agent).
+    permission: allowed
+    input_schema:
+      type: object
+      properties: { question: { type: string } }
+      required: [question]
+
+  - id: visa.genuineness_check
+    description: Run the genuineness screening checklist for a visa case.
+    permission: allowed
+    input_schema:
+      type: object
+      properties: { studentId: { type: string } }
+      required: [studentId]
+
+  - id: application.file
+    description: >
+      File an application with a university on the student's behalf.
+      Side-effectful - always approval-gated.
+    permission: approval_required
+
+  - id: loan.prefile
+    description: Prefile an education loan with a lending partner. Approval-gated.
+    permission: approval_required
+
+triggers:
+  - { id: manual, type: manual, handler: main }
+
+approvals:
+  default: required_for_external_actions
+
+observability: { logs: true, traces: true, audit: true }

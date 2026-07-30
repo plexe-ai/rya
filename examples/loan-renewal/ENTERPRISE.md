@@ -13,8 +13,11 @@ ordered. Each item is scoped and independent.
 
 ## P0 - security and identity
 - [ ] HTTPS: CloudFront + ACM in front of the ALB; HTTP disabled. ~0.5d
-- [ ] Session-to-JWT bridge (X-Rya-User-Token) so every run and approval
-      records WHO acted - "approved by sarah@bbg.bank" in the audit trail. ~1d
+- [x] Session-to-JWT bridge: POST /v1/token exchanges a session for a
+      short-lived HS256 user JWT; the app sends it as X-Rya-User-Token, and
+      approvals record resolvedBy ("approved by sarah@bbg.bank") on the row,
+      the trace event, and the Approvals UI. RYA_REQUIRE_APPROVER_IDENTITY=1
+      (on in the production template) refuses anonymous key-only approvals.
 - [ ] Private subnets for tasks + VPC endpoints (Bedrock, S3, Secrets
       Manager) - document bytes never traverse public internet. ~1d
 - [ ] Bank IdP SSO (SAML/OIDC in front of /v1 auth). ~2d, needs bank input
@@ -36,9 +39,14 @@ ordered. Each item is scoped and independent.
       connections) + dashboard. ~0.5d
 
 ## P2 - operations
-- [ ] `rya deploy aws` one-command deploy (spec: the manual run of
-      2026-07-23; build+push+discover+stack+translate-errors+bootstrap). ~2d
-- [ ] Langfuse in the VPC (traces + eval scores for prod runs). ~0.5d
+- [x] `rya deploy aws` one-command deploy (preflight incl. live Bedrock probe,
+      build+push, VPC discovery, create/update stack with secret+network
+      preservation, root-cause failure translation, healthz smoke; plus
+      `deploy status` / `deploy destroy`). Verified against loan-renewal-live.
+- [x] Langfuse in the VPC: `rya deploy aws --langfuse` provisions the
+      {stack}-langfuse Fargate stack (web+worker+postgres+clickhouse+redis,
+      EFS + S3 via task role) and wires LANGFUSE_* into the app tasks.
+      Verified live: 8 eval traces + 28 scores in the in-VPC instance.
 - [ ] DR runbook: RDS restore drill, region-loss stance, key rotation. ~1d
 - [ ] Real bank integration: archive/LA tools -> `url:` HTTP tools against
       their systems, scoped credentials from connections. Sized with the bank.

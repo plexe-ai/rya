@@ -253,6 +253,17 @@ aside .foot .chip{justify-content:flex-start}
 .checkdraw path{stroke:var(--pos);stroke-width:2;fill:none;stroke-linecap:round;
   stroke-linejoin:round;stroke-dasharray:14;stroke-dashoffset:14;animation:draw .3s var(--ease) .55s forwards}
 @keyframes draw{to{stroke-dashoffset:0}}
+body.gate aside{display:none}
+body.gate .app{grid-template-columns:1fr}
+.gatewrap{flex:1;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.gatecard{width:380px;background:var(--surface);border:1px solid var(--line-2);
+  border-radius:12px;padding:36px 34px;animation:rise .3s var(--ease) both}
+.gatecard .gmark{width:40px;height:40px;border-radius:10px;background:var(--ink);color:#fff;
+  display:grid;place-items:center;font-weight:600;font-size:17px;margin-bottom:16px}
+.gatecard h1{font-size:19px;font-weight:700;letter-spacing:-.016em;color:var(--ink)}
+.gatecard .gs{font-size:13px;color:var(--ink-4);margin:4px 0 22px}
+.gatefoot{position:fixed;bottom:22px;left:0;right:0;text-align:center;
+  font-size:11.5px;color:var(--ink-4)}
 @media (max-width:960px){.app{grid-template-columns:1fr}aside{display:none}.work{grid-template-columns:1fr}.case{display:none}}
 </style>
 
@@ -291,7 +302,8 @@ function saveAuth(a){ auth = a;
   else localStorage.removeItem('rya.auth'); }
 async function apiFetch(path, opts = {}){
   opts.headers = Object.assign({}, opts.headers || {},
-    auth && auth.wsKey ? {'authorization': 'Bearer ' + auth.wsKey} : {});
+    auth && auth.wsKey ? {'authorization': 'Bearer ' + auth.wsKey} : {},
+    auth && auth.userToken ? {'x-rya-user-token': auth.userToken} : {});
   const r = await fetch(API + path, opts);
   if(r.status === 401){ saveAuth(null); location.hash = '#/login'; throw new Error('unauthorized'); }
   return r;
@@ -373,6 +385,7 @@ async function route(){
   if(state && state.polling){ clearInterval(state.polling); }
   state = null;
   const h = location.hash || '#/cases';
+  document.body.classList.remove('gate');
   if(!auth && h !== '#/login'){ location.hash = '#/login'; return loginView(); }
   if(h === '#/login') return loginView();
   if(h.startsWith('#/case/')) return caseView(decodeURIComponent(h.slice(7)));
@@ -401,20 +414,21 @@ async function v1(path, body, token){
 }
 function loginView(){
   nav(null);
-  $('view').innerHTML = `<div class="page" style="max-width:420px;display:flex;flex-direction:column;justify-content:center">
-    <div class="card" style="padding:28px">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-        <div class="mark">R</div>
-        <div style="font-size:16px;font-weight:700;letter-spacing:-.014em;color:var(--ink)">BBG Credit</div>
-      </div>
-      <div class="hint" style="margin:0 0 18px">Sign in to your renewals workspace.</div>
-      <div style="display:flex;flex-direction:column;gap:8px">
+  document.body.classList.add('gate');
+  $('view').innerHTML = `<div class="gatewrap">
+    <div class="gatecard">
+      <div class="gmark">R</div>
+      <h1>BBG Credit</h1>
+      <div class="gs">Sign in to the renewals workspace.</div>
+      <div style="display:flex;flex-direction:column;gap:9px">
         <div class="cbox"><input id="lemail" placeholder="work email" autocomplete="username"></div>
         <div class="cbox"><input id="lpass" type="password" placeholder="password" autocomplete="current-password"></div>
-        <button class="primary" id="loginBtn" style="justify-content:center">Sign in</button>
+        <button class="primary" id="loginBtn" style="justify-content:center;padding:11px">Sign in</button>
         <div class="hint" id="loginErr" style="margin:2px 0 0;text-align:center"></div>
       </div>
-    </div></div>`;
+    </div>
+    <div class="gatefoot">Durable cases on Rya - approvals stay human, every figure cites its source.</div>
+  </div>`;
   $('loginBtn').onclick = doLogin;
   $('lpass').addEventListener('keydown', e => { if(e.key === 'Enter') doLogin(); });
 }
@@ -425,8 +439,10 @@ async function doLogin(){
     const ws = res.workspaces[0];
     if(!ws) throw new Error('no workspace for this account');
     const key = await v1(`/workspaces/${ws.id}/keys`, {label: res.user.email}, res.token);
+    const ut = await v1('/token', {}, res.token).catch(() => null);
     saveAuth({token: res.token, email: res.user.email, userId: res.user.id,
-              wsId: ws.id, wsName: ws.name, wsKey: key.apiKey});
+              wsId: ws.id, wsName: ws.name, wsKey: key.apiKey,
+              userToken: ut ? ut.userToken : null});
     renderUserFoot();
     location.hash = '#/cases';
   }catch(e){ $('loginErr').textContent = e.message; $('loginBtn').disabled = false; }
@@ -481,7 +497,7 @@ async function approvalsView(){
   nav('nav-approvals');
   $('view').innerHTML = `<div class="page"><div class="pagehead">
       <div><h1>Approvals</h1><div class="sub">Human gates - nothing writes to the LA database until signed here or in the case.</div></div>
-    </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div></div>`;
+    </div><div class="listcard" id="aprList"><div class="listempty">Loading...</div></div><div id="aprSigned"></div></div>`;
   const render = async () => {
     try{
       const a = (await (await apiFetch(`/approvals?status=pending`)).json()).approvals || [];
@@ -499,6 +515,22 @@ async function approvalsView(){
           </div>
         </div>`).join('');
     }catch(e){ $('aprList').innerHTML = `<div class="listempty">Could not reach the agent.</div>`; }
+    try{
+      const done = [];
+      for(const s of ['approved', 'rejected'])
+        done.push(...((await (await apiFetch(`/approvals?status=${s}`)).json()).approvals || []));
+      done.sort((a, b) => (b.resolvedAt || '').localeCompare(a.resolvedAt || ''));
+      const rows = done.slice(0, 8).map(x => `
+        <div class="apr-row">
+          <div class="body"><div class="t">${escapeHtml(x.title)}</div>
+            <div class="prev">${x.status === 'approved' ? 'Approved' : 'Rejected'} by
+              ${escapeHtml(x.resolvedBy && x.resolvedBy.email ? x.resolvedBy.email : 'workspace key (pre-identity)')}
+              ${x.resolvedAt ? ' - ' + new Date(x.resolvedAt).toLocaleString() : ''}</div></div>
+          <div class="acts"><span class="badge ${x.status === 'approved' ? 'b-done' : 'b-fail'}">${x.status}</span></div>
+        </div>`).join('');
+      if(rows) $('aprSigned').innerHTML = `<h2 style="margin:22px 4px 10px">Signed</h2>
+        <div class="listcard">${rows}</div>`;
+    }catch(e){ /* audit strip is best-effort */ }
   };
   await render();
 }
@@ -931,6 +963,10 @@ async function guided(){
 }
 
 /* ================= boot ================= */
+if(auth && auth.token)
+  v1('/token', {}, auth.token)
+    .then(r => saveAuth(Object.assign({}, auth, {userToken: r.userToken})))
+    .catch(() => {});
 renderUserFoot();
 refreshBadge();
 listTimer = setInterval(refreshBadge, 6000);

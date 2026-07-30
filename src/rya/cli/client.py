@@ -126,8 +126,12 @@ def _load_agent(manifest, project_root: Path):
             hint="Fix the import/syntax error in the agent module.",
         )
     if not _DEFINED_AGENTS:
+        # The same code the platform's loader raises for this condition
+        # (`runtime/engine.py`), and the one `errors.py` registers as exit 3. The
+        # old `E_NO_AGENT` was undeclared, so it exited 1 — one condition must not
+        # report two codes depending on which side of the split noticed it.
         raise RyaError(
-            "E_NO_AGENT",
+            "E_AGENT_NOT_DEFINED",
             f"{manifest.entrypoint} defines no agent.",
             hint="Add `agent = define_agent()` at module scope.",
         )
@@ -178,6 +182,38 @@ def init(json: bool = typer.Option(False, "--json"), force: bool = typer.Option(
              lambda: console.print(f"[green]✓[/green] Initialized Rya project [bold]{name}[/bold] ({len(written)} files)"))
 
 
+def _check_project():
+    """The body of `rya check`, shared with `rya publish`.
+
+    Returns ``(root, manifest, agent, info)``. Factored out so publishing runs the
+    same validation the author sees rather than a second, drifting copy of it.
+    """
+    root, manifest = _project()
+    agent = _load_agent(manifest, root)
+    # Deliberately NOT checked here: whether every declared tool has an
+    # implementation. A tool is servable by an `@agent.tool`, by a `url:`, or by a
+    # platform BUILT-IN (web.fetch, http.request), and `tools/registry.py` is
+    # platform code this distribution does not ship — so the SDK cannot tell a
+    # built-in from a hole, and guessing would reject the scaffold's own template.
+    # The worker owns that check and refuses to start on a real gap
+    # (`worker.check_handler_set` -> E_HANDLER_SET_INCOMPLETE).
+    info = {
+        "agent": manifest.name,
+        "version": manifest.version,
+        "runtime": manifest.runtime,
+        "entrypoint": manifest.entrypoint,
+        "eventHandler": agent.event_handler() is not None,
+        "jobHandlers": sorted(agent._job_handlers),
+        "cronHandlers": sorted(agent._cron_handlers),
+        "toolHandlers": sorted(agent._tool_handlers),
+        "tools": [t.id for t in manifest.tools],
+        "models": [m.id for m in manifest.models],
+        "triggers": [t.id for t in manifest.triggers],
+        "ready": agent.event_handler() is not None,
+    }
+    return root, manifest, agent, info
+
+
 @app.command()
 def check(json: bool = typer.Option(False, "--json")):
     """Validate the manifest and the handler set, then exit (starts nothing).
@@ -189,22 +225,7 @@ def check(json: bool = typer.Option(False, "--json")):
     admission check, and it needs a store and a provider route to run at all.
     """
     with guard(json):
-        root, manifest = _project()
-        agent = _load_agent(manifest, root)
-        info = {
-            "agent": manifest.name,
-            "version": manifest.version,
-            "runtime": manifest.runtime,
-            "entrypoint": manifest.entrypoint,
-            "eventHandler": agent.event_handler() is not None,
-            "jobHandlers": sorted(agent._job_handlers),
-            "cronHandlers": sorted(agent._cron_handlers),
-            "toolHandlers": sorted(agent._tool_handlers),
-            "tools": [t.id for t in manifest.tools],
-            "models": [m.id for m in manifest.models],
-            "triggers": [t.id for t in manifest.triggers],
-            "ready": agent.event_handler() is not None,
-        }
+        _, manifest, _, info = _check_project()
 
         def render():
             console.print(f"[green]✓[/green] [bold]{manifest.name}[/bold] v{manifest.version} ({manifest.runtime})")
@@ -240,6 +261,107 @@ def bundle(
                                     f"({b.fileCount} files, {b.sizeBytes} bytes, sdk {b.sdkVersion})"),
                       console.print(f"  archive: {payload['archive']}" if out is not None else
                                     "  pass --out to pack the archive")))
+
+
+def _kv(spec: Optional[str]) -> dict:
+    """Parse `k=v,k=v` — the provenance slot on a version.
+
+    A four-line copy of `cli/main.py:_kv`, for the reason given at the top of the
+    output helpers: importing the operator CLI is the one thing this module exists
+    to avoid.
+    """
+    out = {}
+    for part in (spec or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+@app.command()
+def publish(
+    env: Optional[str] = typer.Option(None, "--env", help="Promote into this environment (dev | staging | prod)."),
+    promote_it: bool = typer.Option(True, "--promote/--no-promote",
+                                    help="With --env: also flip the environment's current-version pointer."),
+    actor: Optional[str] = typer.Option(None, "--actor", help="Who is publishing (recorded on the version)."),
+    metadata: Optional[str] = typer.Option(None, "--metadata",
+                                           help="Provenance as k=v,k=v — e.g. gitSha=abc,ci=run/42."),
+    url: Optional[str] = typer.Option(None, "--url", help="Deployment URL (default: the one you logged in to)."),
+    key: Optional[str] = typer.Option(None, "--key", help="API key (default: the stored one)."),
+    skip_check: bool = typer.Option(False, "--skip-check", help="Upload without validating locally first."),
+    json: bool = typer.Option(False, "--json"),
+    non_interactive: bool = typer.Option(False, "--non-interactive",
+                                         help="Never prompt (accepted for contract parity; this command never prompts)."),
+):
+    """Upload this project to a deployment as a new immutable version.
+
+    The §9 pipeline from a client repo: validate, content-hash, upload, and
+    optionally flip the environment pointer — over HTTP, so nothing here needs
+    database or bucket credentials. `rya deploy --env` is the same pipeline run
+    locally by an operator who already has both.
+
+    Local validation is `rya check`-level (manifest + handler set). The
+    *production readiness* gate is platform code and is not in this
+    distribution, so the platform does not receive a readiness attestation on
+    this path and an environment whose gate requires one will refuse the
+    promotion — the response says so.
+    """
+    with guard(json):
+        import tempfile
+
+        from .. import bundles
+        from ..cloud import RemoteClient, load_cloud_config
+
+        cfg = load_cloud_config() or {}
+        target = (url or cfg.get("cloudUrl") or "").rstrip("/")
+        api_key = key or cfg.get("apiKey")
+        if not target:
+            raise RyaError(
+                "E_VALIDATION",
+                "No deployment URL: not logged in and --url was not given.",
+                hint="Run `rya login <url> --key rya_sk_…`, or set RYA_REMOTE_URL / RYA_API_KEY.",
+            )
+
+        root, manifest, _, info = _check_project()
+        if not skip_check and not info["eventHandler"]:
+            raise RyaError(
+                "E_NO_EVENT_HANDLER",
+                "No @agent.on_event handler is registered, so this bundle cannot serve a run.",
+                hint="Add an `@agent.on_event` handler, or pass --skip-check to publish anyway.",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="rya-publish-") as td:
+            b = bundles.build_bundle(root)
+            archive = bundles.pack(b, Path(td) / f"{b.hash}.tar.gz")
+            payload = archive.read_bytes()
+
+        # Recorded as provenance, not as evidence: the platform cannot verify a
+        # check it did not run, and a field that *looked* like an attestation
+        # would undermine the one thing gates guarantee.
+        meta = {**_kv(metadata), "check": "skipped" if skip_check else "passed",
+                "checkSdk": __version__}
+        result = RemoteClient(target, api_key).publish(
+            manifest.name, payload, hash=b.hash, env=env, promote=promote_it,
+            actor=actor, metadata=meta)
+
+        out = {"url": target, **(result or {})}
+
+        def render():
+            console.print(f"[green]✓[/green] {manifest.name} → [bold]{target}[/bold]")
+            console.print(f"  version: {out.get('versionId')}  ({b.hash[:12]}…)")
+            console.print(f"  bundle:  {b.fileCount} files, {b.sizeBytes} bytes, sdk {b.sdkVersion}")
+            console.print(f"  archive: {out.get('archive')}")
+            if out.get("promoted"):
+                console.print(f"  promoted — new runs in {env} use this version; "
+                              "in-flight runs finish on theirs")
+            elif env:
+                console.print(f"  recorded but NOT promoted into {env}")
+            else:
+                console.print("  recorded — pass --env to promote it")
+            if out.get("attested") is False:
+                console.print("  [yellow]readiness not attested[/yellow] — the control plane does not "
+                              "import bundles; a gate requiring readiness will refuse this version")
+        emit(json, out, render)
 
 
 # --------------------------------------------------------------------------

@@ -108,3 +108,119 @@ def test_login_and_drive_hosted_agent_end_to_end(tmp_path, monkeypatch):
     finally:
         server.should_exit = True
         t.join(timeout=5)
+
+
+def test_publish_over_http_end_to_end(tmp_path, monkeypatch):
+    """`rya publish` against a real control plane: the whole point of the HTTP
+    path is that a client repo ships code with no database or bucket access."""
+    import uvicorn
+
+    from rya import bundles
+    from rya.api.app import build_app
+    from rya.store import open_store
+
+    for k in ("RYA_TOKEN", "RYA_MULTITENANT", "RYA_DATABASE_URL", "RYA_JWT_SECRET",
+              "RYA_REMOTE_URL", "RYA_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RYA_HOME", str(tmp_path / "home"))
+    # The endpoint refuses to publish to an unauthenticated control plane.
+    monkeypatch.setenv("RYA_ALLOW_UNAUTHENTICATED_PUBLISH", "1")
+
+    served = tmp_path / "platform"
+    scaffold.write_project(served, "hosted", template="minimal")
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(build_app(served), host="127.0.0.1",
+                                           port=port, log_level="warning", lifespan="on"))
+    t = threading.Thread(target=server.run, daemon=True); t.start()
+    for _ in range(200):
+        if server.started:
+            break
+        time.sleep(0.05)
+    assert server.started
+    url = f"http://127.0.0.1:{port}"
+
+    # A separate tree, as a client repo would be.
+    client_repo = tmp_path / "clientrepo"
+    scaffold.write_project(client_repo, "hosted", template="minimal")
+    expected = bundles.build_bundle(client_repo).hash
+
+    try:
+        monkeypatch.chdir(client_repo)
+        r = runner.invoke(cli, ["publish", "--url", url, "--env", "prod",
+                                "--actor", "ada@example.com",
+                                "--metadata", "gitSha=deadbee", "--json"])
+        assert r.exit_code == 0, r.stdout
+        out = _out(r)
+        assert out["ok"] is True
+        assert out["bundleHash"] == expected      # client hash == recorded hash
+        assert out["promoted"] is True and out["environment"] == "prod"
+        assert out["attested"] is False           # honest about what HTTP cannot do
+
+        version = open_store(served).version_get(out["versionId"])
+        assert version["bundleHash"] == expected
+        assert version["metadata"]["gitSha"] == "deadbee"
+        assert version["metadata"]["check"] == "passed"
+
+        # The artifact is where the worker will look for it.
+        assert bundles.bundle_archive_path(
+            expected, bundles.default_archive_root(served)).is_file()
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_publish_without_a_url_or_login_is_a_validation_error(tmp_path, monkeypatch):
+    for k in ("RYA_REMOTE_URL", "RYA_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RYA_HOME", str(tmp_path / "home"))
+    project = tmp_path / "agent"
+    scaffold.write_project(project, "nowhere", template="minimal")
+    monkeypatch.chdir(project)
+
+    r = runner.invoke(cli, ["publish", "--json"])
+    assert r.exit_code != 0
+    out = _out(r)
+    assert out["error"]["code"] == "E_VALIDATION"
+    assert "rya login" in out["error"]["hint"]
+
+
+def test_the_server_error_code_survives_the_network(monkeypatch):
+    """A hash mismatch must not reach the caller as "HTTP 409": the stable error
+    codes are the CLI's contract, and collapsing them at the boundary would make
+    "the bucket is down" indistinguishable from "your artifact changed"."""
+    import urllib.error
+
+    from rya.errors import RyaError
+
+    body = _json.dumps({"detail": {"code": "E_BUNDLE_MISMATCH", "message": "no match",
+                                   "hint": "re-bundle"}}).encode()
+
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 409, "Conflict", {}, __import__("io").BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    client = cloud.RemoteClient("http://example.invalid", "k")
+    try:
+        client.publish("a", b"x", hash="0" * 64)
+        raise AssertionError("expected a RyaError")
+    except RyaError as e:
+        assert e.code == "E_BUNDLE_MISMATCH"
+        assert e.message == "no match" and e.hint == "re-bundle"
+
+
+def test_a_non_rya_error_body_still_maps_to_e_remote(monkeypatch):
+    """A proxy's HTML 413 carries no Rya code, so the old behaviour must hold."""
+    import urllib.error
+
+    from rya.errors import RyaError
+
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 413, "Too Large", {},
+                                     __import__("io").BytesIO(b"<html>too big</html>"))
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    try:
+        cloud.RemoteClient("http://example.invalid").publish("a", b"x", hash="0" * 64)
+        raise AssertionError("expected a RyaError")
+    except RyaError as e:
+        assert e.code == "E_REMOTE" and "413" in e.message

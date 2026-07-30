@@ -533,6 +533,28 @@ def _deploy_bundle(*, env: str, promote_it: bool, actor: Optional[str],
         emit(json, data, render)
 
 
+# Commands DEFINED in the client CLI, re-registered here so they do not disappear
+# from `rya-server`.
+#
+# Both distributions own the `rya` console script, and the recommended local dev
+# loop is an editable install of this one — which replaces the thin SDK and
+# repoints the script at this module. A command that lived only in
+# `cli/client.py` would vanish the moment a developer dev-linked their agent repo
+# against a local checkout, which is precisely when they are running it most.
+#
+#   publish  the §9 pipeline over HTTP, for a repo with no database or bucket
+#            access. `deploy --env` is the same pipeline run locally.
+#   check    manifest + handler set. `dev --check` is the operator equivalent, but
+#            it starts a server; this one starts nothing and is what CI runs.
+#
+# main.py -> client.py is platform -> SDK, the direction the boundary test allows.
+from .client import check as _check_cmd  # noqa: E402
+from .client import publish as _publish_cmd  # noqa: E402
+
+app.command(name="publish")(_publish_cmd)
+app.command(name="check")(_check_cmd)
+
+
 @app.command()
 def promote(env: str = typer.Option(..., "--env", help="Environment to point at this version."),
             version: str = typer.Option(..., "--version", help="Version id to promote."),

@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import platform
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -424,6 +425,9 @@ def build_app(root: Path) -> FastAPI:
         "E_VERSION_NOT_FOUND": 404,
         "E_RUN_NOT_FOUND": 404,
         "E_VALIDATION": 400,
+        "E_BUNDLE_MISMATCH": 409,
+        "E_BUNDLE_NOT_FOUND": 404,
+        "E_BUNDLE_STORE": 503,        # the operator's bucket, not the caller's request
     }
 
     @api.exception_handler(RyaError)
@@ -1470,12 +1474,167 @@ def build_app(root: Path) -> FastAPI:
         status = {"E_VERSION_NOT_FOUND": 404, "E_ENVIRONMENT_NOT_FOUND": 404,
                   "E_VERSION_IN_USE": 409, "E_VERSION_RETIRED": 409,
                   "E_BUNDLE_MISMATCH": 409,
+                  # 503, not 400: the caller's request was fine and the operator's
+                  # bucket is not. Telling a publisher to fix its request would
+                  # send it in exactly the wrong direction.
+                  "E_BUNDLE_STORE": 503, "E_BUNDLE_NOT_FOUND": 404,
                   # 422: the request is well-formed and the version exists — it is
                   # the version's *evidence* that does not satisfy the gate. A 403
                   # would say "you may not do this"; the caller may, once the
                   # requirements are met.
                   "E_PROMOTION_BLOCKED": 422}.get(e.code, 400)
         return HTTPException(status_code=status, detail=e.to_dict()["error"])
+
+    @api.post("/agents/{agent_id}/versions")
+    async def publish_version_ep(agent_id: str, request: Request,
+                                 engine: Engine = Depends(get_engine),
+                                 authorization: Optional[str] = Header(None),
+                                 x_rya_token: Optional[str] = Header(None)):
+        """Upload a packed bundle as a new immutable version. The §9 pipeline over
+        HTTP: `rya deploy --env` without needing the database or the bucket.
+
+        Body: the raw ``.tar.gz`` from ``bundles.pack``. Query: ``hash``
+        (required, the client's content hash), ``env``, ``promote``, ``actor``,
+        and repeatable ``meta.<key>=<value>`` provenance — the same shape as
+        ``POST /files``.
+
+        **This never imports the bundle** (D13): the control plane must not run
+        tenant code, so it verifies bytes, records a version, and flips a pointer.
+        The consequence is that readiness is NOT evaluated and no readiness
+        attestation is filed — the response says so, and an environment whose gate
+        requires readiness will refuse the promotion.
+        """
+        from .. import bundles, gates
+
+        # An open control plane means anonymous code upload to a box whose worker
+        # imports it — categorically worse than the read/write routes that are
+        # also open in dev mode, so this one refuses rather than shrugging.
+        if not auth_enabled() and os.environ.get("RYA_ALLOW_UNAUTHENTICATED_PUBLISH") != "1":
+            raise HTTPException(status_code=403, detail={
+                "code": "E_UNAUTHORIZED",
+                "message": "Publishing is disabled while the control plane is unauthenticated.",
+                "hint": "Set RYA_TOKEN (generate one with `rya token`), or set "
+                        "RYA_ALLOW_UNAUTHENTICATED_PUBLISH=1 for a local-only loop."})
+
+        claimed = (request.query_params.get("hash") or "").strip().lower()
+        if not claimed:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "query param 'hash' is required.",
+                "hint": "Send the hash from `rya bundle --json`; the platform rebuilds and compares it."})
+
+        max_bytes = int(os.environ.get("RYA_MAX_BUNDLE_BYTES", str(20 * 1024 * 1024)))
+        content = await request.body()
+        if not content:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "request body is empty",
+                "hint": "POST the bundle archive as the raw body with content-type application/gzip."})
+        if len(content) > max_bytes:
+            raise HTTPException(status_code=413, detail={
+                "code": "E_VALIDATION",
+                "message": f"bundle exceeds {max_bytes} bytes",
+                "hint": "Trim the project with a `.ryaignore`, or raise RYA_MAX_BUNDLE_BYTES."})
+
+        meta = {k[5:]: v for k, v in request.query_params.items() if k.startswith("meta.")}
+        env_name = (request.query_params.get("env") or "").strip() or None
+        promote_it = (request.query_params.get("promote", "true").lower() != "false")
+        actor = (request.query_params.get("actor") or "").strip() or _actor(authorization, x_rya_token)
+
+        with tempfile.TemporaryDirectory(prefix="rya-publish-") as td:
+            tmp = Path(td)
+            archive = tmp / "upload.tar.gz"
+            archive.write_bytes(content)
+            unpacked = tmp / "tree"
+            try:
+                # Rebuild the hash from the bytes we received rather than trusting
+                # the sidecar: D12's whole point is that the CONTENT proves the
+                # version. This is `bundles.verify` inlined — it is unpack + build
+                # + compare — so the tree is not extracted twice.
+                bundles.unpack(archive, unpacked, max_total_bytes=max_bytes * 20)
+                rebuilt = bundles.build_bundle(unpacked)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+            if rebuilt.hash != claimed:
+                raise _dep_err(_hash_mismatch(rebuilt, claimed, unpacked))
+
+            # `agent_id` in these paths is decorative everywhere else (each handler
+            # resolves manifest.name), and a version filed under a name this
+            # deployment does not serve would be listed by nothing and run by
+            # nobody. So it is checked here instead of ignored.
+            declared = str((rebuilt.manifest or {}).get("name") or "")
+            if agent_id != manifest.name or declared != manifest.name:
+                raise HTTPException(status_code=400, detail={
+                    "code": "E_VALIDATION",
+                    "message": f"Bundle declares agent '{declared or '?'}' and the path says "
+                               f"'{agent_id}', but this deployment serves '{manifest.name}'.",
+                    "hint": f"Publish to /agents/{manifest.name}/versions from a project whose "
+                            f"rya.agent.yaml has `name: {manifest.name}`."})
+
+            try:
+                archive_store = bundles.resolve_bundle_store(root)
+                stored = bundles.store_bundle(rebuilt, archive_store)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+            try:
+                version = _deployments().create_version(
+                    engine.store, agent=manifest.name, bundle=rebuilt, actor=actor,
+                    metadata={**meta, "publishedVia": "http"})
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+        gate_result = None
+        if env_name and promote_it:
+            try:
+                gate_result = gates.check_promotion(engine.store, version=version,
+                                                   environment=env_name, actor=actor)
+                _deployments().promote(engine.store, environment=env_name, agent=manifest.name,
+                                       version_id=version["id"], actor=actor)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+        return {
+            "ok": True, "agent": manifest.name, "versionId": version["id"],
+            "bundleHash": rebuilt.hash, "fileCount": rebuilt.fileCount,
+            "sizeBytes": rebuilt.sizeBytes, "sdkVersion": rebuilt.sdkVersion,
+            "lockfile": rebuilt.lockfile, "archive": str(stored),
+            "environment": env_name, "promoted": bool(env_name and promote_it),
+            **({"gate": gate_result.to_dict()} if gate_result else {}),
+            # Stated, not implied: the one thing `rya deploy --env` does that this
+            # path cannot.
+            "attested": False, "notAttested": ["readiness"],
+            "note": "Readiness was not evaluated: the control plane does not import bundles. "
+                    "A gate requiring readiness will refuse this version.",
+        }
+
+    def _hash_mismatch(rebuilt, claimed: str, unpacked: Path) -> RyaError:
+        """E_BUNDLE_MISMATCH, with the SDK-skew case named.
+
+        `content_hash` folds the SDK version into the digest, so a client and a
+        platform on different `rya` versions disagree about the hash of BYTE
+        IDENTICAL trees. The generic "the artifact was modified" message would
+        send an operator hunting for tampering that never happened.
+        """
+        base = (f"Bundle content hash {rebuilt.hash[:12]} does not match the "
+                f"claimed {claimed[:12]}.")
+        from ..bundles import BUNDLE_META_NAME
+
+        try:
+            sidecar = json.loads((unpacked / BUNDLE_META_NAME).read_text())
+            client_sdk = str(sidecar.get("sdkVersion") or "")
+        except (OSError, json.JSONDecodeError, ValueError):
+            client_sdk = ""
+        if client_sdk and client_sdk != rebuilt.sdkVersion:
+            return RyaError(
+                "E_BUNDLE_MISMATCH",
+                f"{base} The client built it with rya SDK {client_sdk} and this "
+                f"platform runs {rebuilt.sdkVersion}.",
+                hint="The content hash includes the SDK version, so the same files hash "
+                     "differently across SDK versions. Align them and re-publish.")
+        return RyaError(
+            "E_BUNDLE_MISMATCH", base,
+            hint="The upload does not match the hash it claimed — re-run `rya bundle` and "
+                 "publish again rather than editing an artifact in flight.")
 
     @api.get("/agents/{agent_id}/versions")
     def list_versions_ep(agent_id: str, state: Optional[str] = None,

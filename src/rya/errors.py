@@ -45,6 +45,10 @@ _CODE_EXIT = {
     "E_QUEUE_CONFLICT": EXIT_STATE,
     "E_MODEL_ROUTE_NOT_FOUND": EXIT_NOT_FOUND,
     "E_GROUNDING_BLOCKED": EXIT_PERMISSION,
+    # The Action Guard's egress allowlist refused the request. Its sibling above
+    # was declared and this one was not, so a policy refusal exited 1 and read as
+    # a crash to anything branching on the code.
+    "E_EGRESS_BLOCKED": EXIT_PERMISSION,
     "E_VALIDATION": EXIT_VALIDATION,
     "E_NOT_PRODUCTION_READY": EXIT_VALIDATION,
     "E_UNAUTHORIZED": EXIT_PERMISSION,
@@ -85,6 +89,10 @@ _CODE_EXIT = {
     # Distinct from E_BUNDLE_NOT_FOUND: the artifact may well exist, we cannot
     # reach the place it lives, and the operator fix is different.
     "E_BUNDLE_STORE": EXIT_GENERIC,
+    # A bundle with no @agent.on_event cannot serve a run. Raised as a readiness
+    # block and by `rya publish`; undeclared it fell through to EXIT_GENERIC, so a
+    # refusal to ship looked like a crash to anything branching on the exit code.
+    "E_NO_EVENT_HANDLER": EXIT_VALIDATION,
 }
 
 

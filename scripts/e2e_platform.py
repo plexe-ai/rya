@@ -687,7 +687,7 @@ def main() -> int:
     try:
         sdk, server = phase_wheels(h)
         client_venv = phase_client(h, sdk)
-        _proj, client_hash = phase_author(h, client_venv)
+        client_hash = phase_author(h, client_venv)[1]
         server_venv = phase_platform_env(h, server)
         dep = phase_handoff(h, server_venv, h.dir / "handoff/refund-agent.tar.gz", client_hash)
         version = phase_pipeline(h, server_venv, dep, client_hash)

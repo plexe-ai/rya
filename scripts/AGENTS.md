@@ -6,7 +6,9 @@ Operational scripts that are not part of either shipped distribution.
   `rya` SDK runs on the platform. Builds both wheels, installs them into two
   separate virtualenvs, authors an agent in the client one, hands the platform a
   content-hashed bundle, admits it through a promotion gate, and executes it
-  across an `api` + `worker` pair with a durable human pause.
+  across an `api` + `worker` pair with a durable human pause. `phase_publish` then
+  ships the same tree the *other* way — `rya publish` over HTTP from the SDK-only
+  venv — and asserts both paths resolve to the same version id.
 
 ## Running the e2e
 

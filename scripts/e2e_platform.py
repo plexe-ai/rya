@@ -12,6 +12,13 @@ never imports the runtime, and the platform never reads the client's source tree
 -- it works from the bundle archive alone. If the SDK boundary regressed, or the
 client's content hash stopped matching the server's, this fails.
 
+The handoff is proved twice, on purpose. ``phase_handoff``/``phase_pipeline`` cover
+the operator path (``rya deploy --env``, local database and bucket access), and
+``phase_publish`` covers the client path (``rya publish`` over HTTP, from the
+SDK-only venv). They must agree on the content address -- publishing the tree an
+operator already deployed has to return that same version id, or the hash is a
+label rather than an address.
+
 Run it:
 
     python scripts/e2e_platform.py                # hermetic: offline mock model
@@ -534,6 +541,102 @@ def phase_processes(h: Harness, venv: Path, dep: Path, version: str) -> None:
             f"{w.get('coldStartMs')}ms (target <2000)")
 
 
+def _last_json(stdout: str) -> dict | None:
+    """The last JSON object a `--json` command printed.
+
+    Scanning backwards rather than taking the last line: a failing command prints
+    its error object after any other output, and `guard()` writes it to stdout too.
+    """
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def phase_publish(h: Harness, client_venv: Path, proj: Path, version: str) -> None:
+    """`rya publish` from the SDK-ONLY venv against the running control plane.
+
+    This is the only place in the repo where a venv proven unable to import
+    `rya.worker` (phase_client) ships code to a real platform, which is the whole
+    claim of the HTTP publish path: a client repo needs a URL and a key, not
+    database or bucket credentials.
+
+    The load-bearing assertion is idempotency against the CLI pipeline. Publishing
+    the SAME tree the operator already deployed with `rya deploy --env` must return
+    the SAME version id — the two paths agree on the content address, or the hash
+    is a label rather than an address.
+    """
+    h.head("Publish over HTTP from the client SDK")
+
+    code, res = h.http("GET", "/agents/refund-agent/versions")
+    before = {v["id"] for v in (res.get("versions") or [])}
+
+    unauth = h.run([client_venv / "bin/rya", "publish", "--url", BASE,
+                    "--env", "prod", "--no-promote", "--json"],
+                   proj, check=False)
+    payload = _last_json(unauth.stdout) or {}
+    h.check("unauthenticated publish refused",
+            unauth.returncode != 0 and
+            (payload.get("error") or {}).get("code") == "E_UNAUTHORIZED",
+            (payload.get("error") or {}).get("code") or unauth.stdout[-160:])
+
+    ok = h.run([client_venv / "bin/rya", "publish", "--url", BASE, "--key", TOKEN,
+                "--env", "prod", "--no-promote",
+                "--actor", "ada@example.com", "--metadata", "ci=e2e", "--json"],
+               proj, check=False)
+    out = _last_json(ok.stdout) or {}
+    h.check("client publishes with only the SDK installed",
+            ok.returncode == 0 and out.get("ok") is True,
+            out.get("error", {}).get("code") if ok.returncode else "uploaded")
+    h.check("the platform recorded the client's exact hash",
+            out.get("bundleHash") == h.state["hash"],
+            f"{str(out.get('bundleHash'))[:12]}… == {h.state['hash'][:12]}…")
+    h.check("HTTP publish and `rya deploy` agree on the content address",
+            out.get("versionId") == version and out.get("versionId") in before,
+            f"{out.get('versionId')} (deploy made {version})")
+    h.check("the archive is addressable in the bundle store",
+            str(out.get("archive", "")).endswith(f"{h.state['hash']}.tar.gz"),
+            str(out.get("archive"))[-52:])
+    h.check("publish admits it cannot attest readiness",
+            out.get("attested") is False and out.get("notAttested") == ["readiness"],
+            f"attested={out.get('attested')}")
+
+    # A gate that demands readiness must refuse a version published this way — the
+    # honest consequence, asserted rather than described.
+    #
+    # This needs NEW content. The publish above returned the version `rya deploy
+    # --env prod` already created (that is the idempotency just asserted), and that
+    # version carries a readiness attestation from the CLI path — so gating on it
+    # would pass for a legitimate reason and prove nothing.
+    code, _gate = h.http("PUT", "/gate", {"environments": {"staging": {"requireReadiness": True}}})
+    if h.check("readiness gate configured for staging", code == 200, f"HTTP {code}"):
+        entry = proj / "src/agent.py"
+        original = entry.read_text()
+        entry.write_text(original + "\n# a later edit: new content, new version\n")
+        try:
+            blocked = h.run([client_venv / "bin/rya", "publish", "--url", BASE, "--key", TOKEN,
+                             "--env", "staging", "--json"], proj, check=False)
+            err = (_last_json(blocked.stdout) or {}).get("error") or {}
+            h.check("a readiness gate blocks an unattested HTTP publish",
+                    err.get("code") == "E_PROMOTION_BLOCKED",
+                    err.get("code") or "promoted with no readiness evidence")
+            # The version is still RECORDED — only the pointer flip is refused, so
+            # the artifact is there for `rya eval --attest` to make promotable.
+            recorded = h.run([client_venv / "bin/rya", "publish", "--url", BASE, "--key", TOKEN,
+                              "--json"], proj, check=False)
+            out2 = _last_json(recorded.stdout) or {}
+            h.check("the unattested version is still recorded, just not promoted",
+                    out2.get("ok") is True and out2.get("versionId") != version,
+                    f"{out2.get('versionId')} != {version}")
+        finally:
+            entry.write_text(original)
+            h.http("PUT", "/gate", {"environments": {}})
+
+
 def phase_run(h: Harness, version: str) -> str:
     h.head("Run it: SDK-free HTTP caller -> queue -> worker")
     code, res = h.http("POST", "/agents/refund-agent/turns",
@@ -687,11 +790,12 @@ def main() -> int:
     try:
         sdk, server = phase_wheels(h)
         client_venv = phase_client(h, sdk)
-        client_hash = phase_author(h, client_venv)[1]
+        client_proj, client_hash = phase_author(h, client_venv)
         server_venv = phase_platform_env(h, server)
         dep = phase_handoff(h, server_venv, h.dir / "handoff/refund-agent.tar.gz", client_hash)
         version = phase_pipeline(h, server_venv, dep, client_hash)
         phase_processes(h, server_venv, dep, version)
+        phase_publish(h, client_venv, client_proj, version)
         run_id = phase_run(h, version)
         phase_durability(h, server_venv, dep, run_id)
         phase_isolation(h, version)

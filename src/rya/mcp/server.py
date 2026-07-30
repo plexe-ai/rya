@@ -120,7 +120,12 @@ def rya_validate_manifest(project_dir: Optional[str] = None) -> dict:
 
 @mcp.tool()
 def rya_deploy_agent(project_dir: Optional[str] = None) -> dict:
-    """Validate and produce a deploy plan. (Hosted deploy is a later milestone.)"""
+    """Validate the project and report a deploy plan. Ships NOTHING.
+
+    Deliberately not a deploy: `rya deploy --env` and `rya publish` record an
+    immutable version and can flip an environment pointer, and a coding agent
+    should not do that without a human running the command. Run those in a shell.
+    """
     return ops.deploy_agent(project_dir)
 
 

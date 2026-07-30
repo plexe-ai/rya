@@ -307,8 +307,14 @@ def check_promotion(store, *, version: Mapping[str, Any], environment: str,
             checks.append(_check(
                 "readiness", False,
                 f"No readiness attestation for version {version_id}.",
-                "Run `rya deploy --env <staging> --actor you` (which attests on record) or "
-                f"`rya attest readiness --version {version_id}`.",
+                # Deliberately names only what exists. `rya publish` reaches this
+                # check often — the control plane cannot import a bundle, so it
+                # cannot evaluate readiness and files nothing — and there is no
+                # out-of-band `rya attest` command to point at.
+                "Run `rya deploy --env <name> --actor you` from a machine with store "
+                "access; it evaluates readiness and files the attestation. A version "
+                "published over HTTP carries no readiness evidence and cannot be "
+                "promoted into a readiness-gated environment.",
             ))
         elif att.get("bundleHash") and att.get("bundleHash") != version.get("bundleHash"):
             # Should be unreachable — attestations are keyed by version id and a

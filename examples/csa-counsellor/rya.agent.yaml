@@ -2,7 +2,6 @@ name: csa-counsellor
 runtime: python
 entrypoint: src/agent.py
 version: 0.1.0
-environment: local
 owner: platform@chatstudyabroad
 instructions: >
   ChatStudyAbroad's counsellor agent, represented on Rya. The tool registry

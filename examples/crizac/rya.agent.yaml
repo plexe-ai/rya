@@ -10,7 +10,6 @@ runtime: python
 entrypoint: src/agent.py
 version: 0.1.0
 owner: crizac-platform
-environment: production
 instructions: >
   Serve Crizac's education journey end to end: search and shortlist courses,
   answer questions grounded in CAMS data, screen applications, and file them.

@@ -70,6 +70,11 @@ Handlers receive a context exposing every primitive:
 | `ctx.traces.event(name, data)` | Custom trace spans |
 | `ctx.secrets.get(name)` | Secret values (never persisted/traced) |
 | `ctx.events.emit(type, payload)` | Emit an event |
+| `ctx.knowledge.add/search/documents` | RAG: ingest → chunk → embed → retrieve |
+| `ctx.sessions.get_or_create/append/history/get/search` | Durable chat sessions |
+| `ctx.files.get/list/read/as_document` | Uploaded files; `as_document` feeds knowledge |
+| `ctx.connections.get/secret/list/upsert` | Scoped per-user credentials (see `secret()`'s caveat) |
+| `ctx.guard.check_grounding/scrub/check_secrecy` | Grounding gate, id-secrecy scrub |
 
 ## Tool permissions
 
@@ -133,6 +138,66 @@ a tool's permission NOW, without a redeploy - versioned, append-only history,
 reflected in `GET /tools` as `effectivePermission`, enforced on the next call
 and removed from the `ctx.llm.run` loop immediately. `{"clear": true}` reverts
 to the manifest. Unreadable runtime config fails closed.
+
+## Versions & environments: deployment as a primitive
+
+Shipping is a primitive here, not a script around one. A **version** is an
+immutable, content-hashed bundle of the project; an **environment** (`dev` |
+`staging` | `prod`) is a named pointer at one version. Promotion is the pointer
+flip, and rollback is the same flip backwards.
+
+`POST /agents/{id}/versions` is the publish path — the pipeline over HTTP, so a
+repo with no database and no bucket credentials can ship:
+
+- Body is the raw `.tar.gz` from `bundles.pack`, content-type `application/gzip`.
+  The scalars ride in the query string (same shape as `POST /files`): `hash`
+  (**required**), `env`, `promote`, `actor`, and repeatable `meta.<key>=<value>`
+  provenance.
+- The claimed `hash` is **checked, not trusted**. The platform unpacks the bytes
+  it received and rebuilds the content hash with the same code the client used; a
+  disagreement is `E_BUNDLE_MISMATCH` (409). The content is what proves the
+  version, so a label on the side proves nothing. The hash folds in the SDK
+  version, so the mismatch message names SDK skew when that is the cause rather
+  than implying tampering.
+- Over `RYA_MAX_BUNDLE_BYTES` (default 20 MB) is a 413 before any unpacking.
+- A bundle whose manifest `name` — or whose path segment — is not the agent this
+  deployment serves is a 400. A version filed under a name nothing lists and
+  nobody runs is worse than a refusal.
+- **It never imports the bundle.** The control plane does not run tenant code, so
+  readiness is not evaluated and no readiness attestation is filed. The response
+  says so out loud: `"attested": false, "notAttested": ["readiness"]`, plus a
+  `note`. An environment whose gate requires readiness will refuse the promotion —
+  attest separately (`rya eval --attest`) or deploy from an operator host.
+- Publishing is **refused entirely** while the control plane is unauthenticated,
+  unless `RYA_ALLOW_UNAUTHENTICATED_PUBLISH=1` (403 `E_UNAUTHORIZED`). An open
+  control plane means anonymous code upload to a box whose worker imports it —
+  categorically worse than the read/write routes dev mode also leaves open, so
+  this one fails closed instead of shrugging.
+
+The rest of the surface:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /agents/{id}/versions` | Versions, newest first; `?state=active\|retired` |
+| `GET /versions/{id}` | One version: hash, file count, SDK version, lockfile, provenance |
+| `GET /versions/{id}/pinned-runs` | What blocks a retire: the non-terminal runs still pinned |
+| `GET /versions/{id}/runs` | Every run that ever ran on this version, terminal ones included |
+| `POST /versions/{id}/retire` | No new runs, no promotion, artifact retained. `E_VERSION_IN_USE` while it is a pointer or has live pinned runs; `{"force": true}` is the operator override |
+| `GET /agents/{id}/environments` | Every environment and the version it points at |
+| `GET /agents/{id}/environments/{env}` | One in full: current version, history, versions retained by pinned runs |
+| `POST /agents/{id}/environments/{env}/promote` | Flip the pointer to `{"versionId"}`. `E_PROMOTION_BLOCKED` (422) if the gate is unsatisfied |
+| `POST /agents/{id}/environments/{env}/rollback` | Flip back; defaults to the previous version in history |
+| `GET /agents/{id}/environments/{env}/history` | The promote/rollback audit trail, newest first |
+| `GET /gate`, `PUT /gate`, `GET /gate/check` | What an environment requires before it accepts a version — a server-side admission check, not a client-side courtesy |
+
+Promotion is atomic per environment because it is only a pointer: **new runs get
+the new version, in-flight runs finish on the one they were pinned to.** That is
+also why retirement fails closed — replay is only sound against the code that
+wrote the journal, so a version with live pinned runs is still load-bearing.
+
+CLI: `rya publish --env prod` from a client repo, `rya deploy --env prod` from an
+operator host (same pipeline, local), then `rya versions list`, `rya envs show`,
+`rya gate show`, `rya promote`, `rya rollback`.
 
 ## Durable chat turns
 

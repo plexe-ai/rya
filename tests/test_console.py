@@ -99,6 +99,176 @@ def test_cors_allowlist_via_env(tmp_path, monkeypatch):
     assert r.headers.get("access-control-allow-origin") == "http://localhost:4321"
 
 
+# --------------------------------------------------------------------------- #
+# the deployment hierarchy the console renders: agent -> environment -> version
+# -> runs (PLATFORM_DESIGN §11 item 12). These assert the DATA the console pages
+# read, not their markup: a string check on the HTML would pass while every panel
+# rendered "unavailable".
+# --------------------------------------------------------------------------- #
+def _deployed(root, *, env="prod", actor="ada@example.com"):
+    """Record a version, promote it, and start a run pinned to it — the way
+    `rya deploy` + a version-pinned worker do (D12, §9)."""
+    from rya.bundles import build_bundle
+    from rya.deployments import create_version, promote
+
+    store = Store(root)
+    store.ensure()
+    version = create_version(store, agent="console-agent", bundle=build_bundle(root), actor=actor)
+    promote(store, environment=env, agent="console-agent", version_id=version["id"], actor=actor)
+    manifest = load_manifest(root / "rya.agent.yaml")
+    engine = Engine(manifest, load_agent(manifest, root), store, root,
+                    version=version, environment=env)
+    run = engine.run_event("message.received", {"email": "ada@example.com"})
+    return store, version, run
+
+
+def test_console_hierarchy_environment_to_version_to_runs(tmp_path, monkeypatch):
+    c, root = _client(tmp_path, monkeypatch)
+    _store, version, run = _deployed(root)
+
+    # agent -> environments
+    envs = c.get("/agents/_/environments").json()["environments"]
+    assert [e["name"] for e in envs] == ["prod"]
+
+    # environment -> the version it points at, and who promoted it (§12 risk 7)
+    env = c.get("/agents/_/environments/prod").json()
+    assert env["currentVersionId"] == version["id"]
+    assert env["currentVersion"]["bundleHash"] == version["bundleHash"]
+    assert env["actor"] == "ada@example.com" and env["updatedAt"]
+    assert env["pinnedRuns"] == {}  # nothing older is being retained yet
+
+    # ...and the promote/rollback audit trail behind that pointer
+    hist = c.get("/agents/_/environments/prod/history").json()["history"]
+    assert hist[0]["versionId"] == version["id"] and hist[0]["current"] is True
+    assert hist[0]["actor"] == "ada@example.com"
+
+    # version -> identity + state (the version page's spec cards)
+    v = c.get(f"/versions/{version['id']}").json()
+    assert v["bundleHash"] == version["bundleHash"] and v["state"] == "active"
+    assert v["sdkVersion"] and v["entrypoint"] and v["createdBy"] == "ada@example.com"
+
+    # version -> runs, and which of them still hold the version open
+    body = c.get(f"/versions/{version['id']}/runs").json()
+    assert [r["id"] for r in body["runs"]] == [run["id"]]
+    assert body["runs"][0]["environment"] == "prod" and body["runs"][0]["pinned"] is True
+    assert body["count"] == 1 and body["pinnedCount"] == 1
+    assert [r["id"] for r in c.get(f"/versions/{version['id']}/pinned-runs").json()["runs"]] == [run["id"]]
+
+
+def test_version_runs_keeps_terminal_runs_that_pinned_runs_drops(tmp_path, monkeypatch):
+    # The two routes answer different questions: `pinned-runs` is "what blocks a
+    # retire" (§6) and excludes terminal runs; the console's version page needs
+    # the finished ones too.
+    c, root = _client(tmp_path, monkeypatch)
+    _store, version, run = _deployed(root)
+    approval = c.get("/approvals").json()["approvals"][0]
+    assert c.post(f"/approvals/{approval['id']}/approve").status_code == 200
+    assert c.get(f"/runs/{run['id']}").json()["status"] == "completed"
+
+    body = c.get(f"/versions/{version['id']}/runs").json()
+    assert [r["id"] for r in body["runs"]] == [run["id"]]
+    assert body["runs"][0]["pinned"] is False and body["pinnedCount"] == 0
+    assert c.get(f"/versions/{version['id']}/pinned-runs").json()["count"] == 0
+    assert c.get("/versions/ver_nope/runs").status_code == 404
+
+
+def test_environment_page_shows_retained_older_versions(tmp_path, monkeypatch):
+    # §9's drain step, which is the least obvious part of the model: promoting v2
+    # does not free v1 while a run is still pinned to it (D12).
+    c, root = _client(tmp_path, monkeypatch)
+    store, v1, run = _deployed(root)
+
+    (root / "extra.py").write_text("# a second bundle, therefore a second hash\n")
+    from rya.bundles import build_bundle
+    from rya.deployments import create_version, promote
+    v2 = create_version(store, agent="console-agent", bundle=build_bundle(root), actor="bob@example.com")
+    assert v2["bundleHash"] != v1["bundleHash"]
+    promote(store, environment="prod", agent="console-agent", version_id=v2["id"], actor="bob@example.com")
+
+    env = c.get("/agents/_/environments/prod").json()
+    assert env["currentVersionId"] == v2["id"] and env["actor"] == "bob@example.com"
+    assert env["pinnedRuns"] == {v1["id"]: 1}      # v1 is retained, and the page says why
+    assert env["historyDepth"] == 1
+    assert [h["versionId"] for h in c.get("/agents/_/environments/prod/history").json()["history"]] \
+        == [v2["id"], v1["id"]]
+    # retiring the retained version fails closed while that run is live (§6)
+    assert c.post(f"/versions/{v1['id']}/retire").status_code == 409
+
+    # the versions list carries both, with the pointer resolvable back to prod
+    versions = c.get("/agents/_/versions").json()["versions"]
+    assert {v["id"] for v in versions} == {v1["id"], v2["id"]}
+    assert all(v["state"] == "active" for v in versions)
+    assert c.get("/agents/_/versions", params={"state": "retired"}).json()["versions"] == []
+
+
+def test_version_page_shows_gate_evidence(tmp_path, monkeypatch):
+    c, root = _client(tmp_path, monkeypatch)
+    store, version, _run = _deployed(root, env="staging")
+    from rya.gates import attest_evals, attest_readiness
+
+    attest_readiness(store, version, {"ready": True, "summary": {"blocks": 0, "warnings": 1}},
+                     actor="ci@example.com")
+    attest_evals(store, version, {"ok": True, "total": 3, "passed": 3, "score": 1.0,
+                                  "hasEvals": True, "results": []}, actor="ci@example.com")
+
+    att = c.get(f"/versions/{version['id']}/attestations").json()
+    assert att["count"] == 2
+    assert [a["kind"] for a in att["attestations"]] == ["readiness", "evals"]
+    assert all(a["ok"] and a["actor"] == "ci@example.com" for a in att["attestations"])
+    assert c.get("/versions/ver_nope/attestations").status_code == 404
+
+    # the gate panel: an unconfigured environment is "open", not broken
+    gates = {g["environment"]: g for g in c.get("/gate").json()["gates"]}
+    assert gates["staging"]["enforced"] is False
+    assert c.put("/gate", json={"environments": {"staging": {"requireEvals": True}}}).status_code == 200
+    assert c.get("/gate?env=staging").json()["gates"][0]["enforced"] is True
+    check = c.get("/gate/check", params={"env": "staging"}).json()
+    assert check["versionId"] == version["id"] and check["allowed"] is True
+    assert [c_["check"] for c_ in check["checks"]] == ["evals"]
+
+
+def test_deployment_panels_are_calm_on_a_fresh_install(tmp_path, monkeypatch):
+    # The first thing a new user sees. Nothing is deployed, nothing is running,
+    # and every panel must still answer with a shape the console can render.
+    c, _root = _client(tmp_path, monkeypatch)
+    assert c.get("/agents/_/environments").json() == {"environments": []}
+    assert c.get("/agents/_/versions").json() == {"versions": []}
+    # scale-to-zero (§6) is the designed steady state, not an error
+    assert c.get("/workers").status_code == 200
+    assert c.get("/workers").json() == {"workers": []}
+    # an environment that was never promoted into is a clean 404 with a stable code
+    missing = c.get("/agents/_/environments/prod")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "E_ENVIRONMENT_NOT_FOUND"
+    assert c.get("/gate/check", params={"env": "prod"}).status_code == 404
+    assert c.get("/gate").json()["default"]["enforced"] is False
+    # quota + usage answer even with no policy and no meter records
+    q = c.get("/quotas").json()
+    assert q["quota"]["enforced"] is False and q["admission"] == []
+    assert q["usage"]["runsToday"] == 0 and q["usage"]["workers"] == 0
+    assert c.get("/usage").json()["usage"]["calls"] == 0
+
+
+def test_workers_view_reports_a_live_process(tmp_path, monkeypatch):
+    # §6: the console has to show which process serves which version, its cold
+    # start and its heartbeat.
+    c, root = _client(tmp_path, monkeypatch)
+    store, version, _run = _deployed(root)
+    store.worker_register({"id": "wrk_console1", "agent": "console-agent",
+                           "versionId": version["id"], "bundleHash": version["bundleHash"],
+                           "handlers": ["event"], "pid": 4242, "host": "node-a",
+                           "coldStartMs": 312, "sdkVersion": version["sdkVersion"]})
+    workers = c.get("/workers").json()["workers"]
+    assert [w["id"] for w in workers] == ["wrk_console1"]
+    assert workers[0]["versionId"] == version["id"] and workers[0]["coldStartMs"] == 312
+    assert workers[0]["status"] == "alive" and workers[0]["lastHeartbeatAt"]
+    # the version page filters the fleet down to this version
+    assert c.get("/workers", params={"version_id": version["id"]}).json()["workers"]
+    assert c.get("/workers", params={"version_id": "ver_other"}).json()["workers"] == []
+    # ...and quota usage counts it (§11.12)
+    assert c.get("/quotas").json()["usage"]["workers"] == 1
+
+
 def test_console_security_headers_and_assets(tmp_path, monkeypatch):
     c, _ = _client(tmp_path, monkeypatch)
     page = c.get("/")

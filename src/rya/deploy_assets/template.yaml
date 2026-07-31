@@ -1,12 +1,21 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Rya — single-tenant deployment in the customer's AWS account. Realizes the
-  reference posture: Cognito identity at the edge, ECS Fargate runtime behind an
-  ALB, RDS Postgres with row-level security at the data, ElastiCache for hot
-  reads, a single-purpose mutator Lambda that re-validates the caller's JWT, and
-  all secrets in Secrets Manager. The customer owns the stack; no shared blast
-  radius. Deploy: `sam build && sam deploy --guided`.
+  Rya — deployment in the customer's AWS account. The customer owns the stack, so
+  self-hosting is a residency control: journal, memory, conversation history and
+  sealed credentials stay in this account and region (PLATFORM_DESIGN §8).
+
+  Shipped and wired: Cognito identity at the edge; TWO ECS Fargate services from
+  one image — `api` (control plane, behind the ALB) and `worker` (execution plane,
+  no inbound surface) coordinating through the queue table; RDS Postgres with
+  row-level security; ElastiCache for hot reads; all secrets in Secrets Manager.
+
+  NOT shipped, and deliberately failing closed rather than stubbed: the
+  single-purpose mutator Lambda. It returns 501 and its template comment states
+  what a real implementation must do. Do not read this stack as having that
+  control.
+
+  Deploy: `sam build && sam deploy --guided`.
 
 Parameters:
   DBMultiAZ:
@@ -51,6 +60,19 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Admin token gating self-serve project provisioning (RYA_ADMIN_TOKEN).
+  RyaEnvironment:
+    Type: String
+    Default: prod
+    Description: >
+      Which environment this deployment IS (dev/staging/prod). Deployment
+      identity, not agent config — D11 deletes `environment:` from the manifest
+      so one content-hashed bundle is promoted between environments unchanged.
+  WorkerCount:
+    Type: Number
+    Default: 2
+    Description: >
+      Number of execution-plane tasks. The api process runs NO handler code
+      (§11.7), so with 0 the control plane accepts work and nothing executes it.
 
   LangfuseHost:
     Type: String
@@ -272,9 +294,33 @@ Resources:
           Image: !Ref ContainerImage
           PortMappings:
             - ContainerPort: 8787
+          # ---------------------------------------------------------------
+          # D8: run inputs are DECLARED, not ambient.
+          #
+          # Everything here is DEPLOYMENT IDENTITY — which database, which
+          # environment, how this process authenticates itself. That is
+          # legitimately environmental: it answers "which deployment am I?",
+          # not "what may this run do?".
+          #
+          # What must NOT be added here is per-agent RUN config: model routes,
+          # egress allowlists, tool credentials, prices. Those are platform
+          # state, set through the control plane so they are versioned,
+          # access-controlled and audited — §12 risk 7 makes "who reviewed this
+          # allowlist change" a feature rather than a residual. A provider key
+          # injected below is the legacy single-tenant path; it is read once at
+          # route resolution and recorded with `source: env` provenance.
+          # ---------------------------------------------------------------
           Environment:
             - Name: RYA_MULTITENANT
               Value: "1"
+            - Name: RYA_ENVIRONMENT
+              Value: !Ref RyaEnvironment
+            # §11.7: the api process executes NO handler code, and multi-tenant
+            # mode forces its inline worker off regardless of this value. It is
+            # set explicitly so the topology is legible in the template rather
+            # than implied by a default — the WorkerService below is what runs.
+            - Name: RYA_API_INLINE_WORKER
+              Value: "0"
             # Bank mode: approvals must carry a verified user identity
             # (X-Rya-User-Token from POST /v1/token) - anonymous key-only
             # resolution is refused, so the audit trail always says WHO.
@@ -378,9 +424,115 @@ Resources:
           ContainerPort: 8787
           TargetGroupArn: !Ref TargetGroup
 
+  # ---- The execution plane (PLATFORM_DESIGN §2, §5.2, §11.7) --------------
+  # One deployment, TWO processes. The api service above is the control plane and
+  # executes NO handler code; this is what loads bundles and runs them. They are
+  # run modes of the same image against the same Postgres, coordinating through
+  # the queue table (D4) — there is no api→worker call to configure.
+  #
+  # Without this service the stack accepts events, enqueues them, and never runs
+  # them: severing handler execution from the api process (§11.7) is what makes
+  # per-tenant isolation mean anything, and it also means the worker is no longer
+  # optional.
+  #
+  # No ALB target and no port: a worker has no inbound surface. It claims work
+  # (FOR UPDATE SKIP LOCKED), heartbeats its lease, and exits idle. Scale on queue
+  # depth; per-key concurrency caps keep one workspace from starving another (§6).
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-worker"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref ContainerImage
+          Command: ["rya", "worker", "--interval", "2", "--concurrency", "4"]
+          # Same deployment identity as the api task, same D8 rule: nothing
+          # per-agent belongs here. A worker resolves its run config from
+          # platform state, not from this block.
+          Environment:
+            - Name: RYA_MULTITENANT
+              Value: "1"
+            - Name: RYA_ENVIRONMENT
+              Value: !Ref RyaEnvironment
+            - Name: RYA_FILES_S3_BUCKET
+              Value: !Ref FilesBucket
+            # Trace export follows the handler, not the api process: §11.7 moved
+            # run execution here, so this is where spans are produced. Without
+            # these the api task exports nothing (it runs no handlers) and the
+            # stack would deploy Langfuse with nothing writing to it.
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_HOST, Value: !Ref LangfuseHost }
+              - !Ref "AWS::NoValue"
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_PUBLIC_KEY, Value: !Ref LangfusePublicKey }
+              - !Ref "AWS::NoValue"
+            - !If
+              - LangfuseEnabled
+              - { Name: LANGFUSE_SECRET_KEY, Value: !Ref LangfuseSecretKey }
+              - !Ref "AWS::NoValue"
+            - Name: RYA_DATABASE_URL
+              Value: !Sub
+                - "postgresql://${DBUsername}:${pw}@${Endpoint}:5432/rya"
+                - pw: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+                  Endpoint: !GetAtt Database.Endpoint.Address
+          Secrets:
+            - Name: RYA_SECRET_KEY
+              ValueFrom: !Sub "${AppSecret}:RYA_SECRET_KEY::"
+            - !If
+              - UseAnthropicKey
+              - Name: ANTHROPIC_API_KEY
+                ValueFrom: !Sub "${AppSecret}:ANTHROPIC_API_KEY::"
+              - !Ref "AWS::NoValue"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref WorkerCount
+      TaskDefinition: !Ref WorkerTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+
   # ---- Single-purpose mutator (the privileged-write pattern) -------------
-  # Mutating tool calls travel here; this re-validates the caller's JWT before
-  # touching the database, so the agent holds no privileged DB credentials.
+  # The INTENDED pattern: mutating tool calls travel here, and this re-validates
+  # the caller's Cognito JWT before touching the database, so the agent process
+  # holds no privileged DB credentials.
+  #
+  # It is NOT IMPLEMENTED, and it fails closed rather than pretending to be.
+  # The previous version returned `{"ok": true}` unconditionally while the stack
+  # description advertised JWT re-validation — a security control that answers
+  # "yes" to everything is worse than an absent one, because it reads as covered
+  # in a review. Verifying an RS256 JWT against Cognito's JWKS needs a crypto
+  # library, which `InlineCode` cannot carry, so a correct implementation must
+  # ship as a real packaged function (a Lambda layer or an image) that:
+  #
+  #   1. fetches and caches the pool's JWKS, verifying kid/alg/iss/aud/exp,
+  #   2. connects as the non-superuser `rya_app` role with `app.user_id` set from
+  #      the VERIFIED `sub` (see tenancy.py — the RLS policies depend on it),
+  #   3. performs one scoped write and returns its result.
+  #
+  # Until then nothing should route to it, and a 501 says so unambiguously.
   MutatorFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -390,11 +542,22 @@ Resources:
       Timeout: 15
       InlineCode: |
         import json
+
         def handler(event, context):
-            # In production: verify the Cognito JWT from the request, open a DB
-            # connection as a non-superuser role with app.user_id set from the
-            # verified sub, perform the single scoped write, return the result.
-            return {"statusCode": 200, "body": json.dumps({"ok": True, "pattern": "single-purpose-mutator"})}
+            # Fail closed. See the template comment above this function for what
+            # a real implementation must do before this is enabled.
+            return {
+                "statusCode": 501,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({
+                    "code": "E_NOT_IMPLEMENTED",
+                    "message": "The single-purpose mutator is a deployment pattern, not a "
+                               "shipped implementation.",
+                    "hint": "It must verify the Cognito JWT and connect as rya_app with "
+                            "app.user_id set from the verified sub before it may perform any "
+                            "write. Replace this InlineCode with a packaged function.",
+                }),
+            }
 
   HttpApi:
     Type: AWS::Serverless::HttpApi

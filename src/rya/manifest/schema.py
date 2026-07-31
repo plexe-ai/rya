@@ -69,17 +69,73 @@ class MemoryBlock(BaseModel):
     collections: List[str] = Field(default_factory=list)
 
 
+class RetryDecl(BaseModel):
+    """Declarative tool-call retry policy (A1). The runtime re-invokes the tool
+    on a transient failure whose class is listed in ``on``, up to ``max_attempts``
+    total attempts, sleeping between tries per ``backoff``.
+
+    Error classes (matched by the runtime): ``timeout`` (E_TIMEOUT / TimeoutError),
+    ``5xx`` (an HTTP tool upstream 5xx). ``recoverable`` errors are handled by the
+    separate @agent.repair path, not here."""
+    max_attempts: int = 1
+    backoff: str = "none"  # none | fixed | exponential
+    on: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _rescue_on_keyword(cls, data):
+        # YAML 1.1 footgun: an unquoted `on:` key parses to the boolean True, so
+        # `on: [timeout]` silently becomes {True: [...]} and the list is lost.
+        # Recover it (and accept a `retry_on` alias) so the policy is never a
+        # silent no-op. Quoting `"on":` in the manifest also works.
+        if isinstance(data, dict):
+            data = dict(data)
+            if "on" not in data and True in data:
+                data["on"] = data.pop(True)
+            if "on" not in data and "retry_on" in data:
+                data["on"] = data.pop("retry_on")
+        return data
+
+    @field_validator("max_attempts")
+    @classmethod
+    def _min_attempts(cls, v):
+        if v < 1:
+            raise ValueError("retry.max_attempts must be >= 1")
+        return v
+
+    @field_validator("backoff")
+    @classmethod
+    def _known_backoff(cls, v):
+        if v not in ("none", "fixed", "exponential"):
+            raise ValueError("retry.backoff must be one of none|fixed|exponential")
+        return v
+
+
 class ToolDecl(BaseModel):
     id: str
     permission: Permission = Permission.allowed
     description: Optional[str] = None
     url: Optional[str] = None  # if set, the tool is an HTTP endpoint (POST input as JSON)
+    # Declarative transient-retry policy (A1). None = no retry (attempt once).
+    retry: Optional[RetryDecl] = None
+    # Adoption (A5): on a SUCCESSFUL call, copy a field of the tool's result into
+    # scoped memory, so a later pinned tool in the SAME turn adopts it. Each entry
+    # maps a result field to a "scope.key" memory target, e.g.
+    #   adopt: {accountId: session_state.accountId}
+    # means "write result['accountId'] to memory[session_state]['accountId'] on success".
+    # Pins that read `memory.session_state.accountId` then resolve to the adopted id.
+    adopt: dict[str, str] = Field(default_factory=dict)
     # Scoped connected credentials: if `provider` is set, the runtime resolves a
     # vaulted connection for (provider, requesting-user), enforces that the
     # caller's effective authority covers `scopes`, and injects the credential
     # into the call — the handler/model never sees the secret.
     provider: Optional[str] = None
     scopes: List[str] = Field(default_factory=list)
+    # Fail closed on missing identity: when true, the tool refuses to run without a
+    # verified user (identity.sub). Prevents falling through to a workspace-shared
+    # connection when the caller's user token is absent — a per-user credential
+    # (e.g. a per-user API bearer token) must never be silently shared.
+    require_user: bool = False
     # Server-side arg pinning: never trust the model (or handler input) for these
     # arguments. Each entry maps an input field to a trusted source, resolved by
     # the runtime at call time and overwriting whatever the caller supplied:
@@ -130,11 +186,19 @@ class ObservabilityBlock(BaseModel):
 
 
 class Manifest(BaseModel):
+    """The environment-INVARIANT description of an agent (PLATFORM_DESIGN D11).
+
+    One content-hashed bundle is promoted *between* environments — dev to
+    staging to prod — which an environment-specific manifest makes impossible.
+    Anything that differs per environment (model routes, egress allowlists,
+    credentials, config) is per-environment platform state under D8, not a field
+    here.
+    """
+
     name: str
     runtime: str = "python"
     entrypoint: str = "src/agent.py"
     version: str = "0.1.0"
-    environment: str = "local"
     owner: Optional[str] = None
     instructions: Optional[str] = None
 

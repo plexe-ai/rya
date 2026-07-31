@@ -35,6 +35,7 @@ class Agent:
         self._cron_handlers: Dict[str, Callable] = {}
         self._tool_handlers: Dict[str, Callable] = {}
         self._tool_schemas: Dict[str, dict] = {}
+        self._repair_handlers: Dict[str, Callable] = {}
 
     # ---- decorators ----------------------------------------------------
     def on_event(self, fn: Callable) -> Callable:
@@ -71,6 +72,23 @@ class Agent:
 
         return deco
 
+    def repair(self, tool_id: str) -> Callable:
+        """Register a self-heal callback for a tool: ``def repair(input, error)``.
+
+        When the tool raises a ``RyaRecoverableToolError``, the runtime calls this
+        ONCE with the input it was given and the error (whose ``.reason`` the
+        callback switches on), and retries the tool with the returned **patched
+        input**. Returning ``None`` retries with the original input; re-raising
+        surfaces the error. Like a tool handler it is a leaf — no journaled ``ctx``
+        calls. It may be sync or async.
+        """
+
+        def deco(fn: Callable) -> Callable:
+            self._repair_handlers[tool_id] = fn
+            return fn
+
+        return deco
+
     def cron(self, trigger_id: str) -> Callable:
         """Register a cron handler keyed by a manifest trigger id."""
 
@@ -95,6 +113,9 @@ class Agent:
 
     def tool_schema(self, tool_id: str) -> Optional[dict]:
         return self._tool_schemas.get(tool_id)
+
+    def repair_handler(self, tool_id: str) -> Optional[Callable]:
+        return self._repair_handlers.get(tool_id)
 
 
 def define_agent(name: Optional[str] = None) -> Agent:

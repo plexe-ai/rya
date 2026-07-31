@@ -20,6 +20,7 @@ from typing import Optional
 from .models.registry import default_registry as _models
 from .providers import resolve_provider
 from .tools.registry import default_registry as _tools
+from .config import current_environment
 
 # Invariants an agent must respect — surfaced up front so it doesn't learn them
 # by hitting an error.
@@ -52,7 +53,7 @@ def build_snapshot(manifest, store, agent=None, recent_limit: int = 5, project_r
             "name": manifest.name,
             "version": manifest.version,
             "runtime": manifest.runtime,
-            "environment": manifest.environment,
+            "environment": current_environment(),
             "entrypoint": manifest.entrypoint,
             "instructions": manifest.instructions,
         },
@@ -266,7 +267,7 @@ def build_console(manifest, store, agent, project_root) -> dict:
         "branding": _branding(project_root),
         "governance": _governance(manifest, store, runs, project_root),
         "agent": {"name": manifest.name, "version": manifest.version,
-                  "runtime": manifest.runtime, "environment": manifest.environment,
+                  "runtime": manifest.runtime, "environment": current_environment(),
                   "status": "running",
                   "handlers": {"event": agent.event_handler() is not None,
                                "jobs": list(agent._job_handlers.keys())}},

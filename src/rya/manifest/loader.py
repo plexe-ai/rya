@@ -56,6 +56,21 @@ def load_manifest(path: Optional[Path] = None) -> Manifest:
             hint="Fix the YAML syntax. `rya init --json` reports the first error location.",
         )
 
+    # D11 removed `environment:`. Pydantic would ignore the unknown key in
+    # silence, which is the exact failure mode the decision names — "a production
+    # container declares itself `local` and nothing notices". Say so instead. It
+    # is a warning rather than an error because the field was always inert, so
+    # upgrading should not break a working project; `rya deploy` refuses it.
+    if isinstance(raw, dict) and "environment" in raw:
+        import logging
+        logging.getLogger("rya.manifest").warning(
+            "%s declares `environment: %s`, which no longer exists. One bundle is "
+            "promoted between environments (PLATFORM_DESIGN D11), so the manifest "
+            "cannot name one. Remove the line; per-environment values are platform "
+            "config. `rya deploy` will refuse a manifest that still has it.",
+            path.name, raw.get("environment"))
+        raw = {k: v for k, v in raw.items() if k != "environment"}
+
     try:
         manifest = Manifest.model_validate(raw)
     except ValidationError as exc:

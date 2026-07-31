@@ -1,0 +1,93 @@
+# The thin client SDK — `rya` on PyPI (PLATFORM_DESIGN D16).
+#
+# `rya` and `rya-server` are MUTUALLY EXCLUSIVE ALTERNATIVES, not co-installable
+# halves — the relationship is `opencv-python` vs `opencv-python-headless`. Both
+# install into the same `rya` import namespace and both own `rya/__init__.py`, so
+# installing both leaves whichever landed second in charge of a package the other
+# has different contents for. Client repos install `rya`; the platform image
+# installs `rya-server`; nothing installs both. This is what lets D16 be achieved
+# without moving a single module: the split is which FILES a wheel carries, not
+# where they live in the tree.
+#
+# The file list below is generated from `packaging/surface.py:SDK_MODULES` and
+# checked against it by `tests/test_sdk_surface.py`, which also proves the
+# closure of these files never reaches platform code. Edit the surface module,
+# not this list.
+#
+# Build (wheel only — see docs/PACKAGING.md for why there is no sdist yet):
+#     python -m build --wheel packaging/sdk
+#     uv build --wheel packaging/sdk
+
+[project]
+name = "rya"
+version = "0.1.0"
+description = "Rya — the client SDK for building agents that run on the Rya platform"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Plexe" }]
+keywords = ["ai", "agents", "sdk", "llm", "agent-infrastructure"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+    "Operating System :: OS Independent",
+]
+
+# §2: "a client repo needs `rya-sdk` and a deploy token. It never imports the
+# runtime, never runs a server". Four libraries, no server, no database driver,
+# no model SDK — keys never leave the platform (§14, `providers/`). The list is
+# checked against the SDK code's actual third-party closure by
+# tests/test_sdk_surface.py.
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/plexe-ai/rya"
+Documentation = "https://github.com/plexe-ai/rya/tree/main/docs"
+Repository = "https://github.com/plexe-ai/rya"
+
+# D16: "`uvx rya create` survives verbatim." Same script name as today; the
+# module behind it is the client subset of the CLI (§14) instead of the operator
+# CLI, which needs the runtime and ships in `rya-server`.
+[project.scripts]
+rya = "rya.cli.client:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Nothing is picked up by convention: an SDK wheel that grows a module because
+# someone added a file next to one of these is the exact failure D16 has to
+# prevent, so every member is named.
+only-include = []
+
+[tool.hatch.build.targets.wheel.force-include]
+"../../src/rya/__init__.py" = "rya/__init__.py"
+"../../src/rya/bundles.py" = "rya/bundles.py"
+"../../src/rya/cli/__init__.py" = "rya/cli/__init__.py"
+"../../src/rya/cli/client.py" = "rya/cli/client.py"
+"../../src/rya/cli/deploy_templates.py" = "rya/cli/deploy_templates.py"
+"../../src/rya/cli/scaffold.py" = "rya/cli/scaffold.py"
+"../../src/rya/cloud.py" = "rya/cloud.py"
+"../../src/rya/errors.py" = "rya/errors.py"
+"../../src/rya/manifest/__init__.py" = "rya/manifest/__init__.py"
+"../../src/rya/manifest/loader.py" = "rya/manifest/loader.py"
+"../../src/rya/manifest/schema.py" = "rya/manifest/schema.py"
+"../../src/rya/sdk/__init__.py" = "rya/sdk/__init__.py"
+"../../src/rya/sdk/agent.py" = "rya/sdk/agent.py"
+"../../src/rya/skills/__init__.py" = "rya/skills/__init__.py"
+"../../src/rya/skills/skill_data.py" = "rya/skills/skill_data.py"
+"stubs/rya/sdk/context.pyi" = "rya/sdk/context.pyi"
+"py.typed" = "rya/py.typed"

@@ -54,7 +54,9 @@ work *through `ctx`* (the journaled leaves). Raw `requests.post(...)` or
 `random()` in a handler breaks replay. Tool handlers must be leaves — no nested
 journaled `ctx` calls inside them.
 
-Run statuses: `running` → `completed` | `failed` | `rejected` | `waiting_approval`.
+Run statuses: `running` → `completed` | `failed` | `rejected` | `waiting_approval`
+| `needs_reconnect` (a scoped connection expired mid-turn — `E_CONNECTION_EXPIRED`
+gets its own terminal status so the user gets a reconnect prompt, not a failure).
 
 ---
 
@@ -62,6 +64,7 @@ Run statuses: `running` → `completed` | `failed` | `rejected` | `waiting_appro
 
 ```bash
 pip install -e '.[api,llm,mcp]'        # add ,postgres for the Postgres substrate
+                                       # add ,s3 for object-store file bytes + bundle archives
 rya create myagent && cd myagent
 rya dev            # load + validate the manifest and agent code; report what's wired
 rya serve          # control plane + console on :8787 (also mounts remote MCP at /mcp)
@@ -107,7 +110,7 @@ the **real** provider seam.
 
 ## 4. The primitives (`ctx.*`)
 
-Fifteen primitives, all journaled:
+Seventeen primitives, all journaled:
 
 | Primitive | What it does |
 |---|---|
@@ -120,12 +123,14 @@ Fifteen primitives, all journaled:
 | `ctx.jobs` | Schedule background work (`job.schedule`; executed by `rya worker`) |
 | `ctx.cron` | Recurring schedules |
 | `ctx.approvals` | `request(title, body, action)` → pause the run for a human |
-| `ctx.sessions` | Conversation/session handling (`get_or_create`, `append`) |
-| `ctx.connections` | Scoped, encrypted third-party credentials |
+| `ctx.sessions` | Conversation/session handling (`get_or_create`, `append`, `history`, `get`, `search`) |
+| `ctx.connections` | Scoped, encrypted third-party credentials (`get`, `list`, `upsert`, `secret`) |
 | `ctx.logs` | Structured logs (into the trace) |
 | `ctx.traces` | Trace access |
 | `ctx.secrets` | Secret access (auto-redacted from traces) |
 | `ctx.events` | Emit/consume events |
+| `ctx.files` | Uploaded files: `get`, `list`, `read`, `as_document` (feeds `ctx.knowledge`) |
+| `ctx.guard` | `check_grounding` (grounding gate), `scrub`/`check_secrecy` (id-secrecy) |
 
 ---
 
@@ -169,6 +174,12 @@ One API, two backends, chosen by env:
 
 - **FileStore** — `.rya/` JSON. Default; zero setup.
 - **PostgresStore** — JSONB + row-level security. Used when `RYA_DATABASE_URL` is set.
+- **Bytes live apart from records.** Blobs never belong in a JSONB column, so file
+  bytes go to S3 with `RYA_FILES_S3_BUCKET` (only metadata stays in the store) and
+  bundle archives with `RYA_BUNDLES_S3_BUCKET` (+ `_PREFIX`/`_REGION`); each falls
+  back to a local directory when its bucket is unset. The matching `*_S3_ENDPOINT`
+  points at MinIO/Ceph/R2 and *also* switches boto3 to **path-style addressing** —
+  leave it blank on real AWS, which wants virtual-host style.
 
 `open_store()` picks the backend; agent code never knows the difference.
 
@@ -238,6 +249,7 @@ key or the package it **skips gracefully** (counts as pass) so evals stay runnab
 ```
 login logout whoami            # point the CLI at a hosted Rya or local
 create init dev deploy         # scaffold / validate / ship
+check bundle publish           # validate / content-hash / upload a version over HTTP
 eval                           # run the eval suite
 connect  connections           # scoped credentials (list | reseal | revoke)
 provision                      # stand up the full base infrastructure
@@ -260,15 +272,28 @@ workspaces keys cloud
 | Console | `GET /`, `GET /console` |
 | Agents & runs | `GET /agents/{id}`, `POST /agents/{id}/events`, `GET /agents/{id}/runs`, `GET /runs/{id}`, `GET /runs/{id}/trace` |
 | Approvals | `GET /approvals`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/reject` |
+| Versions & environments | `POST /agents/{id}/versions` (upload a bundle as a new immutable version — raw `application/gzip` body, `?hash=` required, plus `env`/`promote`/`actor`/`meta.<k>`), `GET /agents/{id}/versions`, `GET /versions/{id}`, `POST /versions/{id}/retire`, `GET /agents/{id}/environments`, `POST …/{env}/promote`, `POST …/{env}/rollback`, `GET …/{env}/history`, `GET`/`PUT /gate`, `GET /gate/check` |
 | Onboarding | `POST /v1/signup`, `POST /v1/login`, `GET /v1/me`, `POST /v1/workspaces` |
 | Admin | `POST /v1/projects` (gated by `RYA_ADMIN_TOKEN`; fails closed if unset) |
-| Guard / evals | `GET|PUT /guard`, `POST /guard/test`, `GET /evals`, `POST /evals/run` |
+| Guard / evals | `GET`/`PUT` `/guard`, `POST /guard/test`, `GET /evals`, `POST /evals/run` |
 | Read surfaces | `GET /connections`, `GET /knowledge`, `POST /knowledge/search`, `GET /sessions`, `GET /tools`, `GET /models`, `GET /channels` |
 | Inbound | `POST /inbound`, `POST /slack/events` |
 | Remote MCP | `/mcp` (mounted last so its catch-all doesn't shadow API routes) |
 
 Auth: `Authorization: Bearer <RYA_TOKEN>` (single-tenant operator) or a workspace
 `rya_sk_…` key (multi-tenant). `X-Rya-User-Token` enables per-user RLS.
+
+**Publishing additionally requires auth to be configured at all.** With no
+`RYA_TOKEN` and no multitenancy, `POST /agents/{id}/versions` returns **403**
+unless `RYA_ALLOW_UNAUTHENTICATED_PUBLISH=1` — an open control plane elsewhere
+leaks data; an open publish route is anonymous code upload to a box whose worker
+imports it.
+
+Stable codes map to statuses: `E_VALIDATION` 400, `E_BUNDLE_MISMATCH` 409,
+`E_BUNDLE_NOT_FOUND` 404, `E_BUNDLE_STORE` 503 (the operator's bucket, not the
+caller's request), `E_PROMOTION_BLOCKED` 422, `E_QUOTA_EXCEEDED` 429. The CLI
+re-raises the *server's* code rather than flattening it to `E_REMOTE`, so the
+error contract survives the network boundary.
 
 ---
 
@@ -284,7 +309,12 @@ Auth: `Authorization: Bearer <RYA_TOKEN>` (single-tenant operator) or a workspac
 
 - **Local**: `rya serve` (FileStore, zero setup).
 - **Self-host**: `rya serve` + `RYA_DATABASE_URL` (+ `RYA_MULTITENANT=1`), plus
-  `rya worker` for jobs.
+  `rya worker` for jobs. If the api and the worker do **not** share a filesystem
+  (separate containers, separate hosts), also set `RYA_BUNDLES_S3_*`:
+  `rya publish` writes the version's archive there and a pinned worker
+  (`rya worker --env prod`) reads it back, hash-verifying before it imports
+  anything. Without a shared store the worker resolves a version whose artifact it
+  cannot see. `docker compose up` wires this to a bundled MinIO.
 - **AWS**: `deploy/aws/template.yaml` (SAM) — Cognito, ALB, ECS Fargate (ARM64),
   RDS Postgres, Secrets Manager, and a single-purpose mutator Lambda.
   `deploy/aws/Dockerfile.baked` builds the image with an agent baked at `/project`.
@@ -312,6 +342,12 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 | `RYA_PRICE_<MODEL>_IN` / `_OUT` | Cost accounting (per 1M tokens) |
 | `RYA_TRACE_WEBHOOK`, `LANGFUSE_*`, `RYA_OTLP_ENDPOINT`, `RYA_OTLP_HEADERS`, `OTEL_SERVICE_NAME` | Trace export |
 | `RYA_DEEPEVAL_MODEL` | Override the DeepEval judge model |
+| `RYA_BUNDLES_S3_BUCKET`, `_PREFIX`, `_REGION`, `_ENDPOINT` | Bundle archives in an object store (unset → a local `.rya/bundles` directory); `_ENDPOINT` = MinIO/Ceph/R2, and forces path-style addressing |
+| `RYA_FILES_S3_BUCKET`, `RYA_FILES_S3_ENDPOINT` | File **bytes** in an object store; metadata stays in the store |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Credentials for both of the above (boto3's own chain) |
+| `RYA_MAX_BUNDLE_BYTES` | Publish body cap, default 20 MB — over it, `413` |
+| `RYA_ALLOW_UNAUTHENTICATED_PUBLISH` | `1` → allow `POST /agents/{id}/versions` with auth off (local loops only) |
+| `RYA_PROJECT` | Which project tree `docker compose` mounts at `/project` |
 | `RYA_REMOTE_URL`, `RYA_API_KEY` | Point the CLI at a hosted Rya |
 | `RYA_CORS_ORIGINS`, `RYA_WEBHOOK_SECRET`, `RYA_SLACK_SIGNING_SECRET` | Edge config |
 | `RYA_HOME`, `RYA_GUARD_PATH`, `RYA_APP_DB_PASSWORD` | Paths / infra |
@@ -320,7 +356,11 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 
 ## 16. Current state — honest
 
-**Test suite: 137 passed, 9 skipped** (Postgres-gated + the live DeepEval test).
+**Test suite: 63 files, 562 test functions** (before parametrization; skips are
+Postgres-gated plus the live-provider and DeepEval tests).
+Run with provider keys **unset** — a present `ANTHROPIC_API_KEY` silently routes
+mock-expecting tests to the live API (`RYA_FORCE_MOCK=1` overrides it); and pin
+`mcp<2`, since `mcp` 2.0.0 removed `streamablehttp_client`.
 
 **Verified working (not claims — exercised):**
 - **Live on AWS** (ECS Fargate + RDS, multi-tenant). Self-serve signup → workspace
@@ -339,7 +379,8 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 | Gap | Reality |
 |---|---|
 | **No TLS on the AWS deploy** | HTTP-only. Passwords + API keys travel in **plaintext**. Must fix before sharing publicly. |
-| **No worker on the deploy** | `rya worker` exists, but no worker task runs on AWS → scheduled jobs never execute. |
+| **One agent per deployment** | `build_app` loads `rya.agent.yaml` once at startup and every handler resolves `manifest.name`, so `{id}` in the route paths is decorative — `POST /agents/{id}/versions` refuses a bundle declaring a different `name`. A second agent means a second deployment. |
+| **Publish files no readiness attestation** | The control plane never imports a bundle, so `POST /agents/{id}/versions` cannot evaluate readiness: the response says `"attested": false`, and a readiness-gated environment refuses the promotion (`E_PROMOTION_BLOCKED`). Use `rya deploy --env` from a box with store access. |
 | **Evals are single-tenant only** | `POST /evals/run` → `400 "Evals are single-tenant only."` The console's Run-evals button fails on the cloud. |
 | **Connections + knowledge are read-only from the cloud** | No HTTP endpoint to *create* them (CLI/MCP/`ctx` only), so the console shows the views but can't populate them. |
 | **Remote MCP** | Unauthenticated when `RYA_TOKEN` is unset, and operates on the baked `/project` rather than the caller's workspace. |
@@ -365,13 +406,27 @@ src/rya/
   observability/   export.py (webhook/Langfuse/OTLP), usage.py (tokens + cost)
   api/app.py       FastAPI control plane + console + remote MCP mount
   console/         the built-in dashboard (single-file HTML)
-  store.py store_postgres.py    the two substrates
+  worker.py        the execution plane — claims from the queue, loads the bundle
+  bundles.py       content-hash / pack / verify + the archive store (local | S3)
+  deployments.py   immutable versions, environments, promote, rollback
+  gates.py         promotion gates — readiness + evals as admission checks
+  readiness.py     the production-readiness checklist (blocks, warnings, fixes)
+  queue.py         the durable job queue (lease / heartbeat / DLQ)
+  turns.py         durable, resumable chat turns (survive a dropped connection)
+  quotas.py        per-workspace quotas — concurrency, runs, tokens, cost
+  guard.py         egress firewall + grounding gate + id-secrecy scrub
+  config.py        per-environment run config: model routes, values, secrets
+  snapshot.py      what `rya context` returns — the live state in one payload
+  store.py store_postgres.py    the two record substrates
+  files_s3.py      the S3 bytes backend for the files primitive
   tenancy.py       workspaces, API keys, RLS, self-serve accounts
   accounts.py      PBKDF2 passwords + HMAC session tokens
   seal.py          Fernet encryption-at-rest
   evals.py         the eval harness + scorers (incl. deepeval)
-  cloud.py cli.py
+  cloud.py         RemoteClient — drive a hosted Rya, preserving its E_* codes
+  cli/main.py      the operator CLI (platform)
+  cli/client.py    the thin SDK CLI — where `check` / `bundle` / `publish` live
 deploy/aws/        template.yaml (SAM), Dockerfile.baked
 docs/              this doc + the companions
-tests/             137 tests
+tests/             63 files, 562 test functions
 ```

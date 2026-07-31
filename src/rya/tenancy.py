@@ -34,7 +34,25 @@ except ImportError as exc:  # pragma: no cover
 from .store_postgres import _SCHEMA as _DATA_SCHEMA
 
 _DATA_TABLES = ["rya_runs", "rya_approvals", "rya_jobs", "rya_queue", "rya_stream",
-                "rya_memory", "rya_sessions", "rya_messages", "rya_connections", "rya_files", "rya_job_groups"]
+                "rya_memory", "rya_sessions", "rya_messages", "rya_connections", "rya_files", "rya_job_groups",
+                # Platform state (PLATFORM_DESIGN D7, D10, D11, D12, §6) — RLS
+                # applies to every one of these exactly as it does to run data.
+                "rya_journal", "rya_meter", "rya_policy", "rya_policy_log",
+                "rya_versions", "rya_version_attestations", "rya_environments",
+                "rya_workers"]
+
+# PLATFORM_DESIGN §8: "the commit path connects as a distinct write-privileged
+# Postgres role, separate from the read path, so the runtime cannot perform
+# privileged writes even if its policy code is wrong."
+#
+# These are the tables that DECIDE rather than record: kill switches, guard
+# policy, per-environment config, the immutable version ledger and the
+# environment pointers. The `api` process (control plane) writes them; the
+# `worker` process — the one that loads client bundles — gets SELECT only, so a
+# bug in worker-side policy code cannot escalate into a policy WRITE. This is a
+# database-level backstop for the code-level rule in §3 (no client-versioned code
+# holds a store handle).
+_GOVERNANCE_TABLES = ["rya_policy", "rya_policy_log", "rya_versions", "rya_environments"]
 
 _TENANCY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rya_users (
@@ -97,6 +115,16 @@ def app_dsn(admin_dsn: str, password: Optional[str] = None) -> str:
     return make_conninfo(**params)
 
 
+def worker_dsn(admin_dsn: str, password: Optional[str] = None) -> str:
+    """The EXECUTION-plane DSN (rya_worker role). Same RLS scoping as rya_app but
+    SELECT-only on the governance tables (see ``_GOVERNANCE_TABLES``), so the
+    process that loads client bundles cannot write policy — PLATFORM_DESIGN §8."""
+    params = conninfo_to_dict(admin_dsn)
+    params["user"] = "rya_worker"
+    params["password"] = password or app_db_password()
+    return make_conninfo(**params)
+
+
 class Tenancy:
     """Admin-side operations. Uses a privileged connection (the RYA_DATABASE_URL)."""
 
@@ -124,9 +152,25 @@ class Tenancy:
                 cur.execute(sql.SQL("CREATE ROLE rya_app LOGIN PASSWORD {} NOSUPERUSER").format(sql.Literal(pw)))
             else:
                 cur.execute(sql.SQL("ALTER ROLE rya_app PASSWORD {}").format(sql.Literal(pw)))
+            # The execution-plane role. Same login shape as rya_app; the grants
+            # below are what make it strictly weaker (§8).
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname='rya_worker'")
+            if cur.fetchone() is None:
+                cur.execute(sql.SQL("CREATE ROLE rya_worker LOGIN PASSWORD {} NOSUPERUSER").format(sql.Literal(pw)))
+            else:
+                cur.execute(sql.SQL("ALTER ROLE rya_worker PASSWORD {}").format(sql.Literal(pw)))
             cur.execute("GRANT USAGE ON SCHEMA public TO rya_app")
+            cur.execute("GRANT USAGE ON SCHEMA public TO rya_worker")
+            # rya_policy_log has a BIGSERIAL id; inserting into it needs the
+            # sequence, which is not covered by the table grant.
+            cur.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rya_app")
             for tbl in _DATA_TABLES:
                 cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {tbl} TO rya_app")
+                if tbl in _GOVERNANCE_TABLES:
+                    # Read the verdict, never write it.
+                    cur.execute(f"GRANT SELECT ON {tbl} TO rya_worker")
+                else:
+                    cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {tbl} TO rya_worker")
                 # FORCE so the table owner is subject to RLS too; superusers still
                 # bypass (which is why the data plane uses rya_app).
                 cur.execute(f"ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY")

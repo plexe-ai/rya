@@ -16,11 +16,14 @@ Inbound webhooks (``/inbound``) can additionally require an HMAC signature
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import platform
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -38,6 +41,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse
 
 from .. import __version__ as RYA_VERSION
+from ..config import current_environment
 from ..errors import RyaError
 
 _STARTED_AT = time.time()
@@ -68,7 +72,7 @@ def build_infra(manifest, store) -> dict:
         "platform": f"{platform.system()} {platform.machine()}",
         "pid": os.getpid(),
         "uptimeSeconds": int(time.time() - _STARTED_AT),
-        "environment": manifest.environment,
+        "environment": current_environment(),
         "store": store.describe(),
         "auth": {"mode": auth_mode(),
                  "webhookSignature": bool(os.environ.get("RYA_WEBHOOK_SECRET")),
@@ -284,12 +288,37 @@ def build_app(root: Path) -> FastAPI:
         mcp_asgi = None
         _mcp_sm = None
 
+    # ---- inline execution: OFF whenever isolation has to mean something -----
+    #
+    # PLATFORM_DESIGN §11.7: `_sweeper_loop` and `_jobs_loop` iterate
+    # `tenancy.list_workspaces()` and build an engine per workspace, so the API
+    # process runs EVERY TENANT'S CODE. §5.1: "the api process must stop
+    # executing handler code"; severing this is a precondition for D13, because
+    # per-tenant process isolation is meaningless if one shared process executes
+    # all of them.
+    #
+    # So: in multi-tenant mode the api process never runs a handler, full stop —
+    # `rya worker` does. In single-tenant mode the inline loops stay on by
+    # default, because there a bare `rya serve` IS the whole deployment and
+    # silently ceasing to run scheduled jobs would be a worse failure than the
+    # isolation gap it closes. Set RYA_API_INLINE_WORKER=0 to turn them off
+    # there too; `rya dev` does exactly that and starts a real worker, so the
+    # local shape matches the production shape (§10).
+    def _inline_worker_enabled() -> bool:
+        explicit = os.environ.get("RYA_API_INLINE_WORKER")
+        if mt:
+            if explicit == "1":
+                import logging
+                logging.getLogger("rya.api").warning(
+                    "RYA_API_INLINE_WORKER=1 ignored: multi-tenant mode never executes "
+                    "handler code in the api process (PLATFORM_DESIGN D13). Run `rya worker`.")
+            return False
+        return explicit != "0"
+
     # ---- global turn-reclaim sweeper (the built-in cron) ------------------
     # A crashed chat turn is reclaimable, but reclaim only happens when someone
-    # runs it. This background loop IS that someone: every RYA_TURN_SWEEP_SECONDS
-    # (default 30; 0 disables) it reclaims + runs crashed/pending turns - across
-    # ALL workspaces in multi-tenant mode. Interrupted turns therefore always
-    # finish without any external cron.
+    # runs it. In single-tenant mode this background loop is that someone; in
+    # multi-tenant mode `rya worker` is, and this loop never starts.
     def _sweep_once() -> int:
         from .. import turns as _t
         total = 0
@@ -357,9 +386,16 @@ def build_app(root: Path) -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app):
         import asyncio
-        sweep_seconds = float(os.environ.get("RYA_TURN_SWEEP_SECONDS", "30") or 0)
+        import logging
+        inline = _inline_worker_enabled()
+        if not inline:
+            logging.getLogger("rya.api").info(
+                "api process executes no handler code (%s) — run `rya worker` to "
+                "drain jobs and reclaim turns",
+                "multi-tenant" if mt else "RYA_API_INLINE_WORKER=0")
+        sweep_seconds = float(os.environ.get("RYA_TURN_SWEEP_SECONDS", "30") or 0) if inline else 0
         task = asyncio.create_task(_sweeper_loop(sweep_seconds)) if sweep_seconds > 0 else None
-        jobs_seconds = float(os.environ.get("RYA_JOBS_WORKER_SECONDS", "3") or 0)
+        jobs_seconds = float(os.environ.get("RYA_JOBS_WORKER_SECONDS", "3") or 0) if inline else 0
         jobs_task = asyncio.create_task(_jobs_loop(jobs_seconds)) if jobs_seconds > 0 else None
         async with AsyncExitStack() as stack:
             if _mcp_sm is not None:
@@ -373,6 +409,32 @@ def build_app(root: Path) -> FastAPI:
                     jobs_task.cancel()
 
     api = FastAPI(title="Rya Control Plane", version=manifest.version, lifespan=_lifespan)
+
+    # A RyaError that escapes a route must not become a 500. Routes that want a
+    # specific status still catch locally and win; this is the backstop for codes
+    # raised DEEP in a call — a quota refused inside `run_event`, a journal drift
+    # inside replay — where every caller would otherwise need its own except.
+    _ERROR_STATUS = {
+        "E_QUOTA_EXCEEDED": 429,      # retry-after semantics, not a client bug
+        "E_PROMOTION_BLOCKED": 422,
+        "E_TOOL_PERMISSION_DENIED": 403,
+        "E_SCOPE_DENIED": 403,
+        "E_POLICY_READONLY": 403,
+        "E_UNAUTHORIZED": 401,
+        "E_JOURNAL_DRIFT": 409,
+        "E_VERSION_NOT_FOUND": 404,
+        "E_RUN_NOT_FOUND": 404,
+        "E_VALIDATION": 400,
+        "E_BUNDLE_MISMATCH": 409,
+        "E_BUNDLE_NOT_FOUND": 404,
+        "E_BUNDLE_STORE": 503,        # the operator's bucket, not the caller's request
+    }
+
+    @api.exception_handler(RyaError)
+    async def _rya_error_handler(request: Request, exc: RyaError):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=_ERROR_STATUS.get(exc.code, 400),
+                            content=exc.to_dict()["error"])
 
     # CORS: the console is served SAME-ORIGIN by `rya serve`, so no CORS is needed
     # by default. Cross-origin callers (a dev console on another port) must be
@@ -464,6 +526,109 @@ def build_app(root: Path) -> FastAPI:
         return {**build_console(manifest, store, agent, root),
                 "infra": build_infra(manifest, store), "viewer": viewer}
 
+    # ---- durable turns: the ONE streaming path (D6) -----------------------
+    # `on_token`/`on_trace`/`on_ui` used to be raw Python closures handed into
+    # the engine and on into the provider's SSE parser. That only works while the
+    # process holding the browser socket is the process executing the handler —
+    # which the api/worker split ends. Every stream now goes through the durable
+    # turn buffer: the executor APPENDS frames, the endpoint TAILS them by seq.
+    # A dropped client resumes with Last-Event-ID; a crashed executor's reclaim
+    # just appends more frames.
+    from .. import turns as _turns
+
+    def _fresh_engine_for(authorization, x_rya_token) -> Engine:
+        """A standalone engine for background turn execution - never shares the
+        request engine's connection across the response boundary."""
+        if mt:
+            return engine_for(authorize(authorization, x_rya_token))
+        return base_engine
+
+    def _kick_turn(authorization, x_rya_token) -> None:
+        """Run a due turn in this process — ONLY where that is allowed (§11.7).
+        When it is not, the turn sits on the queue with a lease and `rya worker`
+        claims it; latency differs, durability does not."""
+        if not _inline_worker_enabled():
+            return
+        try:
+            _turns.execute_pending(_fresh_engine_for(authorization, x_rya_token),
+                                   worker_id="inline", limit=1)
+        except Exception:  # reclaim will re-drive it; never fail the request
+            import logging
+            logging.getLogger("rya.turns").warning("inline turn execution failed", exc_info=True)
+
+    def _guard_source(engine: Engine):
+        """Where this workspace's guard policy comes from: the governed store
+        when it supports policy storage (workspace-scoped, versioned, audited),
+        else the project file for `rya dev`."""
+        from ..guard import GUARD_FILE
+        store = engine.store
+        if hasattr(store, "policy_get"):
+            try:
+                if store.policy_get("guard") is not None:
+                    return store
+            except Exception:
+                return store  # a read failure must fail closed, not fall back
+        return str(root / GUARD_FILE)
+
+    def _actor(authorization: Optional[str], x_rya_token: Optional[str]) -> Optional[str]:
+        """The principal a governance write is attributed to. A verified user
+        subject where one exists, else the workspace whose API key was used —
+        an anonymous audit trail answers nobody's question."""
+        from ..auth import jwt_configured, verify_jwt
+        tok = _bearer(authorization, x_rya_token)
+        if tok and jwt_configured():
+            try:
+                return f"user:{verify_jwt(tok).sub}"
+            except RyaError:
+                pass
+        if mt and tok:
+            ws = tenancy.resolve_key(tok)
+            if ws:
+                return f"workspace:{ws}"
+        return "operator" if tok else None
+
+    _TURN_IDLE_SECONDS = float(os.environ.get("RYA_TURN_STREAM_IDLE_SECONDS", "60"))
+
+    async def _tail_turn(engine: Engine, turn_id: str, after: int = -1,
+                         is_disconnected=None, stop_on_pause: bool = False):
+        """Yield a turn's durable frames in seq order until it should stop.
+
+        The single tail implementation behind /ws, /events/stream and
+        /turns/{id}/stream, so all three resume identically.
+
+        ``stop_on_pause`` is the difference between the two contracts. A `run`
+        frame with `waiting_approval` is a PAUSE marker, not an ending — the
+        approval resolution appends the continuation and the real terminal frame
+        to this same buffer, which is why the RESUMABLE endpoint keeps tailing.
+        The one-shot transports (/ws, /events/stream) promise that `run` is
+        always the last frame the client must wait for, so they stop there and
+        the client reconnects with the turn handle after approving.
+        """
+        cursor = after
+        idle = 0
+        idle_limit = max(1, int(_TURN_IDLE_SECONDS / 0.3))
+        while True:
+            if is_disconnected is not None and await is_disconnected():
+                return
+            frames = await asyncio.to_thread(engine.store.stream_read, turn_id, cursor)
+            if frames:
+                idle = 0
+                for f in frames:
+                    cursor = f["seq"]
+                    yield f
+                    if _turns.is_terminal([f]):
+                        return
+                    if stop_on_pause and f["kind"] == "run":
+                        return
+            else:
+                idle += 1
+                if idle >= idle_limit:
+                    yield {"seq": cursor, "kind": "idle", "data": None}
+                    return
+                if idle % 15 == 0:
+                    yield {"seq": cursor, "kind": "keepalive", "data": None}
+                await asyncio.sleep(0.3)
+
     @api.websocket("/ws")
     async def agent_ws(websocket: WebSocket):
         """Real-time bidirectional channel to drive the agent and watch it run.
@@ -541,55 +706,56 @@ def build_app(root: Path) -> FastAPI:
                     event_type = msg.get("eventType", "message.received")
                     payload = msg.get("payload", {})
 
-                # Stream every trace event the instant it happens. The callback
-                # fires on the worker thread; marshal each send onto the loop.
-                futs = []
-
-                def on_trace(ev):
-                    futs.append(asyncio.run_coroutine_threadsafe(
-                        websocket.send_json({"type": "trace", "event": ev}), loop))
-
-                # Token-level LLM streaming: each text chunk lands as a
-                # {"type":"token"} frame the moment the model emits it.
-                def on_token(chunk):
-                    futs.append(asyncio.run_coroutine_threadsafe(
-                        websocket.send_json({"type": "token", "text": chunk}), loop))
-
-                # Custom UI frames emitted by the handler via ctx.emit_ui.
-                def on_ui(frame):
-                    futs.append(asyncio.run_coroutine_threadsafe(
-                        websocket.send_json({"type": "ui", **frame}), loop))
-
+                # D6: enqueue a durable turn and tail its buffer. The socket is
+                # no longer the thing keeping the run alive — a dropped
+                # connection or a crashed executor no longer strands it, and the
+                # executing process need not be this one.
                 try:
-                    run = await asyncio.to_thread(
-                        engine.run_event, event_type, payload, "websocket", None, on_trace, on_token, on_ui)
+                    started = _turns.create_turn(engine, event_type, payload)
                 except RyaError as e:
                     await websocket.send_json({"type": "error", **e.to_dict()["error"]})
                     continue
-                for f in futs:  # ensure all trace frames land before replies/summary
-                    try:
-                        await asyncio.wrap_future(f)
-                    except Exception:
-                        pass
-
-                # Conversational reply: surface assistant messages this run wrote,
-                # BEFORE the terminal summary so `run` is always the last frame a
-                # client must wait for (no ambiguous "is more coming?" blocking).
-                if mtype == "message" and hasattr(engine.store, "find_session"):
-                    sess = engine.store.find_session(manifest.name, payload["channel"],
-                                                     payload["externalId"])
-                    if sess:
-                        for m in engine.store.list_messages(sess["id"]):
-                            if m.get("runId") == run["id"] and m.get("role") in ("assistant", "agent"):
-                                await websocket.send_json({"type": "message", "message": m})
-
-                await websocket.send_json({"type": "run", "run": _run_summary(run)})
+                turn_id = started["turnId"]
+                # Give the client the handle immediately so it can reconnect to
+                # GET /agents/{id}/turns/{turnId}/stream if the socket drops.
+                await websocket.send_json({"type": "turn", "turnId": turn_id})
+                # Concurrent with the tail, so frames reach the socket as they
+                # are appended rather than in one burst at the end.
+                kick = asyncio.create_task(asyncio.to_thread(_kick_turn, token, token))
+                try:
+                    async for f in _tail_turn(engine, turn_id, stop_on_pause=True):
+                        kind, data = f["kind"], f.get("data")
+                        if kind == "keepalive":
+                            continue
+                        if kind == "idle":
+                            await websocket.send_json({"type": "idle", "turnId": turn_id,
+                                                       "after": f["seq"]})
+                            break
+                        if kind == "token":
+                            await websocket.send_json({"type": "token", "text": (data or {}).get("text", "")})
+                        elif kind == "trace":
+                            await websocket.send_json({"type": "trace", "event": data})
+                        elif kind == "ui":
+                            await websocket.send_json({"type": "ui", **(data or {})})
+                        elif kind == "message":
+                            await websocket.send_json({"type": "message", "message": data})
+                        elif kind == "run":
+                            await websocket.send_json({"type": "run", "run": data})
+                        elif kind == "error":
+                            await websocket.send_json({"type": "error", **(data or {})})
+                        else:  # `restart` — a reclaimed executor re-ran the turn
+                            await websocket.send_json({"type": kind, "data": data})
+                finally:
+                    kick.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await kick
                 continue
 
             await websocket.send_json({"type": "error", "message": f"unknown type '{mtype}'"})
 
     @api.post("/agents/{agent_id}/events/stream")
-    async def post_event_stream(agent_id: str, request: Request,
+    async def post_event_stream(agent_id: str, request: Request, background: BackgroundTasks,
+                                after: int = -1,
                                 engine: Engine = Depends(get_engine),
                                 authorization: Optional[str] = Header(None),
                                 x_rya_token: Optional[str] = Header(None)):
@@ -598,6 +764,7 @@ def build_app(root: Path) -> FastAPI:
         The default client transport (plain HTTP - works through ALBs, proxies,
         and `fetch` with no connection upgrade). Frames, in order of arrival:
 
+          event: turn     {"turnId": ...}        - FIRST; the resume handle
           event: token    {"text": ...}          - each streamed LLM chunk
           event: trace    {trace event}          - each journaled step
           event: message  {assistant message}    - session replies (chat agents)
@@ -605,10 +772,13 @@ def build_app(root: Path) -> FastAPI:
           event: error    {code, message}        - fatal error (then closes)
 
         Clients wait for `run` and never have to guess whether more is coming.
-        """
-        import asyncio
-        import queue as _q
 
+        Since D6 this is a thin view over a DURABLE turn: the run is enqueued
+        with a lease, its frames are appended to a store-backed buffer, and this
+        endpoint only tails that buffer. A mid-turn crash no longer strands the
+        run, and a dropped connection resumes with the `turn` handle against
+        GET /agents/{id}/turns/{turnId}/stream (or `?after=<lastSeq>` here).
+        """
         from fastapi.responses import StreamingResponse
 
         body = await request.json()
@@ -616,69 +786,35 @@ def build_app(root: Path) -> FastAPI:
         payload = body.get("payload", {})
         identity = _identity_from(authorization, x_rya_token, required=False)
 
-        frames: _q.Queue = _q.Queue()
-        _DONE = object()
-
-        def emit(kind: str, data: dict) -> None:
-            frames.put((kind, data))
-
-        def produce() -> None:
-            try:
-                run = engine.run_event(event_type, payload, "sse", identity=identity,
-                                       on_trace=lambda ev: emit("trace", ev),
-                                       on_token=lambda chunk: emit("token", {"text": chunk}),
-                                       on_ui=lambda frame: emit("ui", frame))
-                # Chat agents: surface assistant messages this run wrote, BEFORE
-                # the terminal summary (same contract as the WebSocket).
-                if hasattr(engine.store, "find_session") and isinstance(payload, dict) \
-                        and payload.get("channel") and payload.get("externalId"):
-                    sess = engine.store.find_session(manifest.name, payload["channel"],
-                                                     payload["externalId"])
-                    if sess:
-                        for m in engine.store.list_messages(sess["id"]):
-                            if m.get("runId") == run["id"] and m.get("role") in ("assistant", "agent"):
-                                emit("message", m)
-                emit("run", _run_summary(run))
-            except RyaError as e:
-                emit("error", e.to_dict()["error"])
-            except Exception as e:  # never leave the stream hanging
-                emit("error", {"code": "E_RUNTIME", "message": str(e)})
-            finally:
-                frames.put(_DONE)
+        started = _turns.create_turn(engine, event_type, payload, identity=identity)
+        turn_id = started["turnId"]
 
         async def sse():
-            producer = asyncio.get_running_loop().run_in_executor(None, produce)
+            # The kick must run CONCURRENTLY with the tail, not before it and not
+            # as a response background task: a StreamingResponse's background
+            # tasks fire only after the body is fully sent, so scheduling it there
+            # deadlocks the stream against the turn it is waiting for.
+            kick = asyncio.create_task(asyncio.to_thread(_kick_turn, authorization, x_rya_token))
             try:
-                while True:
-                    try:
-                        item = await asyncio.to_thread(frames.get, True, 15.0)
-                    except _q.Empty:
-                        yield ": keep-alive\n\n"  # comment frame; defeats idle timeouts
-                        continue
-                    if item is _DONE:
-                        break
-                    kind, data = item
-                    yield f"event: {kind}\ndata: {json.dumps(data, default=str)}\n\n"
+                yield f"event: turn\ndata: {json.dumps({'turnId': turn_id})}\n\n"
+                async for f in _tail_turn(engine, turn_id, after=after,
+                                          is_disconnected=request.is_disconnected,
+                                          stop_on_pause=True):
+                    if f["kind"] == "keepalive":
+                        yield ": keep-alive\n\n"      # comment frame; defeats idle timeouts
+                    elif f["kind"] == "idle":
+                        yield ": idle-timeout\n\n"    # client reconnects with Last-Event-ID
+                    else:
+                        yield (f"id: {f['seq']}\nevent: {f['kind']}\n"
+                               f"data: {json.dumps(f['data'], default=str)}\n\n")
             finally:
-                await producer
+                kick.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await kick
 
         return StreamingResponse(sse(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
-
-    # ---- durable chat turns ---------------------------------------------
-    # Unlike /events/stream (synchronous - a mid-turn crash strands the run), a
-    # TURN is a durable, leased, reclaimable job whose frames land in a durable
-    # buffer; the stream endpoint just tails it and resumes on reconnect. See
-    # rya.turns.
-    from .. import turns as _turns
-
-    def _fresh_engine_for(authorization, x_rya_token) -> Engine:
-        """A standalone engine for background turn execution - never shares the
-        request engine's connection across the response boundary."""
-        if mt:
-            return engine_for(authorize(authorization, x_rya_token))
-        return base_engine
 
     @api.post("/agents/{agent_id}/turns")
     async def create_turn_ep(agent_id: str, request: Request, background: BackgroundTasks,
@@ -689,18 +825,10 @@ def build_app(root: Path) -> FastAPI:
         runs on a worker (kicked inline here, reclaimed on crash) and streams via
         GET /agents/{id}/turns/{turnId}/stream."""
         body = await request.json()
+        identity = _identity_from(authorization, x_rya_token, required=False)
         res = _turns.create_turn(engine, body.get("type", "message.received"),
-                                 body.get("payload", {}))
-
-        def _kick():
-            try:
-                _turns.execute_pending(_fresh_engine_for(authorization, x_rya_token),
-                                       worker_id="inline", limit=1)
-            except Exception:  # reclaim will re-drive it; never fail the request
-                import logging
-                logging.getLogger("rya.turns").warning("inline turn execution failed", exc_info=True)
-
-        background.add_task(_kick)
+                                 body.get("payload", {}), identity=identity)
+        background.add_task(_kick_turn, authorization, x_rya_token)
         return res
 
     @api.get("/agents/{agent_id}/turns/{turn_id}/stream")
@@ -710,45 +838,21 @@ def build_app(root: Path) -> FastAPI:
         ``?after=<lastSeq>`` (or the browser's Last-Event-ID header) to continue
         exactly where the dropped connection left off. Ends on the terminal
         run/error frame."""
-        import asyncio
-
         from fastapi.responses import StreamingResponse
 
         last_id = request.headers.get("last-event-id")
         start = int(last_id) if (last_id and last_id.lstrip("-").isdigit()) else after
-        idle_limit = max(1, int(float(os.environ.get("RYA_TURN_STREAM_IDLE_SECONDS", "60")) / 0.3))
-
-        def _is_terminal(f: dict) -> bool:
-            # A run frame with waiting_approval is a PAUSE marker - the approval
-            # resolution appends the continuation + the real terminal frame to
-            # this same buffer, so the tail must not end there.
-            from ..turns import TERMINAL_RUN_STATUSES
-            return f["kind"] == "error" or (
-                f["kind"] == "run" and (f.get("data") or {}).get("status") in TERMINAL_RUN_STATUSES)
 
         async def sse():
-            cursor = start
-            idle = 0
-            while True:
-                if await request.is_disconnected():
-                    return
-                frames = await asyncio.to_thread(engine.store.stream_read, turn_id, cursor)
-                if frames:
-                    idle = 0
-                    for f in frames:
-                        cursor = f["seq"]
-                        yield (f"id: {f['seq']}\nevent: {f['kind']}\n"
-                               f"data: {json.dumps(f['data'], default=str)}\n\n")
-                        if _is_terminal(f):
-                            return
+            async for f in _tail_turn(engine, turn_id, after=start,
+                                      is_disconnected=request.is_disconnected):
+                if f["kind"] == "keepalive":
+                    yield ": keep-alive\n\n"
+                elif f["kind"] == "idle":
+                    yield ": idle-timeout\n\n"  # client reconnects w/ Last-Event-ID
                 else:
-                    idle += 1
-                    if idle >= idle_limit:  # no new frame; client reconnects w/ Last-Event-ID
-                        yield ": idle-timeout\n\n"
-                        return
-                    if idle % 15 == 0:
-                        yield ": keep-alive\n\n"
-                    await asyncio.sleep(0.3)
+                    yield (f"id: {f['seq']}\nevent: {f['kind']}\n"
+                           f"data: {json.dumps(f['data'], default=str)}\n\n")
 
         return StreamingResponse(sse(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -763,25 +867,37 @@ def build_app(root: Path) -> FastAPI:
 
     @api.get("/guard")
     def get_guard(engine: Engine = Depends(get_engine)):
-        from ..guard import load_policy, run_tests, GUARD_FILE
-        p = root / GUARD_FILE
-        policy = load_policy(str(p)) or {"ssrf": True, "default": "deny", "fail": "closed",
-                                         "policy": "", "rules": []}
-        return {"policy": policy, "tests": run_tests(policy), "exists": p.is_file()}
+        from ..guard import resolve_policy, run_tests
+        gp = resolve_policy(_guard_source(engine))
+        return {"policy": gp.policy, "tests": run_tests(gp), "exists": gp.enforced,
+                **gp.describe()}
 
     @api.put("/guard")
-    async def put_guard(request: Request, engine: Engine = Depends(get_engine)):
-        from ..guard import save_policy, run_tests, GUARD_FILE
+    async def put_guard(request: Request, engine: Engine = Depends(get_engine),
+                        authorization: Optional[str] = Header(None),
+                        x_rya_token: Optional[str] = Header(None)):
+        """Write the guard policy. Versioned, diffed and attributed to a
+        principal — §12 risk 7: for a governance product, "who reviewed this
+        allowlist change" is a feature, not a residual."""
+        from ..guard import save_policy, run_tests
         body = await request.json()
         policy = body.get("policy", body)
-        save_policy(policy, str(root / GUARD_FILE))
-        return {"ok": True, "tests": run_tests(policy)}
+        record = save_policy(policy, source=_guard_source(engine),
+                             actor=_actor(authorization, x_rya_token))
+        return {"ok": True, "tests": run_tests(policy), "version": record.get("version"),
+                "record": record}
+
+    @api.get("/guard/log")
+    def guard_log(limit: int = 50, engine: Engine = Depends(get_engine)):
+        """The policy audit trail: every change, its diff, and who made it."""
+        from ..guard import POLICY_KEY
+        history = getattr(engine.store, "policy_history", None)
+        return {"entries": history(POLICY_KEY, limit) if history else []}
 
     @api.post("/guard/test")
     def test_guard(engine: Engine = Depends(get_engine)):
-        from ..guard import load_policy, run_tests, GUARD_FILE
-        policy = load_policy(str(root / GUARD_FILE)) or {}
-        return run_tests(policy)
+        from ..guard import run_tests
+        return run_tests(_guard_source(engine))
 
     @api.get("/evals")
     def get_evals(engine: Engine = Depends(get_engine)):
@@ -890,10 +1006,12 @@ def build_app(root: Path) -> FastAPI:
         from ..store import now_iso
         body = await request.json()
         status = body.get("status")
-        if status not in ("completed", "failed", "running", "waiting_approval", "rejected"):
+        if status not in ("completed", "failed", "running", "waiting_approval", "rejected",
+                          "needs_reconnect"):
             raise HTTPException(status_code=400, detail={
                 "code": "E_VALIDATION",
-                "message": "status must be one of completed|failed|running|waiting_approval|rejected."})
+                "message": "status must be one of completed|failed|running|waiting_approval|"
+                           "rejected|needs_reconnect."})
         raw_trace = body.get("trace")
         if not isinstance(raw_trace, list) or not raw_trace or len(raw_trace) > 1000:
             raise HTTPException(status_code=400, detail={
@@ -995,7 +1113,10 @@ def build_app(root: Path) -> FastAPI:
         from .. import files_s3
         meta = engine.store.get_file(file_id)
         if meta is None:
-            raise HTTPException(status_code=404, detail={"code": "E_NOT_FOUND"})
+            raise HTTPException(status_code=404, detail={
+                "code": "E_NOT_FOUND", "message": f"No file '{file_id}'.",
+                "hint": "Presign first (POST /files/presign) — confirm applies to a file the "
+                        "platform already knows about."})
         h = files_s3.head(file_id)
         if h is None:
             raise HTTPException(status_code=409, detail={
@@ -1015,7 +1136,9 @@ def build_app(root: Path) -> FastAPI:
     def get_file(file_id: str, engine: Engine = Depends(get_engine)):
         meta = engine.store.get_file(file_id)
         if meta is None:
-            raise HTTPException(status_code=404, detail={"code": "E_NOT_FOUND"})
+            raise HTTPException(status_code=404, detail={
+                "code": "E_NOT_FOUND", "message": f"No file '{file_id}'.",
+                "hint": "List what exists with GET /files."})
         return meta
 
     @api.get("/runs/{run_id}")
@@ -1076,14 +1199,20 @@ def build_app(root: Path) -> FastAPI:
         client locates its own thread after a reload without listing everything."""
         session = engine.store.find_session(manifest.name, channel, externalId)
         if session is None:
-            raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
+            raise HTTPException(status_code=404, detail={
+                "code": "E_SESSION_NOT_FOUND",
+                "message": f"No session for {channel}/{externalId}.",
+                "hint": "A session is created by the first turn on that identity — send one, "
+                        "then resolve it."})
         return session
 
     @api.get("/sessions/{session_id}")
     def get_session(session_id: str, engine: Engine = Depends(get_engine)):
         session = engine.store.get_session(session_id)
         if session is None:
-            raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
+            raise HTTPException(status_code=404, detail={
+                "code": "E_SESSION_NOT_FOUND", "message": f"No session '{session_id}'.",
+                "hint": "Resolve it by identity with GET /sessions/find?channel=…&externalId=…"})
         return session
 
     @api.get("/sessions/{session_id}/messages")
@@ -1092,7 +1221,10 @@ def build_app(root: Path) -> FastAPI:
         """The durable transcript, oldest first - restored on client reload
         (render instantly; never replay a typewriter)."""
         if engine.store.get_session(session_id) is None:
-            raise HTTPException(status_code=404, detail={"code": "E_SESSION_NOT_FOUND"})
+            raise HTTPException(status_code=404, detail={
+                "code": "E_SESSION_NOT_FOUND", "message": f"No session '{session_id}'.",
+                "hint": "An empty transcript and an unknown session are different answers; "
+                        "this one is unknown."})
         msgs = engine.store.list_messages(session_id)
         return {"messages": msgs[-limit:]}
 
@@ -1246,11 +1378,26 @@ def build_app(root: Path) -> FastAPI:
     def queue_stats(engine: Engine = Depends(get_engine)):
         return q.stats(engine.store)
 
+    def _killswitches(engine: Engine) -> dict:
+        """Read the kill switches the runtime will actually honour.
+
+        §11.2 moved these out of the `_runtime_config` memory scope — which a
+        bundle could overwrite through ctx.memory.set — into privileged policy
+        state. The legacy scope is still READ so a switch set before the move
+        keeps working; nothing writes it any more.
+        """
+        from ..sdk.context import POLICY_KILLSWITCHES
+        getter = getattr(engine.store, "policy_get", None)
+        if getter is not None:
+            switches = getter(POLICY_KILLSWITCHES)
+            if switches is not None:
+                return switches
+        return (engine.store.load_memory("_runtime_config") or {}).get("kv") or {}
+
     @api.get("/tools")
     def tools(engine: Engine = Depends(get_engine)):
         # Effective permission = manifest, unless a runtime kill switch overrides.
-        rc = engine.store.load_memory("_runtime_config")
-        overrides = rc.get("kv") or {}
+        overrides = _killswitches(engine)
         out = []
         for t in manifest.tools:
             ov = overrides.get(f"tool:{t.id}")
@@ -1263,23 +1410,38 @@ def build_app(root: Path) -> FastAPI:
         return {"tools": out}
 
     @api.put("/tools/{tool_id}/permission")
-    async def set_tool_permission(tool_id: str, request: Request, engine: Engine = Depends(get_engine)):
+    async def set_tool_permission(tool_id: str, request: Request,
+                                  engine: Engine = Depends(get_engine),
+                                  authorization: Optional[str] = Header(None),
+                                  x_rya_token: Optional[str] = Header(None)):
         """Runtime kill switch: override a tool's permission NOW, without a
-        redeploy. Versioned + append-only history. Body:
-        {"permission": "...", "reason": "..."} or {"clear": true} to drop the
-        override and fall back to the manifest."""
+        redeploy. Body: {"permission": "...", "reason": "..."} or {"clear": true}
+        to drop the override and fall back to the manifest.
+
+        Written to privileged policy state (§11.2), so the change is versioned,
+        attributed and append-only auditable — and the bundle whose tool is being
+        killed cannot write it back.
+        """
         from ..manifest.schema import Permission as Perm
+        from ..sdk.context import POLICY_KILLSWITCHES
+        from ..store import now_iso
+
         body = await request.json()
         decl = next((t for t in manifest.tools if t.id == tool_id), None)
         if decl is None:
             raise HTTPException(status_code=404, detail={"code": "E_TOOL_NOT_FOUND",
                                 "message": f"Tool '{tool_id}' is not declared in the manifest."})
-        rc = engine.store.load_memory("_runtime_config")
-        kv = rc.setdefault("kv", {})
-        hist = rc.setdefault("collections", {}).setdefault("history", [])
-        prev = (kv.get(f"tool:{tool_id}") or {}).get("permission") or decl.permission.value
+        setter = getattr(engine.store, "policy_set", None)
+        if setter is None:
+            raise HTTPException(status_code=501, detail={
+                "code": "E_RUNTIME",
+                "message": "This store backend does not support privileged policy writes."})
+
+        switches = dict(_killswitches(engine))
+        prev = (switches.get(f"tool:{tool_id}") or {}).get("permission") or decl.permission.value
+        ts = now_iso()
         if body.get("clear"):
-            kv.pop(f"tool:{tool_id}", None)
+            switches.pop(f"tool:{tool_id}", None)
             new = decl.permission.value
         else:
             perm = body.get("permission")
@@ -1288,16 +1450,436 @@ def build_app(root: Path) -> FastAPI:
                     "code": "E_VALIDATION",
                     "message": f"permission must be one of {sorted(p.value for p in Perm)}."})
             new = perm
-        from ..store import now_iso
-        version = len(hist) + 1
-        ts = now_iso()
-        entry = {"version": version, "tool": tool_id, "permission": new, "previous": prev,
-                 "cleared": bool(body.get("clear")), "reason": body.get("reason"), "ts": ts}
-        if not body.get("clear"):
-            kv[f"tool:{tool_id}"] = {"permission": new, "version": version, "ts": ts}
-        hist.append(entry)
-        engine.store.save_memory("_runtime_config", rc)
-        return {"ok": True, **entry}
+            switches[f"tool:{tool_id}"] = {"permission": new, "ts": ts,
+                                           "reason": body.get("reason")}
+        record = setter(POLICY_KILLSWITCHES, switches,
+                        actor=_actor(authorization, x_rya_token))
+        return {"ok": True, "tool": tool_id, "permission": new, "previous": prev,
+                "cleared": bool(body.get("clear")), "reason": body.get("reason"),
+                "version": record.get("version"), "actor": record.get("actor"), "ts": ts}
+
+    @api.get("/tools/log")
+    def tool_permission_log(limit: int = 50, engine: Engine = Depends(get_engine)):
+        """Who changed which kill switch, when, and what it was before."""
+        from ..sdk.context import POLICY_KILLSWITCHES
+        history = getattr(engine.store, "policy_history", None)
+        return {"entries": history(POLICY_KILLSWITCHES, limit) if history else []}
+
+    # ---- deployments: versions + environments (D11, D12, §9) --------------
+    def _deployments():
+        from .. import deployments as _d
+        return _d
+
+    def _dep_err(e: RyaError) -> HTTPException:
+        status = {"E_VERSION_NOT_FOUND": 404, "E_ENVIRONMENT_NOT_FOUND": 404,
+                  "E_VERSION_IN_USE": 409, "E_VERSION_RETIRED": 409,
+                  "E_BUNDLE_MISMATCH": 409,
+                  # 503, not 400: the caller's request was fine and the operator's
+                  # bucket is not. Telling a publisher to fix its request would
+                  # send it in exactly the wrong direction.
+                  "E_BUNDLE_STORE": 503, "E_BUNDLE_NOT_FOUND": 404,
+                  # 422: the request is well-formed and the version exists — it is
+                  # the version's *evidence* that does not satisfy the gate. A 403
+                  # would say "you may not do this"; the caller may, once the
+                  # requirements are met.
+                  "E_PROMOTION_BLOCKED": 422}.get(e.code, 400)
+        return HTTPException(status_code=status, detail=e.to_dict()["error"])
+
+    @api.post("/agents/{agent_id}/versions")
+    async def publish_version_ep(agent_id: str, request: Request,
+                                 engine: Engine = Depends(get_engine),
+                                 authorization: Optional[str] = Header(None),
+                                 x_rya_token: Optional[str] = Header(None)):
+        """Upload a packed bundle as a new immutable version. The §9 pipeline over
+        HTTP: `rya deploy --env` without needing the database or the bucket.
+
+        Body: the raw ``.tar.gz`` from ``bundles.pack``. Query: ``hash``
+        (required, the client's content hash), ``env``, ``promote``, ``actor``,
+        and repeatable ``meta.<key>=<value>`` provenance — the same shape as
+        ``POST /files``.
+
+        **This never imports the bundle** (D13): the control plane must not run
+        tenant code, so it verifies bytes, records a version, and flips a pointer.
+        The consequence is that readiness is NOT evaluated and no readiness
+        attestation is filed — the response says so, and an environment whose gate
+        requires readiness will refuse the promotion.
+        """
+        from .. import bundles, gates
+
+        # An open control plane means anonymous code upload to a box whose worker
+        # imports it — categorically worse than the read/write routes that are
+        # also open in dev mode, so this one refuses rather than shrugging.
+        if not auth_enabled() and os.environ.get("RYA_ALLOW_UNAUTHENTICATED_PUBLISH") != "1":
+            raise HTTPException(status_code=403, detail={
+                "code": "E_UNAUTHORIZED",
+                "message": "Publishing is disabled while the control plane is unauthenticated.",
+                "hint": "Set RYA_TOKEN (generate one with `rya token`), or set "
+                        "RYA_ALLOW_UNAUTHENTICATED_PUBLISH=1 for a local-only loop."})
+
+        claimed = (request.query_params.get("hash") or "").strip().lower()
+        if not claimed:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "query param 'hash' is required.",
+                "hint": "Send the hash from `rya bundle --json`; the platform rebuilds and compares it."})
+
+        max_bytes = int(os.environ.get("RYA_MAX_BUNDLE_BYTES", str(20 * 1024 * 1024)))
+        content = await request.body()
+        if not content:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "request body is empty",
+                "hint": "POST the bundle archive as the raw body with content-type application/gzip."})
+        if len(content) > max_bytes:
+            raise HTTPException(status_code=413, detail={
+                "code": "E_VALIDATION",
+                "message": f"bundle exceeds {max_bytes} bytes",
+                "hint": "Trim the project with a `.ryaignore`, or raise RYA_MAX_BUNDLE_BYTES."})
+
+        meta = {k[5:]: v for k, v in request.query_params.items() if k.startswith("meta.")}
+        env_name = (request.query_params.get("env") or "").strip() or None
+        promote_it = (request.query_params.get("promote", "true").lower() != "false")
+        actor = (request.query_params.get("actor") or "").strip() or _actor(authorization, x_rya_token)
+
+        with tempfile.TemporaryDirectory(prefix="rya-publish-") as td:
+            tmp = Path(td)
+            archive = tmp / "upload.tar.gz"
+            archive.write_bytes(content)
+            unpacked = tmp / "tree"
+            try:
+                # Rebuild the hash from the bytes we received rather than trusting
+                # the sidecar: D12's whole point is that the CONTENT proves the
+                # version. This is `bundles.verify` inlined — it is unpack + build
+                # + compare — so the tree is not extracted twice.
+                bundles.unpack(archive, unpacked, max_total_bytes=max_bytes * 20)
+                rebuilt = bundles.build_bundle(unpacked)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+            if rebuilt.hash != claimed:
+                raise _dep_err(_hash_mismatch(rebuilt, claimed, unpacked))
+
+            # `agent_id` in these paths is decorative everywhere else (each handler
+            # resolves manifest.name), and a version filed under a name this
+            # deployment does not serve would be listed by nothing and run by
+            # nobody. So it is checked here instead of ignored.
+            declared = str((rebuilt.manifest or {}).get("name") or "")
+            if agent_id != manifest.name or declared != manifest.name:
+                raise HTTPException(status_code=400, detail={
+                    "code": "E_VALIDATION",
+                    "message": f"Bundle declares agent '{declared or '?'}' and the path says "
+                               f"'{agent_id}', but this deployment serves '{manifest.name}'.",
+                    "hint": f"Publish to /agents/{manifest.name}/versions from a project whose "
+                            f"rya.agent.yaml has `name: {manifest.name}`."})
+
+            try:
+                archive_store = bundles.resolve_bundle_store(root)
+                stored = bundles.store_bundle(rebuilt, archive_store)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+            try:
+                version = _deployments().create_version(
+                    engine.store, agent=manifest.name, bundle=rebuilt, actor=actor,
+                    metadata={**meta, "publishedVia": "http"})
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+        gate_result = None
+        if env_name and promote_it:
+            try:
+                gate_result = gates.check_promotion(engine.store, version=version,
+                                                   environment=env_name, actor=actor)
+                _deployments().promote(engine.store, environment=env_name, agent=manifest.name,
+                                       version_id=version["id"], actor=actor)
+            except RyaError as e:
+                raise _dep_err(e) from e
+
+        return {
+            "ok": True, "agent": manifest.name, "versionId": version["id"],
+            "bundleHash": rebuilt.hash, "fileCount": rebuilt.fileCount,
+            "sizeBytes": rebuilt.sizeBytes, "sdkVersion": rebuilt.sdkVersion,
+            "lockfile": rebuilt.lockfile, "archive": str(stored),
+            "environment": env_name, "promoted": bool(env_name and promote_it),
+            **({"gate": gate_result.to_dict()} if gate_result else {}),
+            # Stated, not implied: the one thing `rya deploy --env` does that this
+            # path cannot.
+            "attested": False, "notAttested": ["readiness"],
+            "note": "Readiness was not evaluated: the control plane does not import bundles. "
+                    "A gate requiring readiness will refuse this version.",
+        }
+
+    def _hash_mismatch(rebuilt, claimed: str, unpacked: Path) -> RyaError:
+        """E_BUNDLE_MISMATCH, with the SDK-skew case named.
+
+        `content_hash` folds the SDK version into the digest, so a client and a
+        platform on different `rya` versions disagree about the hash of BYTE
+        IDENTICAL trees. The generic "the artifact was modified" message would
+        send an operator hunting for tampering that never happened.
+        """
+        base = (f"Bundle content hash {rebuilt.hash[:12]} does not match the "
+                f"claimed {claimed[:12]}.")
+        from ..bundles import BUNDLE_META_NAME
+
+        try:
+            sidecar = json.loads((unpacked / BUNDLE_META_NAME).read_text())
+            client_sdk = str(sidecar.get("sdkVersion") or "")
+        except (OSError, json.JSONDecodeError, ValueError):
+            client_sdk = ""
+        if client_sdk and client_sdk != rebuilt.sdkVersion:
+            return RyaError(
+                "E_BUNDLE_MISMATCH",
+                f"{base} The client built it with rya SDK {client_sdk} and this "
+                f"platform runs {rebuilt.sdkVersion}.",
+                hint="The content hash includes the SDK version, so the same files hash "
+                     "differently across SDK versions. Align them and re-publish.")
+        return RyaError(
+            "E_BUNDLE_MISMATCH", base,
+            hint="The upload does not match the hash it claimed — re-run `rya bundle` and "
+                 "publish again rather than editing an artifact in flight.")
+
+    @api.get("/agents/{agent_id}/versions")
+    def list_versions_ep(agent_id: str, state: Optional[str] = None,
+                         engine: Engine = Depends(get_engine)):
+        return {"versions": _deployments().list_versions(engine.store, agent=manifest.name,
+                                                         state=state)}
+
+    @api.get("/versions/{version_id}")
+    def get_version_ep(version_id: str, engine: Engine = Depends(get_engine)):
+        v = engine.store.version_get(version_id)
+        if v is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "E_VERSION_NOT_FOUND", "message": f"Version '{version_id}' not found."})
+        return v
+
+    @api.get("/versions/{version_id}/pinned-runs")
+    def pinned_runs_ep(version_id: str, engine: Engine = Depends(get_engine)):
+        """Why a retire was refused: the runs still pinned to this version."""
+        runs = _deployments().pinned_runs(engine.store, version_id)
+        return {"runs": runs, "count": len(runs)}
+
+    @api.get("/versions/{version_id}/runs")
+    def version_runs_ep(version_id: str, limit: int = 50, engine: Engine = Depends(get_engine)):
+        """Every run pinned to this version — terminal ones included.
+
+        Deliberately NOT the same question as `/versions/{id}/pinned-runs`, which
+        answers "what blocks a retire" and therefore excludes terminal runs by
+        construction (`deployments.pinned_runs`, §6 "Version retirement"). The
+        console's environment → version → runs drill-down (§11 item 12) needs the
+        history too: "what ran on the hash that is on prod" is mostly finished
+        runs, and `/console`'s run list is capped at 30 and carries no versionId.
+        """
+        if engine.store.version_get(version_id) is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "E_VERSION_NOT_FOUND", "message": f"Version '{version_id}' not found."})
+        rows = [r for r in engine.store.list_runs(manifest.name)
+                if r.get("versionId") == version_id]
+        rows.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+        live = {r["id"] for r in _deployments().pinned_runs(engine.store, version_id)}
+        runs = [{**_run_summary(r), "createdAt": r.get("createdAt"),
+                 "environment": r.get("environment"), "agentVersion": r.get("agentVersion"),
+                 # "pinned" in the retention sense: still holding the version alive.
+                 "pinned": r["id"] in live}
+                for r in rows[:max(1, min(int(limit or 50), 500))]]
+        return {"runs": runs, "count": len(rows), "pinnedCount": len(live)}
+
+    @api.post("/versions/{version_id}/retire")
+    async def retire_version_ep(version_id: str, request: Request,
+                                engine: Engine = Depends(get_engine)):
+        body = await request.json() if await request.body() else {}
+        try:
+            return _deployments().retire(engine.store, version_id,
+                                         force=bool(body.get("force")))
+        except RyaError as e:
+            raise _dep_err(e)
+
+    @api.get("/agents/{agent_id}/environments")
+    def list_environments_ep(agent_id: str, engine: Engine = Depends(get_engine)):
+        return {"environments": _deployments().list_environments(engine.store,
+                                                                 agent=manifest.name)}
+
+    @api.get("/agents/{agent_id}/environments/{env_name}")
+    def describe_environment_ep(agent_id: str, env_name: str,
+                                engine: Engine = Depends(get_engine)):
+        try:
+            return _deployments().describe_environment(engine.store, env_name, manifest.name)
+        except RyaError as e:
+            raise _dep_err(e)
+
+    @api.post("/agents/{agent_id}/environments/{env_name}/promote")
+    async def promote_ep(agent_id: str, env_name: str, request: Request,
+                         engine: Engine = Depends(get_engine),
+                         authorization: Optional[str] = Header(None),
+                         x_rya_token: Optional[str] = Header(None)):
+        """Flip the environment's current-version pointer (§9). Atomic: new runs
+        go to the new version, in-flight runs finish on theirs."""
+        body = await request.json()
+        try:
+            return _deployments().promote(engine.store, environment=env_name,
+                                          agent=manifest.name,
+                                          version_id=body["versionId"],
+                                          actor=_actor(authorization, x_rya_token),
+                                          force=bool(body.get("force")))
+        except KeyError:
+            raise HTTPException(status_code=400, detail={
+                "code": "E_VALIDATION", "message": "versionId is required."})
+        except RyaError as e:
+            raise _dep_err(e)
+
+    @api.post("/agents/{agent_id}/environments/{env_name}/rollback")
+    async def rollback_ep(agent_id: str, env_name: str, request: Request,
+                          engine: Engine = Depends(get_engine),
+                          authorization: Optional[str] = Header(None),
+                          x_rya_token: Optional[str] = Header(None)):
+        body = await request.json() if await request.body() else {}
+        try:
+            return _deployments().rollback(engine.store, environment=env_name,
+                                           agent=manifest.name,
+                                           to_version_id=body.get("versionId"),
+                                           actor=_actor(authorization, x_rya_token))
+        except RyaError as e:
+            raise _dep_err(e)
+
+    @api.get("/agents/{agent_id}/environments/{env_name}/history")
+    def environment_history_ep(agent_id: str, env_name: str,
+                               engine: Engine = Depends(get_engine)):
+        return {"history": _deployments().history(engine.store, env_name, manifest.name)}
+
+    # ---- promotion gates (§9) ---------------------------------------------
+    # The readiness/eval gate as a server-side ADMISSION check. Config is
+    # privileged platform state (D7), so these routes sit behind the same auth as
+    # every other governance write and every change is audited.
+    def _gates():
+        from .. import gates as _g
+        return _g
+
+    @api.get("/gate")
+    def get_gate_ep(env: Optional[str] = None, engine: Engine = Depends(get_engine)):
+        g = _gates()
+        names = [env] if env else sorted(
+            {e["name"] for e in _deployments().list_environments(engine.store, agent=manifest.name)}
+            | set((engine.store.policy_get(g.POLICY_KEY) or {}).get("environments") or {}))
+        try:
+            return {"gates": [g.resolve_gate(engine.store, n).describe() for n in names],
+                    "default": g.resolve_gate(engine.store, "default").describe()}
+        except RyaError as e:
+            raise _dep_err(e)
+
+    @api.put("/gate")
+    async def put_gate_ep(request: Request, engine: Engine = Depends(get_engine),
+                          authorization: Optional[str] = Header(None),
+                          x_rya_token: Optional[str] = Header(None)):
+        """Replace the promotion gate policy. Validated on write so a mistyped
+        requirement is rejected by the operator who typed it."""
+        body = await request.json() if await request.body() else {}
+        try:
+            record = _gates().set_gate(engine.store, body or None,
+                                       actor=_actor(authorization, x_rya_token))
+        except RyaError as e:
+            raise _dep_err(e)
+        return {"ok": True, "version": record.get("version"), "policy": record.get("value")}
+
+    @api.get("/gate/check")
+    def check_gate_ep(env: str, version_id: Optional[str] = None,
+                      engine: Engine = Depends(get_engine),
+                      authorization: Optional[str] = Header(None),
+                      x_rya_token: Optional[str] = Header(None)):
+        """Dry-run the gate — what a promotion would refuse, before attempting it."""
+        try:
+            if version_id:
+                version = engine.store.version_get(version_id)
+                if version is None:
+                    raise RyaError("E_VERSION_NOT_FOUND", f"Version '{version_id}' not found.")
+            else:
+                version = _deployments().current_version(engine.store, env, manifest.name)
+                if version is None:
+                    raise RyaError("E_ENVIRONMENT_NOT_FOUND",
+                                   f"Nothing is promoted to '{env}' and no versionId was given.")
+            result = _gates().check_promotion(engine.store, version=version, environment=env,
+                                              actor=_actor(authorization, x_rya_token))
+        except RyaError as e:
+            raise _dep_err(e)
+        return {"versionId": version["id"], **result.to_dict()}
+
+    @api.get("/versions/{version_id}/attestations")
+    def version_attestations_ep(version_id: str, engine: Engine = Depends(get_engine)):
+        """The evidence filed against a version: readiness, evals, overrides."""
+        if engine.store.version_get(version_id) is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "E_VERSION_NOT_FOUND", "message": f"Version '{version_id}' not found."})
+        rows = _gates().attestations(engine.store, version_id)
+        return {"attestations": rows, "count": len(rows)}
+
+    # ---- quotas (§11.12, D13) ---------------------------------------------
+    def _quotas():
+        from .. import quotas as _q
+        return _q
+
+    def _require_operator(authorization: Optional[str], x_rya_token: Optional[str]) -> None:
+        """Quota WRITES need the operator, not the tenant.
+
+        A limit the limited party can raise is not a limit. In multi-tenant mode a
+        workspace key authenticates a tenant, so quota writes demand
+        ``RYA_ADMIN_TOKEN`` — the same gate provisioning uses. In single-tenant
+        self-hosting the operator and the tenant are the same person and the
+        workspace's own auth is already the operator's auth.
+        """
+        if not mt:
+            return
+        admin = os.environ.get("RYA_ADMIN_TOKEN")
+        if not admin:
+            raise HTTPException(status_code=501, detail={
+                "code": "E_UNAUTHORIZED",
+                "message": "Quota changes are disabled: no RYA_ADMIN_TOKEN is configured.",
+                "hint": "Set RYA_ADMIN_TOKEN on the api process, then send it as a bearer token."})
+        provided = _bearer(authorization, x_rya_token)
+        if not provided or not hmac.compare_digest(provided, admin):
+            raise HTTPException(status_code=403, detail={
+                "code": "E_UNAUTHORIZED",
+                "message": "Changing a workspace quota requires the admin token.",
+                "hint": "A tenant cannot raise its own quota — that is the point of a quota."})
+
+    @api.get("/quotas")
+    def get_quotas_ep(engine: Engine = Depends(get_engine)):
+        """This workspace's limits and what it is currently consuming."""
+        q = _quotas()
+        try:
+            policy = q.resolve_quota(engine.store)
+            usage = q.usage_snapshot(engine.store)
+        except RyaError as e:
+            raise HTTPException(status_code=400, detail=e.to_dict()["error"])
+        return {"quota": policy.describe(), "usage": usage,
+                "admission": q.check_admission(engine.store, kind="any",
+                                               usage=usage).to_dict()["violations"]}
+
+    @api.put("/quotas")
+    async def put_quotas_ep(request: Request, engine: Engine = Depends(get_engine),
+                            authorization: Optional[str] = Header(None),
+                            x_rya_token: Optional[str] = Header(None)):
+        _require_operator(authorization, x_rya_token)
+        body = await request.json() if await request.body() else {}
+        try:
+            record = _quotas().set_quota(engine.store, body or None,
+                                         actor=_actor(authorization, x_rya_token))
+        except RyaError as e:
+            raise HTTPException(status_code=400, detail=e.to_dict()["error"])
+        return {"ok": True, "version": record.get("version"), "quota": record.get("value")}
+
+    @api.get("/workers")
+    def list_workers_ep(status: Optional[str] = "alive", version_id: Optional[str] = None,
+                        engine: Engine = Depends(get_engine)):
+        """Which execution-plane processes are live, on which version (§6)."""
+        listing = getattr(engine.store, "worker_list", None)
+        return {"workers": listing(version_id=version_id, status=status) if listing else []}
+
+    @api.get("/usage")
+    def usage_ep(since: Optional[str] = None, until: Optional[str] = None,
+                 group_by: Optional[str] = None, engine: Engine = Depends(get_engine)):
+        """Billable facts from the durable meter (D10) — not from run traces."""
+        from ..observability.usage import workspace_usage
+        try:
+            return {"usage": workspace_usage(engine.store, since=since, until=until,
+                                             group_by=group_by)}
+        except RyaError as e:
+            raise HTTPException(status_code=400, detail=e.to_dict()["error"])
 
     @api.get("/models")
     def models(engine: Engine = Depends(get_engine)):

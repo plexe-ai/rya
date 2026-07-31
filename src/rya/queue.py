@@ -1,4 +1,4 @@
-"""Durable job queue for EXTERNAL workers - the "bring your own worker" primitive.
+r"""Durable job queue for EXTERNAL workers - the "bring your own worker" primitive.
 
 The existing ``jobs`` primitive is handler-bound: ``rya worker`` claims a due job
 and executes its Python handler in-process. This module is the complement for
@@ -66,6 +66,13 @@ def enqueue(store, type: str, payload: Any, *, job_id: Optional[str] = None,
         existing = store.queue_get(job_id)
         if existing is not None:
             return existing
+    # §11.12: the queue-depth quota is checked AFTER the idempotency short-circuit,
+    # so a retried enqueue of an existing job never trips it — a client retrying
+    # through a timeout must not be told it is over quota for work already
+    # accepted. D14 keeps this surface SDK-free, and a foreign caller gets the
+    # same E_QUOTA_EXCEEDED as everyone else.
+    from .quotas import require_admission
+    require_admission(store, kind="job")
     job = {
         "id": job_id or _new_id("qj"),
         "type": type,
@@ -98,7 +105,21 @@ def enqueue(store, type: str, payload: Any, *, job_id: Optional[str] = None,
 
 def enqueue_batch(store, type: str, items: List[dict]) -> List[dict]:
     """Enqueue many jobs; dispatch order within the batch follows input order
-    (monotonic ``seq``)."""
+    (monotonic ``seq``).
+
+    Quota-wise a batch is admitted or refused **as a unit**: the depth check runs
+    once, against the depth the batch would produce, rather than per item. Two
+    reasons — a per-item check would issue one count query per job, and a batch
+    accepted halfway is worse than one refused outright, since the caller has no
+    way to know where the fan-out stopped.
+    """
+    from .quotas import _usage_for, require_admission
+    usage = _usage_for(store, {"queueDepth", "tokensToday", "costUsdToday"})
+    if "queueDepth" in usage:
+        # Charge the batch up front, so 1 free slot does not admit 500 jobs.
+        usage = {**usage, "queueDepth": usage["queueDepth"] + max(0, len(items) - 1)}
+    require_admission(store, kind="job", usage=usage)
+
     return [
         enqueue(
             store, type, item.get("payload"),
@@ -116,22 +137,60 @@ def enqueue_batch(store, type: str, items: List[dict]) -> List[dict]:
     ]
 
 
+def version_of(job: dict) -> Optional[str]:
+    """The version a job is pinned to, if any (PLATFORM_DESIGN D12).
+
+    Carried in ``metadata`` rather than as a column so the SDK-free ``/queue/*``
+    surface (D14) stays unchanged for foreign workers: a TypeScript worker that
+    knows nothing about versions enqueues without one and claims without one.
+    """
+    return (job.get("metadata") or {}).get("versionId")
+
+
 def claim(store, worker_id: str, *, types: Optional[List[str]] = None, limit: int = 1,
-          lease_seconds: float = DEFAULT_LEASE_SECONDS) -> List[dict]:
+          lease_seconds: float = DEFAULT_LEASE_SECONDS,
+          version_id: Optional[str] = None) -> List[dict]:
     """Claim up to ``limit`` due jobs for ``worker_id``. Reaps expired leases
     first, then claims one at a time so per-key concurrency caps hold even
-    within a single call."""
+    within a single call.
+
+    ``version_id`` is version-pinned claiming (D12): a worker serving version A
+    must not execute a run pinned to version B, because replay is only sound
+    against the code that wrote the journal. A pinned worker claims jobs pinned
+    to its version plus unpinned ones; an UNpinned worker (the `rya dev` /
+    single-tenant case, and any foreign `/queue/*` consumer) claims anything, so
+    D14's SDK-free surface is untouched.
+
+    Filtering happens after the claim rather than in SQL: releasing a wrongly
+    matched job is cheap and correct on both backends, whereas pushing a JSONB
+    predicate into ``queue_claim_one`` would fork the two store implementations
+    for a case that only arises while several versions are live at once.
+    """
     if not worker_id:
         raise RyaError("E_VALIDATION", "workerId is required to claim jobs.")
     now = now_iso()
     store.queue_reap(now)
     lease = _iso_plus(max(0, lease_seconds))
-    claimed = []
+    claimed: List[dict] = []
+    released: List[dict] = []
     for _ in range(max(1, min(int(limit), MAX_CLAIM_LIMIT))):
         job = store.queue_claim_one(worker_id, now, lease, types)
         if job is None:
             break
+        pinned = version_of(job)
+        if version_id is not None and pinned is not None and pinned != version_id:
+            released.append(job)
+            continue
         claimed.append(job)
+    for job in released:
+        # Hand it back unchanged so the worker on ITS version can take it. The
+        # attempt that queue_claim_one incremented is rolled back: refusing a job
+        # you are not allowed to run must not consume its retry budget.
+        job["status"] = "pending"
+        job["workerId"] = None
+        job["leaseExpiresAt"] = None
+        job["attempts"] = max(0, int(job.get("attempts") or 1) - 1)
+        store.queue_save(job)
     return claimed
 
 

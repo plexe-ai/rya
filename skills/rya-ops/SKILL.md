@@ -43,6 +43,37 @@ rya approvals approve <approval_id> --json   # resume -> runStatus: completed
 rya approvals reject  <approval_id> --json   # terminate -> runStatus: rejected
 ```
 
+## Ship a version
+
+A version is an immutable, content-hashed bundle. Deploying is recording one and
+flipping an environment pointer at it; rollback is the same flip backwards.
+
+```bash
+# From a machine WITH the platform (rya-server): needs DB + bundle-store access.
+rya deploy --check                 # readiness gate; exit 7 if not green
+rya deploy --env prod              # bundle -> version -> attest readiness -> promote
+rya rollback --env prod            # pointer flip back
+
+# From a CLIENT repo (thin SDK only): over HTTP, no DB or bucket needed.
+rya login https://rya.host --key rya_sk_…
+rya publish --env prod             # bundle -> upload -> version -> promote
+
+rya versions list --json           # every version, newest first
+rya envs show prod --json          # what prod points at
+```
+
+**`publish` cannot attest readiness.** The control plane does not import bundles,
+so it files no readiness evidence — the response carries `"attested": false`. An
+environment gated with `rya gate set --env prod --require-readiness` will refuse a
+version published this way; use `rya deploy --env` for that.
+
+**A pinned worker is one version.** `rya worker --env prod` resolves the pointer
+once at startup, so a re-publish needs the workers rolled before it serves.
+
+**One deployment serves one agent.** `rya serve` resolves a single
+`rya.agent.yaml` at startup, so publishing a bundle whose `name:` differs is
+refused with `E_VALIDATION`. Run one api+worker pair per agent.
+
 ## Serve + webhooks (production)
 
 ```bash

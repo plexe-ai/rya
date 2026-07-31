@@ -41,6 +41,25 @@ def check_readiness(manifest, store, agent, project_root) -> dict:
         block("E_RUNTIME_UNSUPPORTED", f"Runtime '{manifest.runtime}' is not executable by this build.",
               "Set runtime: python in the manifest.")
 
+    # D11: the manifest is environment-INVARIANT, because one content-hashed
+    # bundle is promoted between environments. A leftover `environment:` is
+    # inert and actively misleading — a production container declaring itself
+    # `local` is exactly the failure the decision names — so the deploy gate
+    # refuses it rather than ignoring it a second time.
+    manifest_path = Path(project_root) / "rya.agent.yaml"
+    if manifest_path.is_file():
+        import yaml
+        try:
+            raw = yaml.safe_load(manifest_path.read_text()) or {}
+        except yaml.YAMLError:
+            raw = {}
+        if isinstance(raw, dict) and "environment" in raw:
+            block("E_MANIFEST_ENVIRONMENT",
+                  f"rya.agent.yaml still declares `environment: {raw['environment']}`, "
+                  "which no longer exists.",
+                  "Delete the line. One bundle is promoted between environments "
+                  "(`rya deploy --env prod`); per-environment values are platform config.")
+
     gate_policy = manifest.approvals.default  # default: required_for_external_actions
     for t in manifest.tools:
         spec = treg.get(t.id)
@@ -59,6 +78,24 @@ def check_readiness(manifest, store, agent, project_root) -> dict:
             if not env.get(secret):
                 block("E_SECRET_UNSET", f"Secret '{secret}' (required by '{t.id}') is not set.",
                       f"rya secrets set {secret}=…", secret=secret, tool=t.id)
+
+    # --- blocks: no per-user credential stored in plaintext at rest -----
+    # A tool that resolves a per-user connection (provider + require_user) must not
+    # have that connection sitting unencrypted on disk — a stolen store would leak
+    # the bearer. seal() silently degrades to plaintext when no key material is
+    # present; catch that here so a real deploy fails closed. list_connections()
+    # exposes `encrypted` (is_sealed) per row, secret stripped.
+    guarded_providers = {t.provider for t in manifest.tools
+                         if getattr(t, "provider", None) and getattr(t, "require_user", False)}
+    if guarded_providers and hasattr(store, "list_connections"):
+        for c in store.list_connections():
+            if (c.get("provider") in guarded_providers and c.get("secretSet")
+                    and not c.get("encrypted")):
+                block("E_PLAINTEXT_SECRET_AT_REST",
+                      f"Connection '{c.get('id')}' for provider '{c.get('provider')}' is stored "
+                      "in plaintext (not encrypted at rest).",
+                      "Set RYA_SECRET_KEY (or install `cryptography`) and run `rya connect --reseal` "
+                      "so the credential is sealed.", connection=c.get("id"), provider=c.get("provider"))
 
     # --- warnings: hardening advice -------------------------------------
     if resolve_provider(manifest.model.provider) == "mock":

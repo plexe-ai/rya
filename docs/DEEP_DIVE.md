@@ -62,10 +62,9 @@ name: support-followup-agent
 runtime: python                 # python (node reserved)
 entrypoint: src/agent.py
 version: 0.1.0
-environment: local
 timeout_seconds: 300            # per-run-segment execution timeout
 model:
-  provider: auto                # auto | mock | anthropic | openai
+  provider: auto                # auto | mock | anthropic | openai | bedrock | adapter
   default: claude-haiku-4-5     # model name
   fallback: gpt-4.1-mini        # used on provider failure
   temperature: 0.2
@@ -87,8 +86,14 @@ triggers:
   - { id: daily, type: cron, schedule: "0 9 * * *", handler: daily_followup }
 approvals:
   default: required_for_external_actions
-observability: { traces: true, export: langfuse }
+observability: { traces: true, audit: true }
 ```
+
+The manifest is **environment-invariant** (D11): there is no `environment:` field,
+and one content-hashed bundle is promoted *between* dev/staging/prod. Anything
+that differs per environment — model routes, egress allowlists, credentials,
+trace export — is per-environment platform state, not a manifest field. A
+leftover `environment:` line is a readiness **block** (`E_MANIFEST_ENVIRONMENT`).
 
 A companion `rya.guard.yaml` holds the egress policy (§11).
 
@@ -121,8 +126,10 @@ async def score(input): ...
 async def daily_followup(ctx, job): ...
 ```
 
-`ctx` exposes: `llm · models · memory · tools · channels · jobs · cron ·
-approvals · logs · traces · secrets · events · identity`.
+`ctx` exposes seventeen namespaces: `llm · models · memory · knowledge · tools ·
+channels · jobs · cron · approvals · sessions · files · connections · logs ·
+traces · secrets · events · guard` — plus `ctx.identity` (a plain attribute: the
+verified user, or `None`).
 
 ---
 
@@ -201,6 +208,13 @@ Single deployed agent, modes by env (all enforced server-side):
 | `RYA_JWT_SECRET` / `RYA_JWKS_URL` | per-user JWT (HS256 / RS256-JWKS) | end users |
 | `RYA_MULTITENANT=1` + Postgres | API keys → workspace, RLS | tenants |
 
+"Open" has one exception: `POST /agents/:id/versions` (`rya publish`) is refused
+with **403 `E_UNAUTHORIZED`** while auth is off (`auth_enabled()` in
+[api/app.py](../src/rya/api/app.py)). An open control plane elsewhere leaks reads
+and writes; an open publish route means *anonymous code upload* to a box whose
+worker imports it. `RYA_ALLOW_UNAUTHENTICATED_PUBLISH=1` re-enables it for a
+local-only loop.
+
 Inbound webhooks add `RYA_WEBHOOK_SECRET` (HMAC) and `RYA_SLACK_SIGNING_SECRET`
 (Slack signature) — independent of operator auth, since third-party senders hold
 the signing secret, not the token.
@@ -211,10 +225,12 @@ the signing secret, not the token.
 
 The same operations over three surfaces; see [mcp.md](mcp.md), [devex.md](devex.md).
 
-- **CLI** — every command takes `--json`/`--non-interactive`; failures return
+- **CLI** — every command takes `--json`; `--non-interactive` is on the handful
+  that could otherwise prompt (`deploy`, `publish`, `eval`, `provision`,
+  `events send`, `approvals approve/reject`). Failures return
   `{ok:false, error:{code, message, hint, exit_code}}`. Exit codes are semantic
   (§16) so an agent branches without parsing prose.
-- **MCP** — `rya mcp` (stdio), **20 `rya_*` tools** including `rya_context`
+- **MCP** — `rya mcp` (stdio), **25 `rya_*` tools** including `rya_context`
   (orient) and `rya_check_readiness` (the gate). Register with `{"command":"rya","args":["mcp"]}`.
 - **Skills** — `rya skills install` writes two progressive-disclosure modules:
   `rya` (authoring) and `rya-ops` (operating).
@@ -277,8 +293,11 @@ SSRF blocklist  →  deny rules  →  allow rules  →  default (deny | allow)
   cost is computed only when `RYA_PRICE_<MODEL>_IN/_OUT` is configured (no
   hard-coded prices). [observability/usage.py](../src/rya/observability/usage.py).
 - **Export** — on a terminal run, traces are pushed to **Langfuse**
-  (`LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`) or a generic `RYA_TRACE_WEBHOOK`;
-  best-effort, never fails a run. [observability/export.py](../src/rya/observability/export.py).
+  (`LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`), an **OTLP/HTTP** collector
+  (`RYA_OTLP_ENDPOINT`, + `RYA_OTLP_HEADERS`/`OTEL_SERVICE_NAME` — GenAI semantic
+  conventions, so Phoenix/Tempo/Datadog read it), or a generic
+  `RYA_TRACE_WEBHOOK`; all three stdlib-only, best-effort, never fails a run.
+  [observability/export.py](../src/rya/observability/export.py).
 - **Secret redaction** — secret values are scrubbed from traces/logs.
 
 ---
@@ -299,7 +318,17 @@ prompts for the token when auth is on.
 
 ## 14. Deployment
 
-- **Self-host (OSS):** `docker compose up` (Postgres + `rya serve`), or
+- **Self-host (OSS):** `docker compose up` brings up four services —
+  `postgres`; `minio`, the S3-compatible bundle-archive store the api and workers
+  share; `rya`, the api (control plane, `RYA_API_INLINE_WORKER: "0"` so it runs no
+  handler code); and `worker`, the execution plane that claims from the queue and
+  executes handlers. A fifth, `worker-pinned`, sits behind the `pinned` profile
+  (`docker compose --profile pinned up -d worker-pinned`) and runs
+  `rya worker --env prod` — one content-hashed bundle, so a re-publish needs a
+  restart. Your project mounts at `${RYA_PROJECT:-./examples/followup_agent}`
+  → `/project`, with `/project/.rya` on a named volume (`rya_project_state`) so
+  the containers' root-owned state never lands in your working tree.
+  [docker-compose.yml](../docker-compose.yml). Or
   `rya deploy --target docker|fly|render` generates a self-contained image
   (agent baked in; state external via `RYA_DATABASE_URL`) + the exact command.
   [deploy_templates.py](../src/rya/cli/deploy_templates.py).
@@ -308,14 +337,30 @@ prompts for the token when auth is on.
   Postgres, ElastiCache, Secrets Manager, mutator Lambda), cfn-lint clean.
   `sam deploy` is an operator step (real, billable).
 - **Distribution:** `uv build` → wheel/sdist; `uvx rya serve` ships the console.
-  Not yet published to PyPI.
+  Not yet published to PyPI. The platform image installs
+  `.[api,postgres,llm,mcp,s3]` ([Dockerfile](../Dockerfile)) — the `s3` extra
+  (boto3) is not optional in practice, because it is what lets bundle archives and
+  file bytes live in an object store rather than on one container's disk. Without
+  it `rya publish` fails with `E_BUNDLE_STORE`.
 
 ---
 
 ## 15. Testing
 
-`pytest` — **72 pass, 7 Postgres-gated** (run those with
-`RYA_TEST_DATABASE_URL=…`). Coverage includes: manifest validation, the durable
+`pytest` — **63 test files, 562 test functions** (before parametrization, so the
+collected count is higher). Skips are Postgres-gated (run those with
+`RYA_TEST_DATABASE_URL=…`) plus the live-provider and DeepEval tests.
+
+Two things to know before running it. **Unset provider keys first** — with
+`ANTHROPIC_API_KEY` present, `_concrete_provider` in
+[config.py](../src/rya/config.py) (reached via `resolve_model_route`) resolves
+`auto` → `anthropic` from the key's mere presence, so tests written against the
+deterministic mock silently hit the live API. `RYA_FORCE_MOCK=1` overrides it. And
+**`rya[mcp]` must be `<2`**: `pyproject.toml` declares `mcp>=1.2.0` with no upper
+bound, but `mcp` 2.0.0 removed `streamablehttp_client`, which breaks both
+`test_remote_mcp.py` tests.
+
+Coverage includes: manifest validation, the durable
 pause/resume slice (file + Postgres, cross-process), per-user RLS, JWT, real
 tool/channel HTTP delivery, the signed-webhook + auth flows, the
 production-readiness gate, the console aggregate, and the **Action Guard**
@@ -330,12 +375,24 @@ and assertable.
 ### CLI
 
 ```
-login init create dev deploy(--check/--target/--force) status context logs
+login init create dev check status context logs
+deploy(--env/--promote/--target/--check/--force/--actor/--metadata/--write
+       | aws|status|destroy: --region/--stack/--count/--ha
+                             --skip-build/--langfuse/--yes)
+publish(--env/--promote/--actor/--metadata/--url/--key
+        --skip-check/--non-interactive)
 agents(list/inspect) events(send) runs(list/trace) approvals(list/approve/reject)
 tools(list/register) models(list/register) channels(list/connect)
 secrets(set/list) schedules(list/create/run) jobs(list/run/dlq/retry)
 skills(install/path) workspaces(create/list) keys(create) token mcp serve worker
 ```
+
+`check` (manifest + handler set, starts nothing — what CI runs) and `publish`
+(the deploy pipeline over HTTP, for a repo with no database or bucket access) are
+defined in the thin client CLI [cli/client.py](../src/rya/cli/client.py) and
+re-registered in [cli/main.py](../src/rya/cli/main.py), so they survive an
+editable install of the platform. `rya deploy --env` is the same pipeline as
+`publish`, run locally by an operator who already has both.
 
 ### HTTP API (single-tenant)
 
@@ -348,18 +405,36 @@ POST /agents/:id/events     trigger a run         GET  /agents/:id     manifest
 GET  /agents/:id/runs       GET /runs/:id         GET  /runs/:id/trace
 GET  /approvals             POST /approvals/:id/approve  /reject
 GET  /tools /models /channels
+GET  /agents/:id/versions   list versions         POST /agents/:id/versions  publish
 ```
+
+`POST /agents/:id/versions` takes the raw `application/gzip` bundle as the request
+body with `?hash=` (required) plus `env`, `promote`, `actor` and repeatable
+`meta.<k>=<v>` provenance. It rebuilds the hash from the bytes it received rather
+than trusting the sidecar (`E_BUNDLE_MISMATCH`, 409), caps the body at
+`RYA_MAX_BUNDLE_BYTES` (413), and **never imports the bundle** — the control plane
+does not run tenant code — so the response carries
+`"attested": false, "notAttested": ["readiness"]`.
 
 ### Error / exit codes
 
 | Exit | Codes |
 |------|-------|
-| 1 generic | `E_RUNTIME`, `E_TIMEOUT` |
+| 1 generic | `E_RUNTIME`, `E_TIMEOUT`, `E_BUNDLE_STORE` |
 | 3 manifest | `E_MANIFEST_*`, `E_ENTRYPOINT_NOT_FOUND`, `E_AGENT_NOT_DEFINED` |
-| 4 not-found | `E_*_NOT_FOUND` (run/approval/tool/model/job/handler) |
+| 4 not-found | `E_*_NOT_FOUND` (run/approval/tool/model/job/handler/version/bundle/environment) |
 | 5 permission | `E_TOOL_PERMISSION_DENIED`, `E_UNAUTHORIZED`, `E_BAD_SIGNATURE`, `E_EGRESS_BLOCKED` |
-| 6 state | `E_APPROVAL_NOT_PENDING`, `E_RUN_NOT_PAUSED` |
+| 6 state | `E_APPROVAL_NOT_PENDING`, `E_RUN_NOT_PAUSED`, `E_BUNDLE_MISMATCH` |
 | 7 validation | `E_VALIDATION`, `E_NOT_PRODUCTION_READY` |
+
+A code not in [errors.py](../src/rya/errors.py)'s table falls through to exit 1 —
+which is why a *declared* code is part of the contract, not paperwork. Over HTTP
+the same codes carry a status: `E_BUNDLE_STORE` **503** (the operator's bucket, not
+the caller's request), `E_BUNDLE_NOT_FOUND` **404**, `E_BUNDLE_MISMATCH` **409**,
+`E_PROMOTION_BLOCKED` **422**, `E_QUOTA_EXCEEDED` **429**. `RemoteClient`
+([cloud.py](../src/rya/cloud.py)) re-raises the server's code instead of collapsing
+it to `E_REMOTE`, so the contract survives the network boundary — a caller can
+still tell a content-hash mismatch from an unreachable bucket.
 
 ### Key environment variables
 
@@ -368,10 +443,20 @@ GET  /tools /models /channels
 | Persistence | `RYA_DATABASE_URL` / `DATABASE_URL`, `RYA_APP_DB_PASSWORD` |
 | Auth | `RYA_TOKEN`, `RYA_JWT_SECRET`, `RYA_JWKS_URL`, `RYA_MULTITENANT` |
 | Webhooks | `RYA_WEBHOOK_SECRET`, `RYA_SLACK_SIGNING_SECRET` |
-| Models | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RYA_LLM_MODEL`, `RYA_OPENAI_MODEL`, `RYA_LLM_PROVIDER` |
+| Models | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `RYA_LLM_MODEL`, `RYA_OPENAI_MODEL` |
 | Channels | `SLACK_WEBHOOK_URL`, `RESEND_API_KEY`, `RYA_EMAIL_FROM`, `RYA_CHANNEL_<TYPE>_URL` |
-| Cost/obs | `RYA_PRICE_<MODEL>_IN/_OUT`, `LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`, `RYA_TRACE_WEBHOOK` |
+| Cost/obs | `RYA_PRICE_<MODEL>_IN/_OUT`, `LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`, `RYA_TRACE_WEBHOOK`, `RYA_OTLP_ENDPOINT`, `RYA_OTLP_HEADERS`, `OTEL_SERVICE_NAME` |
+| Object stores | `RYA_BUNDLES_S3_BUCKET`, `_PREFIX`, `_REGION`, `_ENDPOINT`†; `RYA_FILES_S3_BUCKET`, `RYA_FILES_S3_ENDPOINT`†; `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` |
+| Publish | `RYA_MAX_BUNDLE_BYTES` (default 20 MB → 413), `RYA_ALLOW_UNAUTHENTICATED_PUBLISH` |
+| Compose | `RYA_PROJECT` (which project tree to mount), `RYA_API_INLINE_WORKER` |
 | Guard | `RYA_GUARD_PATH` |
+
+† Each object store falls back to a local directory when its `_BUCKET` is unset. A
+declared `*_S3_ENDPOINT` means "S3-compatible, not S3" (MinIO/Ceph/R2) and also
+forces **path-style addressing** — botocore has no env var for
+`s3.addressing_style`, so it must be passed on the client, and left at the default
+`http://minio:9000` + bucket `rya-bundles` becomes `http://rya-bundles.minio:9000`
+and fails to resolve. Leave it blank on real AWS, which wants the virtual-host form.
 
 ---
 
@@ -384,6 +469,18 @@ GET  /tools /models /channels
   enforcement), job retry/DLQ, the TS client, deploy artifacts, and `uvx`.
 - **Mocked:** the default tool/model implementations (deterministic IO; the
   registries/permissions/traces around them are real).
+- **One deployment serves exactly one agent.** `build_app` loads
+  `rya.agent.yaml` once at startup and every handler resolves `manifest.name`, so
+  the `:id` in the route paths above is decorative — and
+  `POST /agents/:id/versions` refuses a bundle declaring a different `name` rather
+  than filing a version nothing would list and nobody would run. Serving a second
+  agent means a second deployment.
+- **The publish path files no readiness attestation.** The control plane never
+  imports a bundle, so readiness is not evaluated: the response says
+  `"attested": false, "notAttested": ["readiness"]`, and a readiness-gated
+  environment refuses the promotion (`E_PROMOTION_BLOCKED`). There is no
+  `rya attest readiness` command — the attestation is filed by
+  `rya deploy --env`, which runs the gate locally because it has the store.
 - **Not built:** a *managed* cloud deploy (`rya deploy` emits self-host artifacts
   — `sam deploy` is manual), the Action Guard LLM judge, remote MCP + OAuth, a
   PyPI publish, and per-tenant code sandboxing.

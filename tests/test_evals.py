@@ -19,6 +19,22 @@ def _project(tmp_path):
     return manifest, agent, store
 
 
+def _declare_tool(tmp_path, tool_id: str, permission: str = "approval_required"):
+    """Add a tool to the manifest and return the reloaded manifest.
+
+    An approved action now resolves permission through the same path as
+    ctx.tools.call (PLATFORM_DESIGN §11.1), so a tool the manifest never
+    declared has no permission and is refused — @agent.tool alone is an
+    implementation, not an authorization.
+    """
+    import yaml
+    p = tmp_path / "rya.agent.yaml"
+    doc = yaml.safe_load(p.read_text())
+    doc.setdefault("tools", []).append({"id": tool_id, "permission": permission})
+    p.write_text(yaml.safe_dump(doc))
+    return load_manifest(p)
+
+
 def test_scaffold_ships_evals(tmp_path):
     scaffold.write_project(tmp_path, "ev", template="demo")
     assert (tmp_path / "rya.evals.yaml").exists()
@@ -80,9 +96,11 @@ def test_deepeval_scorer_registered_and_skips_when_absent():
     assert ok is False and "unknown deepeval metric" in detail
 
 
-@pytest.mark.skipif(not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")),
-                    reason="set ANTHROPIC_API_KEY or OPENAI_API_KEY to run the live DeepEval metric")
-def test_deepeval_faithfulness_discriminates_live():
+def test_deepeval_faithfulness_discriminates_live(live_provider_key):
+    # `live_provider_key` (conftest) re-admits the ambient credential and skips
+    # without one. A collection-time `skipif` on os.environ cannot work now that
+    # the suite is hermetic by default — it is evaluated before the fixture that
+    # clears the environment, so the test would run keyless and fail.
     """With a real provider key, the DeepEval scorer computes a genuine metric
     and tells a faithful answer apart from a hallucinated one."""
     from rya.evals import _score_deepeval
@@ -182,6 +200,7 @@ async def gated_job(ctx, job):
     return {"resumed": True, "value": job.payload["value"]}
 ''')
     from rya.runtime import load_agent as _load
+    manifest = _declare_tool(tmp_path, "side.effect")
     agent = _load(manifest, tmp_path)
     engine = Engine(manifest, agent, store, tmp_path)
 
@@ -223,6 +242,7 @@ async def gated_job(ctx, job):
                                 action={"tool": "side.effect", "input": {}})
     return {"done": True}
 ''')
+    manifest = _declare_tool(tmp_path, "side.effect")
     agent = _load(manifest, tmp_path)
     engine = Engine(manifest, agent, store, tmp_path)
     engine.run_event("message.received", {"email": "a@x.co"})

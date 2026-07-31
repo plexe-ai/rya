@@ -2,8 +2,10 @@
 
 Two surfaces let coding agents drive Rya without a human: an **MCP server**
 (MCP-native agents call Rya as tools) and a **Skill** (teaches the workflow so
-the agent doesn't rediscover it each session). Both are built and wrap the same
-operations as the CLI.
+the agent doesn't rediscover it each session). Both are built. The MCP tools
+cover the authoring and run/inspect/approve loop — a subset of the CLI, not a
+mirror of it: the deployment and control-plane commands (`publish`, `versions`,
+`envs`, `gate`, `quotas`, `keys`, `workspaces`) have no MCP tool.
 
 ## MCP server
 
@@ -31,7 +33,7 @@ Every tool returns structured JSON with a stable `ok` flag; failures carry
 folder containing `rya.agent.yaml`); it defaults to the server's working
 directory.
 
-### Tools (19)
+### Tools (25)
 
 | MCP tool | What it does | CLI / API equivalent |
 |----------|--------------|----------------------|
@@ -39,7 +41,7 @@ directory.
 | `rya_create_agent` | Scaffold a project | `rya create` |
 | `rya_get_agent` | Full manifest | `rya agents inspect` / `GET /agents/:id` |
 | `rya_validate_manifest` | Validate manifest + agent code | `rya dev` |
-| `rya_deploy_agent` | Validate + deploy plan | `rya deploy` |
+| `rya_deploy_agent` | **Validates only** — loads the manifest and imports the agent code, then returns `deployed: false`. Ships nothing | `rya dev --check` |
 | `rya_trigger_event` | Trigger a run | `rya events send` / `POST /agents/:id/events` |
 | `rya_list_runs` | Recent runs | `rya runs list` / `GET /agents/:id/runs` |
 | `rya_get_run_trace` | Full durable trace | `rya runs trace` / `GET /runs/:id/trace` |
@@ -54,6 +56,16 @@ directory.
 | `rya_list_channels` | Channels | `rya channels list` / `GET /channels` |
 | `rya_connect_channel` | Enable a channel | `rya channels connect` |
 | `rya_status` | Run/approval/job counts | `rya status` |
+| `rya_provision` | Stand up the full base infrastructure in one call (DB, memory, sessions, auth, guardrails, WebSocket, jobs + DLQ, observability, secrets) | `rya provision` |
+| `rya_check_readiness` | Production-readiness checklist → `{ready, blocks, warnings}`, each block carrying a stable `code` + exact `fix` | `rya deploy --check` |
+| `rya_eval` | Run `rya.evals.yaml` against the runtime — each case fires a **real** event and scores the run | `rya eval` |
+| `rya_connect` | Create a scoped, vaulted provider credential (never returned to the model) | `rya connect` |
+| `rya_list_connections` | List connections (provider, scopes, owner, status, `secretSet`) — never the secret | `rya connections list` |
+| `rya_reseal_connections` | One-time idempotent migration encrypting legacy plaintext secrets at rest | `rya connections reseal` |
+
+There is deliberately no `rya_publish` tool: `rya publish` uploads code that a
+worker will import, and a coding agent should not promote a version without a
+human running the command.
 
 The tool logic lives in [src/rya/mcp/ops.py](../src/rya/mcp/ops.py) (plain,
 unit-tested functions); [src/rya/mcp/server.py](../src/rya/mcp/server.py) is the

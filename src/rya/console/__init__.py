@@ -1,1 +1,1 @@
-"""Bundled web console served by \`rya serve\`."""
+"""Bundled web console served by ``rya serve``."""

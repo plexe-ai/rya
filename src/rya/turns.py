@@ -36,13 +36,39 @@ def _summary(run: dict) -> dict:
             "tokens": u["inputTokens"] + u["outputTokens"], "costUsd": u.get("costUsd")}
 
 
-def create_turn(engine, type: str, payload: dict, *, max_attempts: int = 3) -> dict:
+def create_turn(engine, type: str, payload: dict, *, identity=None,
+                max_attempts: int = 3) -> dict:
     """Enqueue a durable chat turn. Returns ``{turnId, runId: None}`` - the turn
     runs on a worker (inline or reclaimed) and its frames land in the stream
-    buffer keyed by ``turnId``."""
-    job = q.enqueue(engine.store, "chat-turn", {"type": type, "payload": payload},
-                    max_attempts=max_attempts)
+    buffer keyed by ``turnId``.
+
+    ``identity`` is the VERIFIED caller, carried on the job so the executing
+    worker runs under it. D6 routes every stream through this buffer, which means
+    the process that authenticated the request is no longer the process that
+    executes the handler — without this the run would silently lose per-user
+    scoping (and fall through to workspace-shared credentials).
+    """
+    claims = None
+    if identity is not None:
+        claims = identity.to_dict() if hasattr(identity, "to_dict") else identity
+    # D12: pin the turn to the version that enqueued it, so a worker on a
+    # different version will not claim it (queue.claim's version filter). An
+    # unpinned engine (`rya dev`, single-tenant) enqueues without one, and any
+    # worker takes it.
+    version = getattr(engine, "version", None) or {}
+    metadata = {"versionId": version["id"]} if version.get("id") else None
+    job = q.enqueue(engine.store, "chat-turn",
+                    {"type": type, "payload": payload, "identity": claims},
+                    max_attempts=max_attempts, metadata=metadata,
+                    concurrency_key=version.get("id"))
     return {"turnId": job["id"], "status": job["status"]}
+
+
+def _identity_from_claims(claims):
+    if not claims:
+        return None
+    from .auth import Identity
+    return Identity(sub=claims["sub"], claims=claims)
 
 
 def _run_turn(engine, job: dict, worker_id: str) -> None:
@@ -67,7 +93,8 @@ def _run_turn(engine, job: dict, worker_id: str) -> None:
 
     try:
         run = engine.run_event(ev.get("type", "message.received"), ev.get("payload", {}),
-                               source="turn", on_trace=on_trace, on_token=on_token, on_ui=on_ui)
+                               source="turn", identity=_identity_from_claims(ev.get("identity")),
+                               on_trace=on_trace, on_token=on_token, on_ui=on_ui)
         if run["status"] == "waiting_approval":
             # Tag the paused run with its turn so the approval resolution can
             # stream the continuation onto this same buffer (resolve_on_stream).
@@ -91,7 +118,8 @@ def execute_pending(engine, worker_id: str = "turn-worker", limit: int = 10,
     Call it inline after enqueue (low latency) and/or from a periodic sweeper /
     ``rya`` worker loop (the durability backstop). Returns the turn ids run."""
     claimed = q.claim(engine.store, worker_id, types=["chat-turn"], limit=limit,
-                      lease_seconds=lease_seconds)
+                      lease_seconds=lease_seconds,
+                      version_id=(getattr(engine, "version", None) or {}).get("id"))
     for job in claimed:
         _run_turn(engine, job, worker_id)
     return [j["id"] for j in claimed]
@@ -148,7 +176,7 @@ def read_stream(engine, turn_id: str, after_seq: int = -1) -> List[dict]:
     return engine.store.stream_read(turn_id, after_seq)
 
 
-TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected")
+TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected", "needs_reconnect")
 
 
 def is_terminal(frames: List[dict]) -> Optional[dict]:

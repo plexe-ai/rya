@@ -2,7 +2,9 @@
 
 Rya owns the durable journal (replay depends on it) but does not try to be an
 observability product. Point it at a Langfuse - self-hosted or cloud - and every
-run and every eval score lands there automatically.
+run and every eval score lands there automatically. Rya also *reads* from
+Langfuse: `rya eval --langfuse-dataset` pulls a dataset's items and runs the
+agent over each (see [Run a Langfuse dataset](#run-a-langfuse-dataset)).
 
 ## What gets exported
 
@@ -70,6 +72,47 @@ The compose file runs the full Langfuse v3 stack (web, worker, Postgres,
 ClickHouse, Redis, MinIO) with local-dev credentials baked in - override every
 secret via env before exposing it anywhere. The web port binds to 127.0.0.1
 only.
+
+## Run a Langfuse dataset
+
+Have an eval dataset in Langfuse (Datasets — items with an `input` and optional
+`expectedOutput`)? Run the agent over every item and record the results as a
+Langfuse **dataset run**:
+
+```bash
+rya eval --langfuse-dataset <dataset-name>
+```
+
+Each item fires a real engine run (exactly like a local eval case), the run's
+trace is exported, and the trace is linked to its dataset item as a
+`dataset-run-item` — so the whole run shows up under **Datasets → your dataset →
+Runs** in the Langfuse UI, one row per item, each opening the trace that produced
+it. Uses the same three `LANGFUSE_*` env vars; it errors if they're unset.
+
+**How an item's `input` maps to an event** (`type`, `payload`):
+
+| Item `input` | Fired as |
+|---|---|
+| dict with `type` / `payload` keys | those, verbatim |
+| any other dict | the `payload` (type = `--trigger-type`, default `message.received`) |
+| a string | `{"body": <string>}` |
+
+`--payload-defaults '<json>'` is merged *under* every item's payload, so a
+dataset that only carries `body` still satisfies a handler that needs a fixed
+field — the item always wins on conflict:
+
+```bash
+rya eval --langfuse-dataset csa-golden \
+  --payload-defaults '{"email":"counsellor@csa.test"}' \
+  --run-name nightly-2026-07-23 --json
+```
+
+**Scoring.** An item is "run and linked" by default (counts as a pass; its trace
++ any metric scores still land in Langfuse). To assert behaviour per item, add a
+Rya `expect` block under the item's **metadata** (`metadata.expect`) — the same
+scorers as local evals (`status`, `tools_called`, `no_failure`, `deepeval`, …)
+run and attach as scores to the trace. Any failing item exits non-zero (5), so
+you can gate a deploy on a Langfuse dataset just like the local suite.
 
 ## Deep evals
 

@@ -223,7 +223,11 @@ def deploy_agent(project_dir: Optional[str] = None) -> dict:
             "target": "local",
             "agent": manifest.name,
             "version": manifest.version,
-            "message": "Validated locally. Hosted control-plane deploy is a later milestone.",
+            # Not "a later milestone" any more — shipping exists (`rya deploy
+            # --env`, `rya publish`). It is withheld from MCP on purpose: this
+            # tool must not be able to promote a version.
+            "message": "Validated locally; nothing was shipped. Run `rya publish --env <env>` "
+                       "(client repo) or `rya deploy --env <env>` (with store access) to ship.",
         }
     except RyaError as e:
         return _err(e)

@@ -11,6 +11,20 @@ The developer-facing surface and the heart of the runtime.
 - `context.py` - `RuntimeContext` (`ctx`) and its sub-interfaces. This is where
   journaling, permissions, pins, secret redaction, and the Action Guard live.
 
+## Where the package split cuts (D16 / §14)
+
+`agent.py` is SDK code and ships in the thin `rya` wheel; `context.py` is
+**platform** code and does not — the SDK ships type stubs for it, kept at
+`packaging/sdk/stubs/rya/sdk/context.pyi` and checked against the live class by
+`tests/test_sdk_surface.py`. Consequences for anyone editing here:
+
+- `__init__.py` must not import `.context` at module scope; the names are
+  re-exported lazily (PEP 562). One eager import puts the whole engine tree
+  behind `import rya`.
+- `agent.py` must stay import-free of the rest of the package.
+- A new public `ctx.*` method or sub-interface needs a matching entry in the
+  stub, or the stub test fails. See docs/PACKAGING.md.
+
 ## The `ctx` surface (sub-interfaces in context.py)
 
 `ctx.llm` (respond/run, model routes, streaming), `ctx.models`, `ctx.memory`

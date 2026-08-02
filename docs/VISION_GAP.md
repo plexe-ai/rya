@@ -75,14 +75,17 @@ live API. That is the ambient-config bug class, reproduced in our own suite.
   anything ([worker.py](../src/rya/worker.py)). Moving a *live* run onto a new
   version stays impossible **on purpose** (PLATFORM_DESIGN D12): replay is only
   sound against the code that wrote the journal, so a version is retained while
-  any run is pinned to it and in-flight runs finish on theirs. What is genuinely
-  open is the *fleet lifecycle*: **no autoscale, no start-on-demand, no
-  scale-to-zero** — a worker can exit after an idle window (`--idle-exit`) and
-  reports the queue depth it could claim, but nothing starts one back up or
-  varies replica count.
-- **Takes (L):** the §6 worker lifecycle of PLATFORM_DESIGN — a supervisor that
-  starts a process per (workspace, agent, version) on queue depth and pre-warms
-  promoted versions against a cold-start target.
+  any run is pinned to it and in-flight runs finish on theirs. ~~What is genuinely
+  open is the *fleet lifecycle*~~ **Closed (Phase 3, D25/D26)** — `rya supervisor`
+  starts a process per (workspace, agent, version) on claimable depth, scales
+  replicas on it, enforces `maxWorkers` when scheduling rather than at registration,
+  pre-warms named environments and reaps workers that stopped heartbeating. So
+  scale-to-zero is two-way: `--idle-exit` takes a key down and arriving work brings
+  it back. Launching is pluggable per substrate (`ExecutionDriver`); the policy is
+  one implementation and no part of it branches on substrate.
+- **Takes:** the fleet is still one box, because `local` is the only driver — it
+  launches a subprocess here. (L) the `docker`/`kubernetes`/`ecs` drivers, which land
+  with the sandbox work and are what make "autoscale" mean more than one host.
 
 ### Manifest — ✅ built & verified
 Declarative YAML, Pydantic-validated, diff-able, validated before any run/deploy.
@@ -113,15 +116,16 @@ was invisible in this ledger.)*
   `"attested": false, "notAttested": ["readiness"]` and a gate that requires
   readiness refuses the version. There is no way to file one out of band either:
   `gates.py` points at `rya attest readiness --version <id>`, **a command that
-  does not exist** (only `rya eval --attest` does). Worker orchestration is
-  manual — no start-on-demand, no scale-to-zero supervisor (see Runtime above).
-  And one deployment still serves exactly **one** agent: `build_app` resolves a
-  single manifest, `agent_id` in the routes is decorative (checked against
-  `manifest.name` and otherwise unused), and the worker passes
-  `agent_name=manifest.name`.
+  does not exist** (only `rya eval --attest` does). ~~Worker orchestration is
+  manual~~ — `rya supervisor` starts and reaps on demand (see Runtime above).
+  Multi-agent is **done** (D21/D28): `build_app` reads no manifest, agents come
+  from `rya_versions`/`rya_environments`, and `agent_id` in the routes is real.
+  One worker still serves one agent, which is a property of `load_agent` mutating
+  `sys.path` rather than a routing limit.
 - **Takes:** (M) run readiness in an isolated process outside the api, or accept a
-  signed client attestation; (L) the §6 worker lifecycle of PLATFORM_DESIGN;
-  (L) multi-agent routing within one deployment.
+  signed client attestation; ~~(L) the §6 worker lifecycle of PLATFORM_DESIGN~~ —
+  shipped in Phase 3; ~~(L) multi-agent routing within one deployment~~ — shipped in
+  Phase 2.
 
 ### SDK — 🟡 partial
 - **Built:** Python `define_agent()` + the full typed `ctx` surface
@@ -327,8 +331,44 @@ artifact but the package isn't published.
 
 1. ~~"Runs on a container backplane … scales horizontally on CPU."~~ **Partly
    closed** — Phase B/5 built an atomic `FOR UPDATE SKIP LOCKED` claim queue and a
-   horizontally scalable `rya worker`. What remains unbuilt is the *deployed*
-   backplane, not the concurrency primitive.
+   horizontally scalable `rya worker`. The scheduling half followed (MULTITENANT
+   Phase 3: `rya supervisor` starts, scales and reaps through a pluggable
+   `ExecutionDriver`), and the container drivers with it (Phase 4: `docker`,
+   `kubernetes`, gVisor, per-sandbox limits, deny-by-default egress).
+
+   **What remains is that none of it has run on a container backplane.** The
+   `kubernetes` driver renders a manifest and applies it with `kubectl`; no cluster has
+   been touched. So the correct claim is *authored and unit-tested, not deployed* — the
+   same status item 3 gives the SAM template, and for the same reason.
+
+   **gVisor itself is no longer in that bucket.** Phase 6 ran a real `runsc` sentry
+   (`scripts/verify_gvisor.sh`, nested in a privileged container because this host
+   blocks unprivileged user namespaces) over `cryptography`, `pydantic-core`, `psycopg`,
+   `yaml`, `httpx` and `os.fork`. All six work, so D23 holds. It also broke the
+   isolation probe, which had been matching a kernel string no real sentry emits — and
+   the failure direction was the bad one: a genuine sandbox came back *refuted*. See
+   MULTITENANT_DESIGN §9 risk 0. What is still unmeasured is cost on real hardware, and
+   on `x86_64` at all.
+
+   **Phase 5 found what "not deployed" was hiding**, which is the reason this entry is
+   worth re-reading rather than just re-dating. The container drivers build their
+   container's environment with no database credential — right for the process that
+   imports tenant code, impossible for the process that has to claim work — and both
+   were the same container. So a `docker` claimer would have started, opened an empty
+   local store, and reported idle ticks. Unit tests on rendered arguments could not see
+   it; only running it could. The launch gate refused the untrusted posture on those
+   drivers for a phase (D32), and **Phase 6 built the piece that was missing** —
+   `rya template-host`, a credential-free process that serves warm interpreters over a
+   socket, so a launch is a claimer container beside a sandbox container rather than one
+   container trying to be both. The diagnosis had been off by one: neither environment
+   builder was wrong, the second container was absent. The honest claim is back to
+   *authored, unit-tested, and not yet run on a cluster.* The trusted posture is
+   unaffected.
+
+   **Horizontal scaling did move, though.** `RYA_CLAIMER_SCOPE=tenant` makes sandbox
+   count track active tenants rather than the agents×versions product, and that half is
+   exercised end to end by the e2e — real bundles, real forks, two agents through one
+   claimer.
 2. **Still true, in part.** Per-user JWT and per-user RLS *are* built (see §1 and
    Phase B/6, C/9). What is not built is the **Cognito + API-Gateway +
    per-mutator-Lambda** topology: `deploy/aws/template.yaml` declares it and is

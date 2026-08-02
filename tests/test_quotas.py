@@ -12,6 +12,7 @@ data and does nothing about one tenant eating the node. The claims under test:
 """
 
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -25,7 +26,7 @@ from rya.quotas import (
     set_quota,
     usage_snapshot,
 )
-from rya.store import Store
+from rya.store import Store, now_iso
 
 
 @pytest.fixture
@@ -35,7 +36,13 @@ def store(tmp_path: Path) -> Store:
     return s
 
 
-def _run(store, status: str = "running", created: str = "2026-07-30T10:00:00Z") -> dict:
+def _run(store, status: str = "running", created: Optional[str] = None) -> dict:
+    # `created` defaults to *now*, not to a literal date. It used to be
+    # "2026-07-30T10:00:00Z", which made every `maxRunsPerDay` assertion pass on the
+    # day it was written and fail every day after: the daily window is the current
+    # UTC day (`quotas._day_start`), so a fixed timestamp falls out of it as soon as
+    # the clock rolls over. Tests that mean "not today" still say so explicitly.
+    created = created or now_iso()
     run = {"id": store.new_run_id(), "agent": "a", "status": status, "createdAt": created}
     store.save_run(run)
     return run

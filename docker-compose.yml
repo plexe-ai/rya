@@ -9,6 +9,11 @@
 #   worker  execution plane — loads the bundle, owns ctx/journal/replay, claims
 #           from the queue, executes handlers.
 #
+# Two optional profiles change how the execution plane is run rather than adding a
+# component: `--profile pinned` serves one content-hashed version instead of the
+# mounted tree, and `--profile supervised` replaces the declared worker with
+# `rya supervisor`, which starts and reaps them on demand. See both at the bottom.
+#
 # Production checklist (set these in .env): RYA_TOKEN (auth), RYA_SECRET_KEY
 # (encrypt secrets at rest), RYA_WEBHOOK_SECRET (signed inbound), and — for
 # multi-tenant — RYA_MULTITENANT=1 + RYA_ADMIN_TOKEN + RYA_APP_DB_PASSWORD.
@@ -29,6 +34,11 @@
 # ---------------------------------------------------------------------------
 x-rya-env: &rya-env
   RYA_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya
+  # Which deployment this is. Shared by the api and every worker deliberately:
+  # since D21 the api reads the environment pointer to decide which version a
+  # queued run is PINNED to, and `queue.claim` routes on that pin — so an api on
+  # `dev` and a worker on `prod` would agree on nothing and every turn would sit
+  # unclaimed. `worker-pinned` passes `--env prod` to match this default.
   RYA_ENVIRONMENT: ${RYA_ENVIRONMENT:-prod}
   RYA_TOKEN: ${RYA_TOKEN:-}
   RYA_SECRET_KEY: ${RYA_SECRET_KEY:-}
@@ -54,6 +64,35 @@ x-rya-env: &rya-env
   # Legacy single-tenant model config. Prefer per-environment platform config.
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+
+# The EXECUTION plane's environment (#5 / PLATFORM_DESIGN §8, MULTITENANT D19).
+#
+# Identical to the above except for the database credential. The worker is the
+# process that imports client bundles, so it is the one that must not hold a
+# superuser DSN: superusers BYPASS row-level security, which would make every RLS
+# policy installed by `tenancy.setup()` decorative for exactly the process the
+# policies exist to constrain. `rya_worker` also holds SELECT-only on the
+# governance tables, so worker-side code cannot write policy or flip an
+# environment pointer.
+#
+# `RYA_WORKER_DATABASE_URL` is read in preference to RYA_DATABASE_URL by
+# `open_worker_store`. It is EMPTY by default, and empty means "derive the
+# rya_worker role from RYA_DATABASE_URL when RYA_MULTITENANT=1, otherwise use the
+# store as-is" — because the rya_worker role does not exist until
+# `tenancy.setup()` has run, and the default single-tenant `docker compose up`
+# never runs it. So the default stays working and the multi-tenant path is one
+# line in `.env`:
+#
+#   RYA_WORKER_DATABASE_URL=postgresql://rya_worker:<RYA_APP_DB_PASSWORD>@postgres:5432/rya
+#
+# Setting it also REMOVES the admin DSN from the worker's environment (note this
+# block does not re-export RYA_DATABASE_URL), which is the actual goal: declining
+# to use a credential you still hold is not a boundary. Holding no credential at
+# all is D18, and that is Phase 4.
+x-rya-worker-env: &rya-worker-env
+  <<: *rya-env
+  RYA_DATABASE_URL: ${RYA_WORKER_DATABASE_URL:-postgresql://postgres:${POSTGRES_PASSWORD:-rya}@postgres:5432/rya}
+  RYA_WORKER_DATABASE_URL: ${RYA_WORKER_DATABASE_URL:-}
 
 services:
   postgres:
@@ -151,7 +190,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    environment: *rya-env
+    environment: *rya-worker-env
     volumes:
       - ${RYA_PROJECT:-./examples/followup_agent}:/project
       - rya_project_state:/project/.rya
@@ -185,11 +224,68 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    environment: *rya-env
+    environment: *rya-worker-env
     volumes:
       - ${RYA_PROJECT:-./examples/followup_agent}:/project
       - rya_project_state:/project/.rya
     command: ["rya", "worker", "--env", "prod", "--interval", "2", "--concurrency", "4"]
+
+  # The thing that makes the two services above unnecessary (D25).
+  #
+  # `docker compose --profile supervised up -d supervisor`
+  #
+  # A compose file is a static list of workers, and a static list is exactly what a
+  # fleet of N tenants x M agents x V versions cannot be. This watches claimable
+  # queue depth per key and starts, scales and reaps workers itself, so
+  # scale-to-zero is two-way: `--idle-exit` takes a key down and arriving work
+  # brings it back. Run it INSTEAD of `worker`, not alongside — both would serve the
+  # same key and you would get double the workers you asked for.
+  #
+  # **Read the limitation honestly.** This runs the `local` driver, which launches a
+  # subprocess. Inside a container that means the workers are processes in *this*
+  # container: `docker compose ps` shows one service and the fleet is invisible to
+  # Docker, cgroups apply to the group rather than per worker, and stopping this
+  # service stops all of them. Right shape, wrong granularity — useful for seeing the
+  # policy work, not for running a production fleet.
+  #
+  # The `docker` driver (Phase 4) is what fixes the granularity, and it is not wired up
+  # here on purpose. It needs the Docker socket mounted into this container so it can
+  # ask the daemon to start siblings, and mounting `/var/run/docker.sock` into a
+  # service is equivalent to giving it root on the host. That is a reasonable thing for
+  # an operator to decide and a bad thing for a quickstart to do silently, so the
+  # sandboxed drivers are documented rather than defaulted:
+  #
+  #   RYA_EXECUTION_DRIVER=docker RYA_CONTAINER_RUNTIME=runsc RYA_SANDBOX_IMAGE=<this image>
+  #
+  # plus the socket mount. Check what you get with `rya posture --verify` before
+  # believing it, and note that `RYA_UNTRUSTED_TENANTS=1` also requires RYA_BROKER=1
+  # and RYA_EGRESS — the launch gate refuses two out of three.
+  #
+  # There is deliberately no `template-host` service here. That is the sandbox half of
+  # the D32 pair, and the `docker` driver *renders* it per launch — it creates the
+  # volume, starts the sandbox container, then starts the claimer beside it. A static
+  # service in this file would be one host for the whole compose project, which is the
+  # opposite of per-tenant. The weak topology (this file's default, where the claimer
+  # spawns its own templates) is the correct one for a single-operator self-host:
+  # everything in the container already belongs to the same person.
+  supervisor:
+    build: .
+    profiles: ["supervised"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # The worker environment, not the api's: it reads claimable depth and the worker
+    # registry, both of which are execution-plane reads, and the workers it launches
+    # inherit this environment (including RYA_ENVIRONMENT, which the driver forces
+    # onto them so an api/worker mismatch is not reachable by accident).
+    environment: *rya-worker-env
+    volumes:
+      - ${RYA_PROJECT:-./examples/followup_agent}:/project
+      - rya_project_state:/project/.rya
+    command: ["rya", "supervisor", "--env", "prod", "--interval", "5", "--idle-exit", "120"]
 
 volumes:
   rya_pgdata:

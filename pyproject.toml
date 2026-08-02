@@ -65,6 +65,17 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/rya"]
 
+# The React console's compiled output. `src/rya/console/dist/` is gitignored (it is
+# build output, built from `web/console/` by `npm run build`), and hatchling skips
+# VCS-ignored paths by default — `artifacts` is the opt-back-in for exactly that
+# case. This is the Airflow pattern (`artifacts = ["src/airflow/ui/dist/"]`): Node
+# is a maintainer/CI dependency at release time, never an install-time one, so
+# `pip install rya` still needs nothing but Python.
+#
+# Absent dist -> the pattern matches nothing and the wheel builds fine; the console
+# route then serves its "not bundled" fallback (api/app.py `_load_console_dist`).
+artifacts = ["src/rya/console/dist/**"]
+
 [tool.hatch.build.targets.wheel.force-include]
 "src/rya/console/index.html" = "rya/console/index.html"
 "src/rya/console/lucide.min.js" = "rya/console/lucide.min.js"

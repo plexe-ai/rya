@@ -43,6 +43,7 @@
   .agent-pick .ai{width:24px;height:24px;border-radius:var(--radius);background:var(--subtle);display:grid;place-items:center;flex:none}.agent-pick .ai svg{width:13px;height:13px;color:var(--ink);stroke-width:1.9}
   .agent-pick .nm{font-size:13px;font-weight:600;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-pick .en{font-size:11px;color:var(--text-3);margin-top:-2px}
   .agent-pick .dot{margin-left:auto;width:6px;height:6px;border-radius:50%;background:var(--green);flex:none}
+  .agent-pick select{font:inherit;font-size:13px;font-weight:600;color:var(--ink);background:transparent;border:0;padding:0;margin:0;max-width:150px;cursor:pointer}
   .grp{font-size:11px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;color:var(--text-3);padding:16px 8px 5px}
   .nav button{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:var(--radius);border:0;background:transparent;color:var(--text-2);font-size:13px;font-weight:450;text-align:left;width:100%}
   .nav button:hover{background:var(--hover);color:var(--text)}.nav button.on{background:#ecebe9;color:var(--ink);font-weight:500}
@@ -347,7 +348,23 @@ const getToken = () => localStorage.getItem(TKEY) || '';
 const views = ['overview','infra','manifest','tools','memory','knowledge','models','channels','connections','deploy','versions','workers','quotas','runs','conversations','approvals','evals','guard','jobs','queue','secrets','team','governance'];
 const NAVBTNS = '#nav button,#nav2 button,#nav3 button,#nav4 button';
 let STATE = null, wasLive = null, lastFocus = null;
-const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// Which agent this page is about. `_` is the platform's sole-agent alias — it
+// resolves server-side while a deployment serves one, and 400s naming the
+// candidates once it serves several (D21/D28). Every agent-scoped call goes
+// through ag() so switching agents is one variable, not a sweep.
+const AKEY = 'rya_agent';
+let AGENT = localStorage.getItem(AKEY) || '_';
+const ag = p => '/agents/' + encodeURIComponent(AGENT) + p;
+function setAgent(name){
+  AGENT = name || '_';
+  if(AGENT==='_') localStorage.removeItem(AKEY); else localStorage.setItem(AKEY, AGENT);
+  refresh();
+}
+// Escapes quotes as well as angle brackets: esc() output lands in ATTRIBUTE
+// position too (e.g. title="${esc(ts)}" in ago(), aria-label in the runs table),
+// where &<> alone would let a value containing a quote break out of the attribute.
+// In text position the entities render identically, so this is safe everywhere.
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // JS-string-escape for ids interpolated into inline handlers (defense-in-depth).
 const jss = s => String(s==null?'':s).replace(/[\\'"]/g,'\\$&');
 const PB = {allowed:'allowed',read_only:'read',approval_required:'appr',disabled:'dis'};
@@ -458,9 +475,22 @@ function toggleNav(){ document.querySelector('.side').classList.toggle('open'); 
 
 function setLive(ok){const l=document.getElementById('live');l.classList.toggle('off',!ok);document.getElementById('liveText').textContent=ok?'live':'offline';}
 
+// The sidebar chip becomes a real selector once the deployment serves more than
+// one agent, and stays plain text while it serves one — a <select> with a single
+// option is a control that implies a choice nobody has.
+function renderAgentPicker(s){
+  const el=document.getElementById('sideAgent');
+  const roster=(s.agents||[]).map(a=>a.name);
+  const cur=s.selectedAgent||(s.agent&&s.agent.name)||'—';
+  if(roster.length<2){ el.textContent=cur; return; }
+  el.innerHTML='<select id="agentSel" aria-label="Agent">'+roster.map(n=>
+    `<option value="${esc(n)}"${n===cur?' selected':''}>${esc(n)}</option>`).join('')+'</select>';
+  document.getElementById('agentSel').addEventListener('change',e=>setAgent(e.target.value));
+}
+
 async function refresh(){
   let s;
-  try{ s = await api('/console'); }
+  try{ s = await api('/console' + (AGENT==='_' ? '' : '?agent='+encodeURIComponent(AGENT))); }
   catch(e){
     setLive(false);
     if(e.message==='unauthorized') return;          // the Connect dialog is up
@@ -498,7 +528,7 @@ function render(s){
   }
   const vw=(s.viewer&&s.viewer.workspace&&s.viewer.workspace!=='default')?s.viewer.workspace:null;
   document.getElementById('agentName').textContent=(br&&vw)?vw:s.agent.name;
-  document.getElementById('sideAgent').textContent=s.agent.name;
+  renderAgentPicker(s);
   document.getElementById('sideEnv').textContent='v'+s.agent.version+' · '+s.agent.environment;
   document.getElementById('wsSub').textContent=s.agent.environment+' · '+s.runtime.store;
   // Real viewer identity (no hardcoded placeholders).
@@ -904,7 +934,7 @@ async function openTurnStream(id){
   const timer=setTimeout(()=>ctrl.abort(),6000);  // finished turns flush instantly; live ones tail briefly
   try{
     const t=getToken();
-    const r=await fetch(API+`/agents/_/turns/${encodeURIComponent(id)}/stream`,{headers:t?{'Authorization':'Bearer '+t}:{},signal:ctrl.signal});
+    const r=await fetch(API+ag(`/turns/${encodeURIComponent(id)}/stream`),{headers:t?{'Authorization':'Bearer '+t}:{},signal:ctrl.signal});
     const rd=r.body.getReader(); const dec=new TextDecoder(); let buf='',ev=null,dat=[];
     for(;;){ const {done,value}=await rd.read(); if(done)break; buf+=dec.decode(value,{stream:true});
       let nl; while((nl=buf.indexOf('\n'))>=0){ const line=buf.slice(0,nl).replace(/\r$/,''); buf=buf.slice(nl+1);
@@ -953,7 +983,7 @@ async function refreshDeployCts(){
   if(Date.now()-DEPLOY_CT_AT<30000) return;
   DEPLOY_CT_AT=Date.now();
   const g=p=>api(p).catch(()=>null);
-  const [e,v,w]=await Promise.all([g('/agents/_/environments'),g('/agents/_/versions'),g('/workers')]);
+  const [e,v,w]=await Promise.all([g(ag('/environments')),g(ag('/versions')),g('/workers')]);
   if(e){ DEPLOY.envs=e.environments||[]; navCt('envs',DEPLOY.envs.length); }
   if(v){ DEPLOY.versions=v.versions||[]; navCt('versions',DEPLOY.versions.length); }
   if(w) navCt('workers',(w.workers||[]).length);
@@ -986,7 +1016,7 @@ function verState(v){ return v&&v.state==='retired'
 async function loadEnvironments(){
   const body=document.getElementById('envBody');
   let envs=[];
-  try{ envs=(await api('/agents/_/environments')).environments||[]; }
+  try{ envs=(await api(ag('/environments'))).environments||[]; }
   catch(e){ body.innerHTML=deployErr(e,'Environments'); return; }
   DEPLOY.envs=envs; navCt('envs',envs.length);
   if(!envs.length){
@@ -998,7 +1028,7 @@ async function loadEnvironments(){
   // The list route returns the raw pointer record; the bundle hash and the
   // retention story (§9's drain step) only come from describe_environment.
   const desc=await Promise.all(envs.map(e=>
-    api('/agents/_/environments/'+encodeURIComponent(e.name)).catch(()=>null)));
+    api(ag('/environments/'+encodeURIComponent(e.name))).catch(()=>null)));
   const promoted=desc.filter(d=>d&&d.currentVersion).length;
   const retained=desc.reduce((n,d)=>n+Object.keys((d&&d.pinnedRuns)||{}).length,0);
   const gated=Object.values(gates).filter(g=>g.enforced).length;
@@ -1028,9 +1058,9 @@ async function openEnvironment(name){
   const head=`<div class="secrow"><span class="l">Environment · ${esc(name)}</span></div>`;
   box.innerHTML=head+'<div class="empty">Loading…</div>';
   let d;
-  try{ d=await api('/agents/_/environments/'+encodeURIComponent(name)); }
+  try{ d=await api(ag('/environments/'+encodeURIComponent(name))); }
   catch(e){ box.innerHTML=head+deployErr(e,'This environment'); return; }
-  const v=d.currentVersion||null, ep='/agents/_/environments/'+encodeURIComponent(name);
+  const v=d.currentVersion||null, ep=ag('/environments/'+encodeURIComponent(name));
   const [hist,gate,check,runs]=await Promise.all([
     api(ep+'/history').catch(()=>({history:[]})),
     api('/gate?env='+encodeURIComponent(name)).catch(()=>null),
@@ -1108,7 +1138,7 @@ async function openEnvironment(name){
 async function loadVersions(){
   const body=document.getElementById('versionsBody');
   let vs=[];
-  try{ vs=(await api('/agents/_/versions')).versions||[]; }
+  try{ vs=(await api(ag('/versions'))).versions||[]; }
   catch(e){ body.innerHTML=deployErr(e,'Versions'); return; }
   DEPLOY.versions=vs; navCt('versions',vs.length);
   if(!vs.length){
@@ -1116,7 +1146,7 @@ async function loadVersions(){
     icons(); return;
   }
   let envs=DEPLOY.envs;
-  try{ envs=(await api('/agents/_/environments')).environments||[]; DEPLOY.envs=envs; }catch(e){}
+  try{ envs=(await api(ag('/environments'))).environments||[]; DEPLOY.envs=envs; }catch(e){}
   const pointers={};
   (envs||[]).forEach(e=>{ if(e.currentVersionId) (pointers[e.currentVersionId]=pointers[e.currentVersionId]||[]).push(e.name); });
   body.innerHTML=ctable(['Version','Bundle','Label','SDK','State','Deployed to','Recorded'],
@@ -1194,7 +1224,10 @@ function workerTable(list,emptyMsg){
   if(!list.length) return empty(emptyMsg,'moon');
   return table(['Worker','Version','Bundle','Handlers','Host','Cold start','Heartbeat'],
     list.map(w=>{
-      const stale=w.lastHeartbeatAt&&(Date.now()-Date.parse(w.lastHeartbeatAt))>120000;
+      // The server decides this now (store.WORKER_LOST_SECONDS). The clock check
+      // stays as the fallback for the window between "late" and "declared lost",
+      // and because a browser clock may be ahead of the deployment's.
+      const stale=w.status==='lost'||(w.lastHeartbeatAt&&(Date.now()-Date.parse(w.lastHeartbeatAt))>120000);
       return [`<span class="mono">${esc(w.id)}</span>${w.status!=='alive'?` <span class="pb dis">${esc(w.status||'')}</span>`:''}`,
         w.versionId?`<span class="mono dim">${esc(w.versionId)}</span>`:'<span class="dim">working tree</span>',
         `<span class="mono dim">${esc(short(w.bundleHash))}</span>`,
@@ -1207,16 +1240,20 @@ function workerTable(list,emptyMsg){
 async function loadWorkers(){
   const body=document.getElementById('workersBody');
   let list=[];
-  try{ list=(await api('/workers')).workers||[]; }
+  // `?status=` = every status, not just alive. A worker that was SIGKILLed comes
+  // back `lost`; dropping it would make a crash look identical to scale-to-zero.
+  try{ list=(await api('/workers?status=')).workers||[]; }
   catch(e){ body.innerHTML=deployErr(e,'Workers'); return; }
-  navCt('workers',list.length);
-  const cold=list.map(w=>w.coldStartMs||0).filter(Boolean);
+  const live=list.filter(w=>w.status==='alive'), lost=list.filter(w=>w.status==='lost');
+  navCt('workers',live.length);
+  const cold=live.map(w=>w.coldStartMs||0).filter(Boolean);
   const done=list.reduce((n,w)=>n+(((w.stats||{}).completed)||0),0);
   const claimed=list.reduce((n,w)=>n+(((w.stats||{}).claimed)||0),0);
   body.innerHTML='<div class="stats" style="margin-bottom:20px">'+[
-    tile('cpu','Live processes',list.length,list.length?'claiming from the queue':'scaled to zero'),
-    tile('package','Versions served',new Set(list.map(w=>w.versionId||'local')).size,'one process per version'),
-    tile('timer','Slowest cold start',cold.length?Math.max(...cold)+' ms':'—','on the critical path after idle'),
+    tile('cpu','Live processes',live.length,live.length?'claiming from the queue':'scaled to zero'),
+    tile('package','Versions served',new Set(live.map(w=>w.versionId||'local')).size,'one process per version'),
+    lost.length?tile('unplug','Lost',lost.length,'stopped heartbeating; the supervisor replaces these')
+      :tile('timer','Slowest cold start',cold.length?Math.max(...cold)+' ms':'—','on the critical path after idle'),
     tile('check-circle-2','Work done',done,claimed+' claimed this uptime'),
   ].join('')+'</div>'+
   // §6: an empty list is scale-to-zero, which is the DESIGNED steady state for an
@@ -1261,8 +1298,79 @@ async function loadQuotas(){
       ['Input tokens',`<span class="mono">${(usage.inputTokens||0).toLocaleString()}</span>`],
       ['Output tokens',`<span class="mono">${(usage.outputTokens||0).toLocaleString()}</span>`],
       ['Cost',`<span class="mono">$${Number(usage.costUsd||0).toFixed(4)}</span>`]])
-    : empty('No metered usage yet.','coins'));
+    : empty('No metered usage yet.','coins'))
+  + orgSection(q.org)
+  + await postureSection();
   icons();
+}
+// D29: the billing boundary above this workspace. Absent unless a reconciler has run,
+// which is deliberate — "no rollup" and "an all-clear rollup" are different states and
+// an operator refusing to believe a budget needs to tell them apart. The `byWorkspace`
+// column is the one that matters: the total says the budget is gone and this says which
+// sibling spent it.
+function orgSection(org){
+  if(!org||!org.orgId) return '';
+  const b=org.budget||{}, u=org.usage||{};
+  const LIM=[['tokensToday','maxTokensPerDay','Org tokens today'],
+             ['costUsdToday','maxCostUsdPerDay','Org USD today'],
+             ['costUsdMonth','maxCostUsdPerMonth','Org USD this month']];
+  const rows=LIM.filter(([,pk])=>b[pk]!=null).map(([uk,pk,label])=>{
+    const lim=b[pk], cur=u[uk];
+    const at=cur!=null&&Number(cur)>=Number(lim);
+    return [label,`<span class="mono">${esc(String(cur==null?'—':cur))}</span>`,
+      `<span class="mono">${esc(String(lim))}</span>`,
+      at?'<span class="stbadge fail"><span class="d"></span>over budget</span>'
+        :'<span class="stbadge ok"><span class="d"></span>within budget</span>'];
+  });
+  return '<div class="secrow"><span class="l">Organization budget</span>'
+    + `<span class="r">shared with ${(org.workspaces||[]).length} workspace(s) — `
+    + `computed ${esc(String(org.computedAt||'never'))}</span></div>`
+    + (rows.length? table(['Limit','Org consuming','Ceiling','Status'],rows)
+        : empty('This organization has no budget set.','coins'))
+    + (org.exhausted
+        ? '<div class="keynote">This workspace is refusing new work because its '
+          + '<b>organization</b> is over budget, not because of its own quota. '
+          + '<span class="mono">rya orgs show</span> names which workspace spent it.</div>'
+        : '');
+}
+// The launch gate, on the page that already answers "what is this deployment allowed
+// to do". Read-only and unauthenticated server-side, because an operator checking
+// whether their own deployment is safe should not need a token to find out — and every
+// field is about CONFIGURATION, never a credential's value.
+async function postureSection(){
+  let p; try{ p=await api('/posture'); }catch(e){ return ''; }
+  const d=p.driver||{}, creds=p.credentials||{};
+  // A trusted deployment with none of the three conditions met is CORRECT. Marking it
+  // red would train an operator to ignore the mark on the one deployment where it means
+  // something, so the badge follows `untrusted` and not `ok`.
+  const satisfied = p.ok || !p.untrusted;
+  const rows=[
+    ['Isolation (D23)', esc(((p.isolation||{}).detail)||'—'), (p.isolation||{}).ok],
+    ['Credential mediation (D18)', esc(((p.broker||{}).detail)||'—'), (p.broker||{}).ok],
+    ['Network egress (D24)', esc(((p.egress||{}).detail)||'—'), (p.egress||{}).ok],
+  ].map(([label,detail,ok])=>[label,detail,
+    ok?'<span class="stbadge ok"><span class="d"></span>in force</span>'
+      :'<span class="stbadge wait"><span class="d"></span>not in force</span>']);
+  return '<div class="secrow"><span class="l">Tenant posture</span>'
+    +'<span class="r">'+(p.untrusted?'untrusted tenancy declared':'trusted tenancy')+'</span></div>'
+    +'<div class="stats" style="margin-bottom:20px">'+[
+      tile(satisfied?'shield-check':'shield-alert','Posture',
+           p.untrusted?(p.ok?'safe':'INCOMPLETE'):'trusted',
+           p.untrusted?'RYA_UNTRUSTED_TENANTS=1':'hostile-tenant isolation not claimed',
+           p.untrusted&&!p.ok),
+      tile('box','Driver',esc(d.driver||'—'),esc(d.isolation||'—')+
+           (((p.probe||{}).verified===true)?' · verified':((p.probe||{}).verified===false)?' · REFUTED':' · unverified'),
+           (p.probe||{}).verified===false),
+      tile('key-round','This process',creds.clean?'no platform credentials':'holds credentials',
+           creds.clean?'nothing a tenant must not see':
+             (creds.violations||[]).map(v=>esc(v.group||v.name)).join(', '),
+           false),
+    ].join('')+'</div>'
+    +table(['Condition','State','Status'],rows)
+    +(p.untrusted?'':'<div class="note">None of the above is enforced: the trusted '
+      +'posture is supported and is what every self-host runs. Declare '
+      +'<span class="mono">RYA_UNTRUSTED_TENANTS=1</span> only with all three in '
+      +'force — the platform refuses to start otherwise.</div>');
 }
 // ---- Team & access -----------------------------------------------------------
 async function v1(path,opts){
@@ -1378,7 +1486,7 @@ async function toolSwitch(id,mode){
 }
 async function sendEvent(){
   const b=document.getElementById('evtBtn'); b.disabled=true;
-  try{ const r=await api('/agents/_/events',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'message.received',payload:{email:'demo+'+Math.random().toString(36).slice(2,7)+'@acme.io'}})});
+  try{ const r=await api(ag('/events'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'message.received',payload:{email:'demo+'+Math.random().toString(36).slice(2,7)+'@acme.io'}})});
     toast('Run '+r.runId+' → '+r.status); await refresh(); }
   catch(e){ toast('Error — '+e.message); } finally{ b.disabled=false; }
 }

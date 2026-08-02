@@ -356,3 +356,94 @@ def test_no_branding_by_default(tmp_path):
     agent = load_agent(manifest, tmp_path)
     engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
     assert build_console(manifest, engine.store, agent, tmp_path)["branding"] is None
+
+
+# ---------------------------------------------------------------------------
+# The React console at /v2 (source: web/console/, built to src/rya/console/dist).
+#
+# `dist/` is gitignored build output, so these tests must pass BOTH on a machine
+# that has run `npm run build` and on one that never installed Node. Each test
+# below states which arm it covers rather than skipping silently.
+# ---------------------------------------------------------------------------
+
+def test_v2_serves_bundle_or_explains_itself(tmp_path, monkeypatch):
+    """/v2 is never a 404: it is the bundle, or a 503 that names the build command."""
+    from rya.api import app as app_mod
+
+    c, _ = _client(tmp_path, monkeypatch)
+    r = c.get("/v2/")
+    if app_mod._CONSOLE_DIST is None:
+        assert r.status_code == 503
+        assert "npm run build" in r.text
+        assert 'href=\'/\'' in r.text  # points back at the working console
+    else:
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
+        assert '<div id="root">' in r.text
+
+
+def test_v2_never_takes_away_the_legacy_console(tmp_path, monkeypatch):
+    """Both consoles are live during the migration (the Prefect ui/ui-v2 pattern)."""
+    c, _ = _client(tmp_path, monkeypatch)
+    assert c.get("/").status_code == 200
+    assert "rya context" in c.get("/").text  # the legacy single-file SPA, unchanged
+
+
+def test_v2_drops_unsafe_inline_for_scripts(tmp_path, monkeypatch):
+    """The build step's security win: the React bundle needs no inline script.
+
+    The legacy console is one big inline <script>, so `/` must keep
+    'unsafe-inline'. /v2 loads external modules and must not.
+    """
+    from rya.api import app as app_mod
+
+    if app_mod._CONSOLE_DIST is None:
+        pytest.skip("frontend not built (run `cd web/console && npm run build`)")
+
+    c, _ = _client(tmp_path, monkeypatch)
+
+    def script_src(resp):
+        csp = resp.headers["content-security-policy"]
+        return next(d for d in csp.split(";") if d.strip().startswith("script-src"))
+
+    assert "'unsafe-inline'" not in script_src(c.get("/v2/"))
+    assert "'unsafe-inline'" in script_src(c.get("/"))  # legacy still needs it
+
+
+def test_v2_assets_carry_security_headers(tmp_path, monkeypatch):
+    """A mount bypasses route-level headers, so the StaticFiles subclass must add them."""
+    import re
+
+    from rya.api import app as app_mod
+
+    if app_mod._CONSOLE_DIST is None:
+        pytest.skip("frontend not built (run `cd web/console && npm run build`)")
+
+    c, _ = _client(tmp_path, monkeypatch)
+    refs = [a for a in re.findall(r'(?:src|href)="([^"]+)"', c.get("/v2/").text) if a.startswith("/v2/")]
+    assert refs, "the built index.html should reference at least one hashed asset"
+    for ref in refs:
+        r = c.get(ref)
+        assert r.status_code == 200, ref
+        assert r.headers.get("content-security-policy"), f"no CSP on {ref}"
+        assert r.headers.get("x-content-type-options") == "nosniff", ref
+
+
+def test_console_dist_detection_requires_an_index(tmp_path, monkeypatch):
+    """A dist/ dir without index.html counts as not-built, not as a broken bundle.
+
+    Guards the fresh-clone path: a stale or half-written dist/ must fall back to
+    the 503 explainer rather than mounting a directory with nothing to serve.
+    """
+    import importlib.resources
+
+    from rya.api import app as app_mod
+
+    dist = tmp_path / "console" / "dist"
+    dist.mkdir(parents=True)
+    monkeypatch.setattr(importlib.resources, "files", lambda _pkg: tmp_path)
+
+    assert app_mod._console_dist_dir() is None  # dist/ exists but is empty
+
+    (dist / "index.html").write_text("<!doctype html>")
+    assert app_mod._console_dist_dir() is not None  # index.html present -> built

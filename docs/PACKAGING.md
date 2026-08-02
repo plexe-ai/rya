@@ -72,11 +72,42 @@ root stay in step on version, dependencies and extras.
 
 ## Building
 
+**Build the console first.** The React console's source lives in `web/console/`
+and compiles to `src/rya/console/dist/`, which is gitignored — so a fresh clone
+has no bundle and a wheel built from it would ship none. Node is a *release-time*
+dependency only; `pip install rya-server` never needs it.
+
+```bash
+scripts/build_console.sh              # npm ci && npm run build
+# or: cd web/console && npm install && npm run build
+```
+
+This is the pattern Airflow (`src/airflow/ui/dist/`), Chainlit
+(`chainlit/frontend/dist/`) and Label Studio (`web/dist/apps/labelstudio/`) all
+use: frontend source stays out of the wheel, only the compiled output goes in.
+The root pyproject opts `dist/` back in past the VCS-ignore with
+`artifacts = ["src/rya/console/dist/**"]`; `packaging/server` picks it up for free
+because it force-includes the whole `src/rya` tree.
+
+Skipping this step is not fatal — the wheel builds, and `/v2` serves a 503 that
+names the build command instead of 404ing — but the shipped console would be
+missing, so **verify** before publishing:
+
+```bash
+python -c "import zipfile,sys; n=zipfile.ZipFile(sys.argv[1]).namelist(); \
+  assert any(x.startswith('rya/console/dist/') for x in n), 'console NOT bundled — run scripts/build_console.sh'; \
+  print('console ok')" dist/server/rya_server-*.whl
+```
+
+Then the wheels:
+
 ```bash
 uv build --wheel packaging/sdk     -o dist
 uv build --wheel packaging/server  -o dist
 # or: python -m build --wheel packaging/sdk
 ```
+
+The thin SDK wheel carries no console: it has no server to serve one.
 
 **Never build the repo root.** `uv build --wheel .` succeeds and writes
 `dist/rya-<version>-py3-none-any.whl` — the exact filename PyPI takes as the thin

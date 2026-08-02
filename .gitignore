@@ -9,6 +9,13 @@ dist/
 venv/
 .preview/
 
+# frontend (web/console) — deps and build output. `dist/` above already covers
+# src/rya/console/dist; the compiled console is built at release time by CI and
+# force-included into the wheel, never committed. See docs/PACKAGING.md.
+node_modules/
+.vite/
+vite.config.ts.timestamp-*
+
 # secrets / local env — never commit (use .env.example for the template)
 .env
 *.key

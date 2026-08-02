@@ -124,9 +124,9 @@ def test_server_requires_jwt_when_configured(tmp_path, monkeypatch):
     scaffold.write_project(tmp_path, "jwt-agent", template="demo")
     c = TestClient(build_app(tmp_path))
 
-    assert c.post("/agents/x/events", json={"payload": {"email": "a@b.com"}}).status_code == 401
+    assert c.post("/agents/_/events", json={"payload": {"email": "a@b.com"}}).status_code == 401
     tok = _mint({"sub": "user_9", "email": "nine@x.com"}, "serversecret")
-    r = c.post("/agents/x/events", json={"payload": {"email": "a@b.com"}},
+    r = c.post("/agents/_/events", json={"payload": {"email": "a@b.com"}},
                headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 200
     assert r.json()["identity"]["sub"] == "user_9"

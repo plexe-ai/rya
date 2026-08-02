@@ -47,12 +47,13 @@ def test_webhook_to_approval_over_http(client):
 def test_token_required_when_set(client):
     c, _, monkeypatch = client
     monkeypatch.setenv("RYA_TOKEN", "secret-token")
-    # Control route without token -> 401.
-    assert c.get("/agents/x").status_code == 401
+    # Control route without token -> 401. `_` is the sole-agent alias; a made-up
+    # id would now 404 on its own (D21), which would not prove anything about auth.
+    assert c.get("/agents/_").status_code == 401
     # With wrong token -> 401.
-    assert c.get("/agents/x", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert c.get("/agents/_", headers={"Authorization": "Bearer nope"}).status_code == 401
     # With correct token -> 200.
-    ok = c.get("/agents/x", headers={"Authorization": "Bearer secret-token"})
+    ok = c.get("/agents/_", headers={"Authorization": "Bearer secret-token"})
     assert ok.status_code == 200
     # Webhook stays public (signature layer is separate).
     assert c.post("/inbound", json={"email": "a@b.com"}).status_code == 200

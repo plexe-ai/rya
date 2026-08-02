@@ -9,13 +9,16 @@ import gzip
 import io
 import os
 import tarfile
+from pathlib import Path
 
 import pytest
 
 from rya.bundles import (
     BUNDLE_META_NAME,
     Bundle,
+    BundleStore,
     build_bundle,
+    bundle_archive_key,
     bundle_archive_path,
     content_hash,
     load_bundle,
@@ -26,6 +29,14 @@ from rya.bundles import (
 )
 from rya.cli import scaffold
 from rya.errors import RyaError
+
+
+def _scaffold(path: Path, name: str) -> Path:
+    """A throwaway project. D20's tests need SAME content in two tenants, so they
+    build from one scaffold rather than reusing the shared `project` fixture."""
+    path.mkdir(parents=True, exist_ok=True)
+    scaffold.write_project(path, name, template="demo")
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +364,115 @@ def test_load_bundle_missing_hash(tmp_path):
         load_bundle("0" * 64, tmp_path / "archives", tmp_path / "dest")
     assert exc.value.code == "E_BUNDLE_NOT_FOUND"
     assert "rya deploy" in exc.value.hint
+
+
+# --------------------------------------------------------------------------- #
+# D20 — the tenant namespace
+#
+# A bundle hash is content-addressed, so two tenants that publish the same bytes
+# derive the SAME hash independently. Before D20 that made one tenant's archive
+# readable by any other that could compute the hash — which, for a public
+# template or a shared base project, is anyone.
+# --------------------------------------------------------------------------- #
+def test_a_workspace_scoped_store_cannot_resolve_another_tenants_archive(tmp_path):
+    """The Phase 1 exit criterion, asserted rather than reasoned about."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+
+    acme = BundleStore(kind="local", root=root, workspace="ws_acme")
+    other = BundleStore(kind="local", root=root, workspace="ws_other")
+
+    stored = store_bundle(bundle, acme)
+    assert "ws_acme" in str(stored)
+
+    # Same bytes, same hash, different tenant -> not resolvable.
+    with pytest.raises(RyaError) as exc:
+        load_bundle(bundle.hash, other, tmp_path / "dest")
+    assert exc.value.code == "E_BUNDLE_NOT_FOUND"
+
+    # ...and the owning tenant still resolves it.
+    dest = load_bundle(bundle.hash, acme, tmp_path / "mine")
+    assert build_bundle(dest).hash == bundle.hash
+
+
+def test_each_tenant_gets_its_own_copy_of_identical_content(tmp_path):
+    """Cross-tenant dedupe is deliberately forfeited (D20): identical bytes are
+    stored once PER TENANT, because a shared read namespace is the thing being
+    removed."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+
+    a = store_bundle(bundle, BundleStore(kind="local", root=root, workspace="ws_a"))
+    b = store_bundle(bundle, BundleStore(kind="local", root=root, workspace="ws_b"))
+    assert a != b
+    assert Path(a).is_file() and Path(b).is_file()
+
+
+def test_an_unnamespaced_store_is_byte_for_byte_the_old_layout(tmp_path):
+    """`rya dev`, the test suite and single-tenant self-host must not move."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+    path = store_bundle(bundle, BundleStore(kind="local", root=root))
+    assert path == bundle_archive_path(bundle.hash, root)
+    assert path.parent.name == bundle.hash[:2]
+
+
+def test_the_single_tenant_sentinel_is_the_unnamespaced_address(tmp_path):
+    """"default" (PostgresStore's default) and "" (FileStore has no workspace)
+    are two spellings of "no tenant", and both must resolve to the pre-D20 flat
+    address — with ONE lookup, not a namespaced miss followed by a fallback."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+
+    legacy = store_bundle(bundle, BundleStore(kind="local", root=root))  # pre-D20
+    upgraded = BundleStore(kind="local", root=root, workspace="default")
+
+    assert upgraded.read_workspaces() == ("",)      # one lookup, no fallback cost
+    assert store_bundle(bundle, upgraded) == legacy
+    assert build_bundle(load_bundle(bundle.hash, upgraded, tmp_path / "d")).hash == bundle.hash
+    assert bundle_archive_key("abc", "bundles", "default") == "bundles/abc.tar.gz"
+
+
+def test_a_named_workspace_does_not_read_legacy_keys_by_default(tmp_path):
+    """A deployment that was multi-tenant BEFORE D20 has flat archives, and its
+    tenants would 404 after the upgrade. The fallback that fixes it is opt-in,
+    because reading a flat key from a named tenant is a cross-tenant read."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+    store_bundle(bundle, BundleStore(kind="local", root=root))  # pre-D20 archive
+
+    closed = BundleStore(kind="local", root=root, workspace="ws_acme")
+    assert closed.read_workspaces() == ("ws_acme",)
+    with pytest.raises(RyaError) as exc:
+        load_bundle(bundle.hash, closed, tmp_path / "dest")
+    assert exc.value.code == "E_BUNDLE_NOT_FOUND"
+
+    # Opted in, the same store resolves it — the documented upgrade path.
+    opened = BundleStore(kind="local", root=root, workspace="ws_acme",
+                         legacy_fallback=True)
+    assert opened.read_workspaces() == ("ws_acme", "")
+    assert build_bundle(load_bundle(bundle.hash, opened, tmp_path / "d2")).hash == bundle.hash
+
+
+def test_the_legacy_fallback_never_diverts_a_write(tmp_path):
+    """Even opted in, a write lands in the tenant's own namespace. A fallback
+    that could also redirect writes would put one tenant's bytes in the shared
+    space, which is worse than the read it was added to permit."""
+    root = tmp_path / "archives"
+    bundle = build_bundle(_scaffold(tmp_path / "proj", "shared"))
+    store = BundleStore(kind="local", root=root, workspace="ws_acme",
+                        legacy_fallback=True)
+    assert "ws_acme" in str(store_bundle(bundle, store))
+
+
+def test_s3_keys_carry_the_workspace_segment(tmp_path):
+    """The prefix an IAM/bucket policy is scoped to. Without this segment there
+    is nothing to grant per-tenant on."""
+    assert bundle_archive_key("abc", "bundles", "ws_acme") == "bundles/ws_acme/abc.tar.gz"
+    assert bundle_archive_key("abc", "bundles") == "bundles/abc.tar.gz"
+    assert bundle_archive_key("abc", "", "ws_acme") == "ws_acme/abc.tar.gz"
+    # Slashes an operator might type around the prefix must not double up.
+    assert bundle_archive_key("abc", "/bundles/", "/ws_acme/") == "bundles/ws_acme/abc.tar.gz"
 
 
 def test_two_projects_two_hashes(tmp_path):

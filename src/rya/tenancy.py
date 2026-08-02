@@ -39,7 +39,12 @@ _DATA_TABLES = ["rya_runs", "rya_approvals", "rya_jobs", "rya_queue", "rya_strea
                 # applies to every one of these exactly as it does to run data.
                 "rya_journal", "rya_meter", "rya_policy", "rya_policy_log",
                 "rya_versions", "rya_version_attestations", "rya_environments",
-                "rya_workers"]
+                "rya_workers",
+                # Phase 5: named leases (the supervisor's singleton guard). RLS'd like
+                # everything else — a lease names a workspace's fleet, so one tenant
+                # reading or breaking another's would be a cross-tenant scheduling
+                # path even though the row holds no tenant data.
+                "rya_leases"]
 
 # PLATFORM_DESIGN §8: "the commit path connects as a distinct write-privileged
 # Postgres role, separate from the read path, so the runtime cannot perform
@@ -61,6 +66,21 @@ CREATE TABLE IF NOT EXISTS rya_users (
     password_hash TEXT NOT NULL,
     created_at TEXT
 );
+-- D29: the BILLING entity, above the workspace. An organization owns many
+-- workspaces; a workspace remains the ISOLATION boundary. Deliberately not in
+-- `_DATA_TABLES` and so carrying no RLS policy: like `rya_workspaces`, it is
+-- admin-plane state reached over the privileged connection, never by tenant
+-- code. See MULTITENANT_DESIGN's D29 split rule for which concern follows which.
+CREATE TABLE IF NOT EXISTS rya_organizations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT
+);
+-- Phase 5: the org's BUDGET, which is the first thing to read `org_id` and the
+-- reason D29 exists. Money limits only (see `rya.orgs._BUDGET_FIELDS`): tokens and
+-- cost aggregate cleanly across workspaces because they are summed from a durable
+-- ledger after the fact, and concurrency does not.
+ALTER TABLE rya_organizations ADD COLUMN IF NOT EXISTS budget JSONB;
 CREATE TABLE IF NOT EXISTS rya_workspaces (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -68,6 +88,13 @@ CREATE TABLE IF NOT EXISTS rya_workspaces (
     created_at TEXT
 );
 ALTER TABLE rya_workspaces ADD COLUMN IF NOT EXISTS owner_user_id TEXT;
+-- NULLABLE, and nothing reads it yet (Phase 5's quota work is the first
+-- consumer). It lands now because it is cheapest while every workspace still maps
+-- to exactly one org: adding it once tenants and invoices exist means a backfill
+-- against live data with a billing boundary already in use.
+ALTER TABLE rya_workspaces ADD COLUMN IF NOT EXISTS org_id TEXT
+    REFERENCES rya_organizations(id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_org ON rya_workspaces (org_id);
 CREATE TABLE IF NOT EXISTS rya_api_keys (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES rya_workspaces(id) ON DELETE CASCADE,
@@ -123,6 +150,25 @@ def worker_dsn(admin_dsn: str, password: Optional[str] = None) -> str:
     params["user"] = "rya_worker"
     params["password"] = password or app_db_password()
     return make_conninfo(**params)
+
+
+def is_worker_dsn(dsn: str) -> bool:
+    """Whether ``dsn`` already connects as ``rya_worker``."""
+    try:
+        return conninfo_to_dict(dsn).get("user") == "rya_worker"
+    except Exception:
+        return False
+
+
+def ensure_worker_dsn(dsn: str, password: Optional[str] = None) -> str:
+    """:func:`worker_dsn`, but a no-op when ``dsn`` already names ``rya_worker``.
+
+    A deployment that hands the worker container its own least-privilege DSN —
+    which is the goal, so the process never *holds* superuser credentials rather
+    than merely declining to use them — must not have that DSN's password
+    rewritten from ``RYA_APP_DB_PASSWORD``.
+    """
+    return dsn if is_worker_dsn(dsn) else worker_dsn(dsn, password)
 
 
 class Tenancy:
@@ -213,19 +259,123 @@ class Tenancy:
                           AND (owner IS NULL OR owner = current_setting('app.user_id', true)))
                    WITH CHECK (workspace_id = current_setting('app.workspace_id', true))"""
             )
+            self._backfill_organizations(cur)
         return app_dsn(self.admin_dsn, pw)
 
-    def create_workspace(self, name: str, owner_user_id: Optional[str] = None) -> dict:
+    # ---- organizations (D29) --------------------------------------------
+    def _backfill_organizations(self, cur) -> int:
+        """Give every org-less workspace an organization of its own.
+
+        Idempotent by construction: it selects only ``org_id IS NULL``, so the
+        second run finds nothing. One-org-per-workspace is the only backfill that
+        cannot be wrong — merging workspaces into a shared org is a billing
+        assertion nobody has made yet, and un-merging later means splitting an
+        invoice. Operators group workspaces afterwards with
+        :meth:`assign_workspace_to_org`.
+        """
+        cur.execute("SELECT id, name FROM rya_workspaces WHERE org_id IS NULL")
+        orphans = cur.fetchall()
+        for ws_id, ws_name in orphans:
+            org_id = _new_id("org")
+            cur.execute(
+                "INSERT INTO rya_organizations (id, name, created_at) VALUES (%s,%s,%s)",
+                (org_id, ws_name, now_iso()))
+            cur.execute("UPDATE rya_workspaces SET org_id=%s WHERE id=%s", (org_id, ws_id))
+        return len(orphans)
+
+    def create_organization(self, name: str) -> dict:
+        org = {"id": _new_id("org"), "name": name, "createdAt": now_iso()}
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rya_organizations (id, name, created_at) VALUES (%s,%s,%s)",
+                (org["id"], org["name"], org["createdAt"]))
+        return org
+
+    def list_organizations(self) -> List[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("""SELECT o.id, o.name, o.created_at, COUNT(w.id), o.budget
+                           FROM rya_organizations o
+                           LEFT JOIN rya_workspaces w ON w.org_id = o.id
+                           GROUP BY o.id, o.name, o.created_at, o.budget
+                           ORDER BY o.created_at""")
+            return [{"id": r[0], "name": r[1], "createdAt": r[2], "workspaces": r[3],
+                     "budget": r[4] or None}
+                    for r in cur.fetchall()]
+
+    def get_organization(self, org_id: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id, name, created_at, budget FROM rya_organizations "
+                        "WHERE id=%s", (org_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cur.execute("SELECT id FROM rya_workspaces WHERE org_id=%s ORDER BY id",
+                        (org_id,))
+            members = [r[0] for r in cur.fetchall()]
+        return {"id": row[0], "name": row[1], "createdAt": row[2],
+                "budget": row[3] or None, "workspaces": members}
+
+    def set_org_budget(self, org_id: str, budget: Optional[dict]) -> dict:
+        """Write an org's budget. ``None`` clears it.
+
+        Validated here rather than trusted, because this is the *admin* plane and the
+        row it writes is read by a reconciler running unattended — a malformed budget
+        would either be silently ignored (a limit that caps nothing) or would break
+        every tick for every org. Refusing at the write is the only place the person
+        who made the mistake is still present.
+        """
+        from psycopg.types.json import Json
+
+        from .errors import RyaError
+        from .orgs import coerce_budget
+
+        coerce_budget(budget)
+        with self._conn.cursor() as cur:
+            cur.execute("UPDATE rya_organizations SET budget=%s WHERE id=%s",
+                        (Json(budget) if budget else None, org_id))
+            if cur.rowcount == 0:
+                raise RyaError("E_NOT_FOUND", f"No organization '{org_id}'.")
+        return {"orgId": org_id, "budget": budget}
+
+    def assign_workspace_to_org(self, workspace_id: str, org_id: str) -> dict:
+        """Move a workspace's BILLING to another org. Its isolation is unaffected —
+        `workspace_id` does not change and no RLS policy references `org_id`."""
+        from .errors import RyaError
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM rya_organizations WHERE id=%s", (org_id,))
+            if cur.fetchone() is None:
+                raise RyaError("E_NOT_FOUND", f"No organization '{org_id}'.")
+            cur.execute("UPDATE rya_workspaces SET org_id=%s WHERE id=%s",
+                        (org_id, workspace_id))
+            if cur.rowcount == 0:
+                raise RyaError("E_NOT_FOUND", f"No workspace '{workspace_id}'.")
+        return {"workspaceId": workspace_id, "orgId": org_id}
+
+    def create_workspace(self, name: str, owner_user_id: Optional[str] = None,
+                         org_id: Optional[str] = None) -> dict:
+        """Create a workspace. Without an ``org_id`` it gets an organization of
+        its own, so the invariant "every workspace has exactly one org" holds from
+        creation rather than only after the next ``setup()``."""
         ws = {"id": _new_id("ws"), "name": name, "owner": owner_user_id, "createdAt": now_iso()}
         with self._conn.cursor() as cur:
-            cur.execute("INSERT INTO rya_workspaces (id, name, owner_user_id, created_at) VALUES (%s, %s, %s, %s)",
-                        (ws["id"], ws["name"], owner_user_id, ws["createdAt"]))
+            if org_id is None:
+                org_id = _new_id("org")
+                cur.execute(
+                    "INSERT INTO rya_organizations (id, name, created_at) VALUES (%s,%s,%s)",
+                    (org_id, name, ws["createdAt"]))
+            cur.execute(
+                "INSERT INTO rya_workspaces (id, name, owner_user_id, created_at, org_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (ws["id"], ws["name"], owner_user_id, ws["createdAt"], org_id))
+        ws["orgId"] = org_id
         return ws
 
     def list_workspaces(self) -> List[dict]:
         with self._conn.cursor() as cur:
-            cur.execute("SELECT id, name, created_at FROM rya_workspaces ORDER BY created_at")
-            return [{"id": r[0], "name": r[1], "createdAt": r[2]} for r in cur.fetchall()]
+            cur.execute("SELECT id, name, created_at, org_id FROM rya_workspaces "
+                        "ORDER BY created_at")
+            return [{"id": r[0], "name": r[1], "createdAt": r[2], "orgId": r[3]}
+                    for r in cur.fetchall()]
 
     # ---- self-serve accounts (onboarding) ------------------------------
     def create_user(self, email: str, password: str) -> dict:

@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .errors import RyaError
-from .store import now_iso, _new_id
+from .store import apply_worker_liveness, now_iso, _iso_in, _new_id
 
 try:
     import psycopg
@@ -238,6 +238,21 @@ CREATE TABLE IF NOT EXISTS rya_workers (
     started_at TEXT,
     last_heartbeat_at TEXT,
     data JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+-- Phase 5 / open question 7: "only one of these should be running" needs somewhere
+-- to be true. The supervisor is the caller — a Kubernetes Deployment is scalable by
+-- default and two supervisors double every replica count silently. Keyed by
+-- (workspace, name) rather than by name alone because `supervise_workspaces` reads
+-- each tenant through that tenant's own store handle, so a per-workspace lease also
+-- lets two supervisors split a fleet instead of fighting over it.
+CREATE TABLE IF NOT EXISTS rya_leases (
+    workspace_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    acquired_at TEXT,
+    expires_at TEXT NOT NULL,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (workspace_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_workers_key ON rya_workers (workspace_id, agent, version_id, status);
 CREATE INDEX IF NOT EXISTS idx_conn_lookup ON rya_connections (workspace_id, provider, status);
@@ -461,12 +476,14 @@ class PostgresStore:
 
     # ---- jobs ----------------------------------------------------------
     def create_job(self, run_id: str, handler: str, payload: dict, run_at: str,
-                   max_attempts: int = 3, group_id: Optional[str] = None) -> dict:
+                   max_attempts: int = 3, group_id: Optional[str] = None,
+                   agent: Optional[str] = None) -> dict:
         job = {
             "id": _new_id("job"), "parentRunId": run_id, "handler": handler,
             "payload": payload, "status": "pending", "runAt": run_at,
             "attempts": 0, "maxAttempts": max_attempts, "lastError": None,
             "createdAt": now_iso(), "resultRunId": None, "groupId": group_id,
+            "agent": agent,   # D22 for the `jobs` primitive — see FileStore.create_job
         }
         self.save_job(job)
         return job
@@ -497,19 +514,29 @@ class PostgresStore:
                             (self._ws, status))
             return [r[0] for r in cur.fetchall()]
 
-    def claim_due_job(self) -> Optional[dict]:
+    def claim_due_job(self, agent: Optional[str] = None) -> Optional[dict]:
         """Atomically claim one due pending job. FOR UPDATE SKIP LOCKED makes this
-        safe across N concurrent workers — no two ever grab the same job."""
+        safe across N concurrent workers — no two ever grab the same job.
+
+        ``agent`` is the D22 filter (see ``FileStore.claim_due_job``). Expressed as
+        ``data->>'agent' IS NULL OR = %s`` so a job written before the attribution
+        existed stays claimable rather than becoming permanently unrunnable.
+        """
+        clause = "" if agent is None else \
+            " AND (data->>'agent' IS NULL OR data->>'agent' = %s)"
+        params: List[Any] = [self._ws, now_iso()]
+        if agent is not None:
+            params.append(agent)
         with self._conn.cursor() as cur:
             cur.execute(
-                """WITH c AS (
+                f"""WITH c AS (
                        SELECT id FROM rya_jobs
-                       WHERE workspace_id=%s AND status='pending' AND run_at <= %s
+                       WHERE workspace_id=%s AND status='pending' AND run_at <= %s{clause}
                        ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 1)
-                   UPDATE rya_jobs j SET status='claimed', data = jsonb_set(j.data, '{status}', '"claimed"')
+                   UPDATE rya_jobs j SET status='claimed', data = jsonb_set(j.data, '{{status}}', '"claimed"')
                    FROM c WHERE j.id = c.id
                    RETURNING j.data""",
-                (self._ws, now_iso()),
+                tuple(params),
             )
             row = cur.fetchone()
             return row[0] if row else None
@@ -766,7 +793,8 @@ class PostgresStore:
             "id": _new_id("conn"), "provider": provider, "owner": owner or self.user_id,
             "scopes": list(scopes or []), "label": label or provider,
             # Server context: key comes from RYA_SECRET_KEY (no project keyfile).
-            "secret": seal(secret, None), "status": "active", "createdAt": now_iso(),
+            "secret": seal(secret, None, workspace=self.workspace_id),
+            "status": "active", "createdAt": now_iso(),
         }
         with self._conn.cursor() as cur:
             cur.execute(
@@ -797,7 +825,8 @@ class PostgresStore:
                 "id": row[0] if row else _new_id("conn"),
                 "provider": provider, "owner": owner,
                 "scopes": list(scopes or []), "label": label or provider,
-                "secret": seal(secret, None), "status": "active",
+                "secret": seal(secret, None, workspace=self.workspace_id),
+                "status": "active",
                 "createdAt": (row[1].get("createdAt") if row else now_iso()) or now_iso(),
                 "updatedAt": now_iso(),
             }
@@ -828,7 +857,9 @@ class PostgresStore:
             row = cur.fetchone()
             if not row:
                 return None
-            return {**row[0], "secret": unseal(row[0].get("secret"), None)}
+            return {**row[0],
+                    "secret": unseal(row[0].get("secret"), None,
+                                     workspace=self.workspace_id)}
 
     def list_connections(self) -> List[dict]:
         with self._conn.cursor() as cur:
@@ -864,7 +895,7 @@ class PostgresStore:
             if is_sealed(sec):
                 already += 1
                 continue
-            new = seal(sec, None)  # env key only in server context
+            new = seal(sec, None, workspace=self.workspace_id)
             if is_sealed(new):
                 doc = {**data, "secret": new}
                 with self._conn.cursor() as cur:
@@ -1172,6 +1203,21 @@ class PostgresStore:
                             "AND agent=%s ORDER BY name", (self._ws, agent))
             return [r[0] for r in cur.fetchall()]
 
+    def agent_list(self) -> List[str]:
+        """Every agent name with a version or an environment pointer (D21).
+
+        Both halves of the UNION are index-only on `(workspace_id, agent, …)` and
+        neither touches the `data` JSONB, which is what makes this cheap enough to
+        run on every unprefixed request (D28 Rule 6).
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT agent FROM rya_versions WHERE workspace_id=%s
+                   UNION
+                   SELECT agent FROM rya_environments WHERE workspace_id=%s
+                   ORDER BY 1""", (self._ws, self._ws))
+            return [r[0] for r in cur.fetchall() if r[0]]
+
     # ---- worker registration (§6) ----------------------------------------
     def worker_register(self, record: dict) -> dict:
         worker = {"id": record.get("id") or _new_id("wrk"), "status": "alive",
@@ -1188,6 +1234,59 @@ class PostgresStore:
                  worker["lastHeartbeatAt"], Json(worker)),
             )
         return worker
+
+    # ---- named leases (Phase 5, open question 7) ---------------------------
+    def lease_acquire(self, name: str, holder: str,
+                      ttl_seconds: float = 30.0) -> Optional[dict]:
+        """Take or renew a named lease. ``None`` means somebody else holds it.
+
+        One statement, and the ``WHERE`` on the conflict path is the whole mechanism:
+        the update applies only if the current holder is *this* holder (a renewal) or
+        the existing lease has already expired (a takeover). Anything else leaves the
+        row untouched and ``RETURNING`` yields nothing, which is how the caller learns
+        it lost. No read-then-write, so there is no window between the two.
+
+        ``acquired_at`` survives a renewal so "how long has this supervisor been in
+        charge" is answerable, which is the field an operator reads when a fleet
+        starts behaving as though it changed hands.
+        """
+        now, expires = now_iso(), _iso_in(max(1.0, ttl_seconds))
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rya_leases (workspace_id, name, holder, acquired_at,
+                                           expires_at)
+                   VALUES (%s,%s,%s,%s,%s)
+                   ON CONFLICT (workspace_id, name) DO UPDATE
+                     SET holder = EXCLUDED.holder,
+                         expires_at = EXCLUDED.expires_at,
+                         acquired_at = CASE WHEN rya_leases.holder = EXCLUDED.holder
+                                            THEN rya_leases.acquired_at
+                                            ELSE EXCLUDED.acquired_at END
+                     WHERE rya_leases.holder = EXCLUDED.holder
+                        OR rya_leases.expires_at <= %s
+                   RETURNING holder, acquired_at, expires_at""",
+                (self._ws, name, holder, now, expires, now))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {"name": name, "holder": row[0], "acquiredAt": row[1],
+                "expiresAt": row[2], "renewed": row[1] != now}
+
+    def lease_release(self, name: str, holder: str) -> bool:
+        with self._conn.cursor() as cur:
+            cur.execute("DELETE FROM rya_leases WHERE workspace_id=%s AND name=%s "
+                        "AND holder=%s", (self._ws, name, holder))
+            return cur.rowcount > 0
+
+    def lease_get(self, name: str) -> Optional[dict]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT holder, acquired_at, expires_at FROM rya_leases "
+                        "WHERE workspace_id=%s AND name=%s", (self._ws, name))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {"name": name, "holder": row[0], "acquiredAt": row[1],
+                "expiresAt": row[2]}
 
     def worker_heartbeat(self, worker_id: str, **fields) -> Optional[dict]:
         with self._conn.cursor() as cur:
@@ -1219,11 +1318,16 @@ class PostgresStore:
                     status: Optional[str] = None) -> List[dict]:
         clauses = ["workspace_id=%s"]
         params: List[Any] = [self._ws]
-        for col, val in (("agent", agent), ("version_id", version_id), ("status", status)):
+        for col, val in (("agent", agent), ("version_id", version_id)):
             if val is not None:
                 clauses.append(f"{col}=%s")
                 params.append(val)
+        # `status` is NOT pushed into SQL. The column records what a worker last
+        # said about itself; whether that is still true is a function of its
+        # heartbeat age, which only `apply_worker_liveness` knows. Filtering here
+        # would return rows the liveness pass is about to demote to `lost` — see
+        # its docstring for why `quotas` in particular must not see those.
         with self._conn.cursor() as cur:
             cur.execute(f"SELECT data FROM rya_workers WHERE {' AND '.join(clauses)} "
                         "ORDER BY started_at DESC", tuple(params))
-            return [r[0] for r in cur.fetchall()]
+            return apply_worker_liveness([r[0] for r in cur.fetchall()], status)

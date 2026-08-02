@@ -27,8 +27,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,31 @@ from typing import Any, Dict, List, Optional
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_in(seconds: float) -> str:
+    """``now_iso()`` shifted forward. Same format, so lexicographic ordering holds.
+
+    Every deadline in this codebase is a fixed-width UTC ISO string compared with
+    ``<`` — queue leases, job ``runAt``, and now named leases. That is what lets an
+    expiry test live inside a single SQL statement on one arm and a string compare on
+    the other, with no timezone or clock-format skew between them.
+    """
+    from datetime import timedelta
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _slug(name: str) -> str:
+    """A filesystem-safe file stem for an arbitrary name.
+
+    Lease names are constructed by platform code (``supervisor:acme``), so this is
+    hygiene rather than a boundary — but a name with a ``/`` in it would write outside
+    the leases directory, and that is not a class of bug worth leaving open on the
+    strength of every current caller being well behaved.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "_"
 
 
 def _fair_order(pending: List[dict], running: Dict[str, int]) -> List[dict]:
@@ -91,6 +118,148 @@ def open_store(root: Path):
     return store
 
 
+def open_worker_store(root: Path, workspace: str = "default"):
+    """The EXECUTION plane's store handle: scoped to ``workspace``, connected as
+    the ``rya_worker`` role.
+
+    The same seam as :func:`open_store`, with the two properties the execution
+    plane needs and the control plane does not (PLATFORM_DESIGN §8, D19):
+
+    1. **The workspace is load-bearing.** ``open_store`` returns a store on the
+       default workspace whatever the caller intended, so `rya worker
+       --workspace acme` used to produce a worker whose *key* said `acme` and
+       whose *store* read everything. The flag described the worker without
+       scoping it.
+    2. **The role is weaker.** ``rya_worker`` holds SELECT only on the governance
+       tables, so the process that imports client bundles cannot write policy,
+       flip an environment pointer or forge a version — even if its own policy
+       code is wrong.
+
+    ``RYA_WORKER_DATABASE_URL`` is honoured ahead of everything else. That is how
+    a deployment gives this process a least-privilege DSN *and nothing else*:
+    deriving the worker role from the admin DSN still leaves the admin DSN in the
+    environment, where a hostile bundle can read it and connect as a superuser —
+    and superusers bypass RLS entirely. Deriving is the convenience path;
+    supplying is the correct one. (Holding no credential at all is D18, Phase 4.)
+
+    Falls back to :func:`open_store` when multi-tenancy is off, because the
+    ``rya_worker`` role only exists once ``tenancy.setup()`` has run. A
+    single-tenant self-host and `rya dev` are unchanged.
+    """
+    import os
+
+    from .config import multitenant_enabled
+
+    explicit = os.environ.get("RYA_WORKER_DATABASE_URL")
+    url = explicit or os.environ.get("RYA_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    # An explicitly supplied worker DSN is itself the declaration that this is the
+    # execution plane, so it does not also require RYA_MULTITENANT — otherwise the
+    # least-privilege path would silently downgrade to `open_store` on the admin
+    # DSN, which is the opposite of what the operator asked for.
+    if not url or not (explicit or multitenant_enabled()):
+        return open_store(root)
+
+    from .errors import RyaError
+    from .store_postgres import PostgresStore
+    from .tenancy import ensure_worker_dsn
+
+    try:
+        store = PostgresStore(ensure_worker_dsn(url), workspace_id=workspace)
+    except Exception as exc:
+        # A missing role is a provisioning step that was skipped, not a bug —
+        # say which command installs it rather than surfacing a psycopg error.
+        raise RyaError(
+            "E_TENANCY_NOT_PROVISIONED",
+            f"Could not connect as the rya_worker role: {exc}",
+            hint="Run `rya tenancy setup` (or Tenancy.setup()) on the admin DSN "
+                 "to create the rya_app / rya_worker roles and install RLS.",
+        ) from exc
+    # NOT store.ensure(): DDL belongs to the admin role, and a worker that could
+    # create tables could create one without an RLS policy.
+    return store
+
+
+# ---- worker liveness (§6) ---------------------------------------------------
+# `lastHeartbeatAt` was written by every worker and read by nothing, so a
+# SIGKILLed process stayed `alive` in `GET /workers` forever. Two things depended
+# on that lie: `quotas._usage_for` counts `worker_list(status="alive")` against
+# `maxWorkers`, so every crash permanently consumed a slot until the quota
+# refused the whole fleet; and a supervisor (D25) cannot decide to replace a
+# worker on a signal that never changes.
+#
+# Liveness is derived at READ time rather than by a background sweep. The status
+# column is then correct in a deployment that runs no supervisor at all — which
+# is every self-host today — and a reaper becomes an optimisation that persists
+# what the read already knows, not the thing that makes it true.
+STATUS_ALIVE = "alive"
+STATUS_LOST = "lost"        # registered, stopped heartbeating, never deregistered
+STATUS_STOPPED = "stopped"  # deregistered on the way out, with a reason
+
+# Deliberately the same window as `turns.execute_pending`'s lease. The platform
+# already presumes an item is abandoned after this long and hands it to someone
+# else, so a worker that has not heartbeat for a full lease is one whose work is
+# ALREADY being reclaimed — calling it lost at that point states what the queue
+# has already concluded rather than guessing separately.
+#
+# The residual: a worker heartbeats between ticks, so a single tick longer than
+# this window looks lost while it is in fact busy. That is bounded on purpose.
+# The supervisor's response to a lost worker is to START a replacement, never to
+# kill; claims are atomic and leased, so a spurious replacement costs a process,
+# not a double execution. Making it precise needs a heartbeat thread, and a
+# thread inside the execution plane is not worth buying that with.
+WORKER_LOST_SECONDS = 120.0
+
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def worker_liveness(doc: dict, *, now: Optional[datetime] = None,
+                    lost_after: float = WORKER_LOST_SECONDS) -> dict:
+    """``doc`` with a truthful ``status``, plus how stale its heartbeat is.
+
+    Only ever demotes ``alive`` to ``lost``. A ``stopped`` worker deregistered
+    itself and its last heartbeat is irrelevant; promoting a lost worker back to
+    alive would need a heartbeat, which is the one thing it is not sending.
+
+    An unparseable or missing ``lastHeartbeatAt`` is treated as lost rather than
+    alive: this is the signal a scheduler acts on, so an absent one must not read
+    as healthy.
+    """
+    if doc.get("status") != STATUS_ALIVE:
+        return doc
+    now = now or datetime.now(timezone.utc)
+    beat = _parse_iso(doc.get("lastHeartbeatAt"))
+    age = None if beat is None else max(0.0, (now - beat).total_seconds())
+    out = {**doc, "heartbeatAgeSeconds": age}
+    if age is None or age > lost_after:
+        out["status"] = STATUS_LOST
+        out["lostAfterSeconds"] = lost_after
+    return out
+
+
+def apply_worker_liveness(docs: List[dict], status: Optional[str] = None,
+                          *, now: Optional[datetime] = None,
+                          lost_after: float = WORKER_LOST_SECONDS) -> List[dict]:
+    """Derive liveness across a listing, then filter — in that order.
+
+    The order is the whole point. Filtering on the stored column first and
+    deriving afterwards would answer ``status="alive"`` with rows this function
+    is about to call lost, which is precisely the bug: `quotas` asks exactly that
+    question, and getting a demoted row back would keep the crashed worker
+    counting against `maxWorkers`.
+    """
+    out = [worker_liveness(doc, now=now, lost_after=lost_after) for doc in docs]
+    if status is not None:
+        out = [doc for doc in out if doc.get("status") == status]
+    return out
+
+
 class FileStore:
     """File-backed store (zero-config local / OSS dev). Default backend."""
 
@@ -113,12 +282,13 @@ class FileStore:
         self.versions_dir = self.dir / "versions"
         self.envs_dir = self.dir / "envs"
         self.workers_dir = self.dir / "workers"
+        self.leases_dir = self.dir / "leases"
 
     def ensure(self) -> None:
         for d in (self.runs_dir, self.approvals_dir, self.jobs_dir, self.queue_dir,
                   self.streams_dir, self.memory_dir, self.sessions_dir, self.connections_dir,
                   self.files_dir, self.journal_dir, self.meter_dir, self.policy_dir,
-                  self.versions_dir, self.envs_dir, self.workers_dir):
+                  self.versions_dir, self.envs_dir, self.workers_dir, self.leases_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     # ---- low level -----------------------------------------------------
@@ -276,7 +446,8 @@ class FileStore:
 
     # ---- jobs ----------------------------------------------------------
     def create_job(self, run_id: str, handler: str, payload: dict, run_at: str,
-                   max_attempts: int = 3, group_id: Optional[str] = None) -> dict:
+                   max_attempts: int = 3, group_id: Optional[str] = None,
+                   agent: Optional[str] = None) -> dict:
         job = {
             "id": _new_id("job"),
             "parentRunId": run_id,
@@ -290,6 +461,13 @@ class FileStore:
             "createdAt": now_iso(),
             "resultRunId": None,
             "groupId": group_id,
+            # D22, applied to the `jobs` primitive. Without it `claim_due_job` is
+            # unfiltered, so in a workspace with two agents either worker claims
+            # either agent's due job and `run_job` raises E_HANDLER_NOT_FOUND on
+            # the one it cannot serve. Rows written before this exist with `None`
+            # and stay claimable by anyone, which is the only back-compatible
+            # reading of an absent attribution.
+            "agent": agent,
         }
         self._write(self.jobs_dir / f"{job['id']}.json", job)
         return job
@@ -341,14 +519,23 @@ class FileStore:
         out.sort(key=lambda j: j.get("runAt", ""))
         return out
 
-    def claim_due_job(self) -> Optional[dict]:
-        """Claim one due pending job (best-effort; the file store is single-worker)."""
+    def claim_due_job(self, agent: Optional[str] = None) -> Optional[dict]:
+        """Claim one due pending job (best-effort; the file store is single-worker).
+
+        ``agent`` is the D22 filter, and it reads the same way ``queue.claim``'s
+        version filter does: a row with no agent is unattributed and claimable by
+        anyone, a row that names one is only that agent's work.
+        """
         now = now_iso()
         for job in self.list_jobs("pending"):
-            if (job.get("runAt") or "") <= now:
-                job["status"] = "claimed"
-                self.save_job(job)
-                return job
+            if (job.get("runAt") or "") > now:
+                continue
+            owner = job.get("agent")
+            if agent is not None and owner is not None and owner != agent:
+                continue
+            job["status"] = "claimed"
+            self.save_job(job)
+            return job
         return None
 
     # ---- queue: durable jobs for EXTERNAL workers ------------------------
@@ -860,6 +1047,17 @@ class FileStore:
                 out.append(doc)
         return out
 
+    def agent_list(self) -> List[str]:
+        """Every agent name with a version or an environment pointer (D21).
+
+        Its own method rather than a reduction over `version_list()` because the
+        multi-agent api asks this on every unprefixed request (D28 Rule 6) and
+        the Postgres arm answers it from an index without reading any `data`.
+        """
+        found = {doc.get("agent") for doc in self.version_list()}
+        found |= {doc.get("agent") for doc in self.env_list()}
+        return sorted(n for n in found if n)
+
     # ---- worker registration (§6) ----------------------------------------
     # `queue.claim` takes a bare worker_id string that is never registered or
     # validated. A worker now registers what it actually is — bundle hash and
@@ -875,6 +1073,71 @@ class FileStore:
         }
         self._write(self.workers_dir / f"{worker['id']}.json", worker)
         return worker
+
+    # ---- named leases (Phase 5, open question 7) ---------------------------
+    # "Only one of these should be running" needs somewhere to be true. The
+    # supervisor is the caller that needs it: the obvious way to run one on
+    # Kubernetes is a Deployment, a Deployment defaults to being scalable, and two
+    # supervisors on one workspace double every replica count with nothing detecting
+    # it. A lease is the smallest mechanism that turns that into a decision.
+    #
+    # **This arm is advisory and the Postgres arm is authoritative.** The exclusive
+    # lock file below makes the read-modify-write atomic between processes on one
+    # box, which is exactly as far as a FileStore's guarantees ever reach — it is a
+    # single-node development store. Two supervisors that matter are two containers,
+    # and those share Postgres, where the acquire is one statement.
+    def lease_acquire(self, name: str, holder: str,
+                      ttl_seconds: float = 30.0) -> Optional[dict]:
+        path = self.leases_dir / f"{_slug(name)}.json"
+        lock = path.with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        for _ in range(100):
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError:
+                try:
+                    # A lock file outliving its holder by a second means the process
+                    # died between creating and removing it. Breaking it is safe: the
+                    # lock guards a few milliseconds of file I/O, not the lease itself.
+                    if time.time() - lock.stat().st_mtime > 1.0:
+                        lock.unlink()
+                        continue
+                except OSError:  # pragma: no cover - it went away; retry
+                    continue
+                time.sleep(0.01)
+        if fd is None:  # pragma: no cover - contention this heavy is not real here
+            return None
+        try:
+            now = now_iso()
+            held = self._read(path)
+            if held is not None and held.get("holder") != holder \
+                    and (held.get("expiresAt") or "") > now:
+                return None
+            renewed = held is not None and held.get("holder") == holder
+            doc = {"name": name, "holder": holder,
+                   "acquiredAt": (held or {}).get("acquiredAt") if renewed else now,
+                   "expiresAt": _iso_in(max(1.0, ttl_seconds)),
+                   "renewed": renewed}
+            self._write(path, doc)
+            return doc
+        finally:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                lock.unlink()
+
+    def lease_release(self, name: str, holder: str) -> bool:
+        path = self.leases_dir / f"{_slug(name)}.json"
+        doc = self._read(path)
+        if doc is None or doc.get("holder") != holder:
+            return False
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return True
+
+    def lease_get(self, name: str) -> Optional[dict]:
+        return self._read(self.leases_dir / f"{_slug(name)}.json")
 
     def worker_heartbeat(self, worker_id: str, **fields) -> Optional[dict]:
         doc = self._read(self.workers_dir / f"{worker_id}.json")
@@ -906,11 +1169,11 @@ class FileStore:
                 continue
             if version_id is not None and doc.get("versionId") != version_id:
                 continue
-            if status is not None and doc.get("status") != status:
-                continue
             out.append(doc)
         out.sort(key=lambda w: w.get("startedAt", ""), reverse=True)
-        return out
+        # `status` is applied by the liveness pass, not here: a stored `alive` may
+        # be a lost worker that never got to deregister.
+        return apply_worker_liveness(out, status)
 
     def describe(self) -> dict:
         return {"backend": "file", "location": str(self.dir)}

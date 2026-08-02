@@ -93,6 +93,49 @@ _CODE_EXIT = {
     # block and by `rya publish`; undeclared it fell through to EXIT_GENERIC, so a
     # refusal to ship looked like a crash to anything branching on the exit code.
     "E_NO_EVENT_HANDLER": EXIT_VALIDATION,
+    # ---- execution plane (MULTITENANT D25/D26/D27) ----------------------------
+    # Declared late: these shipped in Phase 3 and were left out of this table, so
+    # every one of them exited 1. That is the same miss the E_NOT_FOUND comment
+    # above records, and it mattered most for the first one — the fail-closed
+    # isolation refusal is the launch gate, and a launch gate that exits like a
+    # crash is one an operator's deploy script cannot tell from a crash.
+    "E_ISOLATION_INSUFFICIENT": EXIT_PERMISSION,
+    "E_DRIVER_UNKNOWN": EXIT_VALIDATION,
+    "E_WORKER_START_FAILED": EXIT_GENERIC,
+    "E_POOL_HASH_MISMATCH": EXIT_STATE,
+    "E_BUNDLE_IMPORT_FAILED": EXIT_MANIFEST,
+    "E_TEMPLATE_START_FAILED": EXIT_GENERIC,
+    "E_TEMPLATE_NOT_RUNNING": EXIT_STATE,
+    "E_TEMPLATE_LOST": EXIT_GENERIC,
+    # ---- the untrusted posture (MULTITENANT D18/D23/D24/D30/D31) --------------
+    # The broker refused a call. A REFUSAL, not a failure: E_BROKER_METHOD_DENIED
+    # is what a tenant reaching outside its allowlisted surface gets, and it must
+    # be as distinguishable from a bug as E_TOOL_PERMISSION_DENIED is.
+    "E_BROKER_METHOD_DENIED": EXIT_PERMISSION,
+    "E_BROKER_SCOPE_DENIED": EXIT_PERMISSION,
+    "E_BROKER_UNAVAILABLE": EXIT_GENERIC,
+    "E_BROKER_PROTOCOL": EXIT_GENERIC,
+    "E_CAPABILITY_INVALID": EXIT_PERMISSION,
+    "E_CAPABILITY_EXPIRED": EXIT_PERMISSION,
+    "E_MODEL_NOT_ALLOWED": EXIT_PERMISSION,
+    # Key management. E_KEY_NOT_SHREDDABLE is a validation failure rather than a
+    # permission one on purpose: the operator is allowed to purge, the configured
+    # key provider simply cannot deliver what the purge would claim.
+    "E_KEY_UNAVAILABLE": EXIT_GENERIC,
+    "E_KEY_NOT_FOUND": EXIT_NOT_FOUND,
+    "E_KEY_NOT_SHREDDABLE": EXIT_VALIDATION,
+    "E_KEY_PROVIDER_UNKNOWN": EXIT_VALIDATION,
+    "E_KEY_WORKSPACE_MISMATCH": EXIT_PERMISSION,
+    # D31: a purge asked for on a workspace that was never disabled, or before its
+    # retention window elapsed. A state error — the request is legitimate and the
+    # order is wrong.
+    "E_PURGE_NOT_ALLOWED": EXIT_STATE,
+    "E_WORKSPACE_DISABLED": EXIT_PERMISSION,
+    # D24: the network layer refused, as distinct from guard.py's E_EGRESS_BLOCKED
+    # which is the policy verdict. Two codes because after D24 they are two
+    # mechanisms, and a divergence between them is the thing worth alerting on.
+    "E_EGRESS_DENIED": EXIT_PERMISSION,
+    "E_EGRESS_UNAVAILABLE": EXIT_GENERIC,
 }
 
 

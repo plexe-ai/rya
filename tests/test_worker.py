@@ -372,6 +372,88 @@ def test_an_unpinned_worker_claims_anything(tmp_path):
     assert len(q.claim(store, "any", types=["chat-turn"], limit=10)) == 2
 
 
+# ---- D22: the agent filter ------------------------------------------------
+#
+# The regression these cover is not hypothetical and not version-shaped: an
+# *unpinned* worker — the common case, since pinning requires a published
+# version — used to claim a sibling agent's chat-turn and execute it against its
+# own handler. Under D17 that is a cross-tenant execution path.
+
+def test_an_unpinned_worker_does_not_claim_another_agents_turn(tmp_path):
+    """THE Phase 1 defect. Version pinning did not cover this: neither worker is
+    pinned, so the version filter never engages and the agent filter is the only
+    thing standing between agent A's worker and agent B's turn."""
+    from rya import queue as q
+    store = _store(tmp_path)
+
+    mine = q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "support"})
+    theirs = q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "billing"})
+    loose = q.enqueue(store, "chat-turn", {"type": "m"})
+
+    claimed = q.claim(store, "worker-support", types=["chat-turn"], limit=10,
+                      agent="support")
+    ids = {j["id"] for j in claimed}
+    assert mine["id"] in ids
+    assert loose["id"] in ids           # untagged work is still anyone's (D14)
+    assert theirs["id"] not in ids      # <- the defect
+
+    # Refusing it neither consumed its retry budget nor left it running, so the
+    # worker that *should* have it still can.
+    back = store.queue_get(theirs["id"])
+    assert back["status"] == "pending" and back["attempts"] == 0
+    assert q.claim(store, "worker-billing", types=["chat-turn"], limit=10,
+                   agent="billing")[0]["id"] == theirs["id"]
+
+
+def test_agent_and_version_filters_are_independent(tmp_path):
+    """A job may be refused for either reason. Pinning to the right version does
+    not buy you a pass on the agent check, which is the whole point of D22 being
+    a separate filter rather than a wider version key."""
+    from rya import queue as q
+    store = _store(tmp_path)
+
+    wrong_agent_right_version = q.enqueue(
+        store, "chat-turn", {"type": "m"},
+        metadata={"agent": "billing", "versionId": "ver_A"})
+    right_both = q.enqueue(
+        store, "chat-turn", {"type": "m"},
+        metadata={"agent": "support", "versionId": "ver_A"})
+
+    claimed = q.claim(store, "w", types=["chat-turn"], limit=10,
+                      version_id="ver_A", agent="support")
+    ids = {j["id"] for j in claimed}
+    assert right_both["id"] in ids
+    assert wrong_agent_right_version["id"] not in ids
+
+
+def test_a_claimer_naming_no_agent_still_claims_anything(tmp_path):
+    """D14's SDK-free surface: a foreign TypeScript worker knows nothing about
+    agents and must keep working exactly as before."""
+    from rya import queue as q
+    store = _store(tmp_path)
+    q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "support"})
+    q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "billing"})
+    q.enqueue(store, "chat-turn", {"type": "m"})
+    assert len(q.claim(store, "foreign", types=["chat-turn"], limit=10)) == 3
+
+
+def test_queue_depth_ignores_another_agents_turn(tmp_path):
+    """The counting half of the same defect. An unpinned worker has no version to
+    filter on, so before D22 a sibling agent's pending turn read as depth
+    forever: this worker would never claim it and never go idle."""
+    from rya import queue as q
+    store = _store(tmp_path)
+    root = _project(tmp_path)
+    engine = _engine(root, store)
+
+    q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "billing"})
+    w = Worker(engine, WorkerKey("default", "support"))
+    assert w.queue_depth() == 0
+
+    q.enqueue(store, "chat-turn", {"type": "m"}, metadata={"agent": "support"})
+    assert w.queue_depth() == 1
+
+
 def test_retiring_a_version_with_a_live_run_fails_closed(tmp_path):
     store = _store(tmp_path)
     root = _project(tmp_path, entrypoint=ENTRYPOINT.replace(
@@ -390,3 +472,112 @@ def test_retiring_a_version_with_a_live_run_fails_closed(tmp_path):
         deployments.retire(store, v["id"])
     assert e.value.code == "E_VERSION_IN_USE"
     assert run["id"] in [r["id"] for r in deployments.pinned_runs(store, v["id"])]
+
+
+# ---- worker liveness (§6, Phase 3) ------------------------------------------
+# `lastHeartbeatAt` was written by every worker and read by nothing, so a process
+# killed with SIGKILL stayed `alive` forever. Two things believed it: `GET
+# /workers` (the e2e asserted the lie as a known GAP) and `quotas`, which counts
+# alive workers against `maxWorkers` — so each crash leaked a permanent slot.
+
+def _register(store, worker_id="wrk_1", **fields):
+    return store.worker_register({"id": worker_id, "agent": "wrk",
+                                  "workspaceId": "default", **fields})
+
+
+def _age(store, worker_id, seconds):
+    """Backdate a worker's heartbeat, the way a crash does by not writing one."""
+    from datetime import datetime, timedelta, timezone
+    doc = store.worker_list()[0] if worker_id is None else next(
+        w for w in store.worker_list(status=None) if w["id"] == worker_id)
+    then = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    doc = {**doc, "lastHeartbeatAt": then.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    doc.pop("heartbeatAgeSeconds", None)
+    store._write(store.workers_dir / f"{doc['id']}.json", doc)
+
+
+def test_a_worker_that_stopped_heartbeating_is_not_reported_alive(tmp_path):
+    """The Phase 3 prerequisite. A supervisor cannot decide to replace a worker
+    on a signal that never changes, and `GET /workers` must not overstate a fleet
+    that a SIGKILL has already reduced."""
+    from rya.store import WORKER_LOST_SECONDS
+
+    store = _store(tmp_path)
+    _register(store)
+    assert [w["status"] for w in store.worker_list(status="alive")] == ["alive"]
+
+    _age(store, "wrk_1", WORKER_LOST_SECONDS + 30)
+    assert store.worker_list(status="alive") == []
+    lost = store.worker_list(status="lost")
+    assert [w["id"] for w in lost] == ["wrk_1"]
+    assert lost[0]["heartbeatAgeSeconds"] > WORKER_LOST_SECONDS
+
+
+def test_a_lost_worker_is_still_listed_rather_than_hidden(tmp_path):
+    """"Not alive" must not be achieved by disappearing. An empty worker list is
+    scale-to-zero — the designed idle state (§6) — so a crash that emptied the
+    list would be indistinguishable from a key that idled out."""
+    from rya.store import WORKER_LOST_SECONDS
+
+    store = _store(tmp_path)
+    _register(store)
+    _age(store, "wrk_1", WORKER_LOST_SECONDS + 30)
+
+    every = store.worker_list()
+    assert [(w["id"], w["status"]) for w in every] == [("wrk_1", "lost")]
+
+
+def test_a_crashed_worker_stops_consuming_a_maxworkers_slot(tmp_path):
+    """The quota consequence, which is worse than the cosmetic one: `_usage_for`
+    counts `worker_list(status="alive")`, so before this a single crash consumed a
+    slot permanently and enough crashes refused the whole fleet."""
+    from rya.quotas import check_admission, set_quota
+    from rya.store import WORKER_LOST_SECONDS
+
+    store = _store(tmp_path)
+    set_quota(store, {"maxWorkers": 1})
+    _register(store)
+    assert check_admission(store, kind="worker").allowed is False
+
+    _age(store, "wrk_1", WORKER_LOST_SECONDS + 30)
+    assert check_admission(store, kind="worker").allowed is True
+
+
+def test_a_deregistered_worker_stays_stopped_rather_than_becoming_lost(tmp_path):
+    """Liveness only ever DEMOTES alive. A worker that said goodbye has a reason
+    recorded, and an old heartbeat on it is not news."""
+    from rya.store import WORKER_LOST_SECONDS
+
+    store = _store(tmp_path)
+    _register(store)
+    store.worker_deregister("wrk_1", "idle")
+    _age(store, "wrk_1", WORKER_LOST_SECONDS + 30)
+
+    doc = store.worker_list()[0]
+    assert doc["status"] == "stopped" and doc["stopReason"] == "idle"
+
+
+def test_a_worker_with_no_heartbeat_at_all_is_lost_not_alive(tmp_path):
+    """Fail closed on a missing signal. This is what a scheduler acts on, so an
+    absent heartbeat must not read as healthy."""
+    store = _store(tmp_path)
+    doc = _register(store)
+    doc.pop("lastHeartbeatAt")
+    store._write(store.workers_dir / f"{doc['id']}.json", doc)
+
+    assert store.worker_list(status="alive") == []
+    assert store.worker_list(status="lost")[0]["id"] == "wrk_1"
+
+
+def test_a_heartbeat_brings_a_worker_back_into_the_alive_list(tmp_path):
+    """The window is about the heartbeat, not about the row: a worker that was
+    merely slow is alive again the moment it reports, with no reaper involved."""
+    from rya.store import WORKER_LOST_SECONDS
+
+    store = _store(tmp_path)
+    _register(store)
+    _age(store, "wrk_1", WORKER_LOST_SECONDS + 30)
+    assert store.worker_list(status="alive") == []
+
+    store.worker_heartbeat("wrk_1")
+    assert [w["id"] for w in store.worker_list(status="alive")] == ["wrk_1"]

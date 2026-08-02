@@ -120,10 +120,21 @@ class Engine:
         models: Optional[ModelRegistry] = None,
         version: Optional[dict] = None,
         environment: Optional[str] = None,
+        broker=None,
+        config=None,
     ) -> None:
         self.manifest = manifest
         self.agent = agent
         self.store = store
+        # D18: the mediated IO client, threaded straight through to every ctx this
+        # engine builds. The engine itself never calls it — it holds no credentials
+        # to replace — but it is the one object that constructs `RuntimeContext`, so
+        # it is where the posture has to be carried. `config` is here for the same
+        # reason: under mediation the claimer resolves the RunConfig and hands down a
+        # STRIPPED copy (no api keys, no secrets), and letting RuntimeContext resolve
+        # its own from `os.environ` inside the sandbox would undo that.
+        self.broker = broker
+        self.config = config
         self.project_root = project_root
         self.tools = tools or default_tools()
         self.models = models or default_models()
@@ -191,9 +202,36 @@ class Engine:
         self.store.save_run(run)
         return run
 
+    def _adopt_run(self, run_id: str) -> Optional[dict]:
+        """Take over a run the CONTROL PLANE created and queued (D21).
+
+        `POST /agents/{id}/events` no longer executes; it writes a `queued` run —
+        pinned to the promoted version, admitted against the quota — and enqueues
+        it. The caller therefore holds a run id before any worker has touched the
+        work, which is what makes `GET /runs/{id}` answer immediately and the pin
+        auditable. This is where a worker picks that record up instead of minting
+        a second one.
+
+        The journal and trace are reset, not resumed. A queued run has never
+        executed, and a *reclaimed* one is being re-run from scratch by contract
+        (see the `turns` module docstring: crash-retry re-runs the handler fresh).
+        The durable-resume case is an approval pause, which goes through
+        `approve`, never here.
+        """
+        run = self.store.get_run(run_id)
+        if run is None:
+            return None
+        run["status"] = "running"
+        run["journal"] = {}
+        run["trace"] = []
+        run["error"] = None
+        run["pendingApproval"] = None
+        return run
+
     # ---- execution -----------------------------------------------------
     def run_event(self, type: str, payload: dict, source: str = "manual", identity=None,
-                  on_trace=None, on_token=None, on_ui=None) -> dict:
+                  on_trace=None, on_token=None, on_ui=None,
+                  run_id: Optional[str] = None) -> dict:
         handler = self.agent.event_handler()
         if handler is None:
             raise RyaError(
@@ -201,8 +239,21 @@ class Engine:
                 "No @agent.on_event handler is registered.",
                 hint="Decorate a handler with @agent.on_event in your entrypoint.",
             )
-        event = self.make_event(type, payload, source)
-        run = self._new_run("event", event)
+        run = self._adopt_run(run_id) if run_id else None
+        if run is not None:
+            # The control plane's event, not a fresh one: re-minting it would give
+            # the run a different event id on every reclaim, and `run["event"]` is
+            # what a replay and the trace's `run.started` step are written against.
+            event = run.get("event") or self.make_event(type, payload, source)
+            run["event"] = event
+            run["trace"].append({
+                "seq": 0, "ts": now_iso(), "kind": "run.started",
+                "label": "event", "data": {"event": event, "job": None},
+            })
+            self.store.save_run(run)
+        else:
+            event = self.make_event(type, payload, source)
+            run = self._new_run("event", event)
         if identity is not None:
             run["identity"] = identity.to_dict() if hasattr(identity, "to_dict") else identity
         return self._execute(run, handler, Event.from_dict(event), identity=identity,
@@ -253,15 +304,25 @@ class Engine:
                 if out and out.get("fire"):
                     oc = out["onComplete"]
                     self.store.create_job(oc.get("parentRunId"), oc["handler"],
-                                          oc.get("payload", {}), now_iso())
+                                          oc.get("payload", {}), now_iso(),
+                                          agent=self.manifest.name)
             except Exception:  # never let group bookkeeping kill the worker
                 pass
         return result
 
     def due_jobs(self) -> list:
-        """Pending jobs whose runAt is in the past (ready to run)."""
+        """Pending jobs whose runAt is in the past **and that this agent may run**.
+
+        The agent filter is D22 reaching the `jobs` primitive. Without it a worker
+        counted every sibling agent's due job as its own claimable depth, so it
+        never went idle (the scale-to-zero failure ``Worker.queue_depth`` is about)
+        and it claimed work whose handler it does not have.
+        """
         now = now_iso()
-        return [j for j in self.store.list_jobs("pending") if (j.get("runAt") or "") <= now]
+        mine = getattr(self.manifest, "name", None)
+        return [j for j in self.store.list_jobs("pending")
+                if (j.get("runAt") or "") <= now
+                and (j.get("agent") is None or mine is None or j["agent"] == mine)]
 
     def _clone(self) -> "Engine":
         """A sibling engine on a FRESH store connection - required for running
@@ -283,10 +344,11 @@ class Engine:
         ``concurrency`` > 1 runs jobs in parallel threads, each on a cloned
         engine with its own store connection; claims are serialized under a
         lock so the file backend stays correct too."""
+        mine = getattr(self.manifest, "name", None)
         if concurrency <= 1:
             ran = []
             while True:
-                job = self.store.claim_due_job()
+                job = self.store.claim_due_job(mine)
                 if not job:
                     break
                 result = self.run_job(job["id"])
@@ -302,7 +364,7 @@ class Engine:
             try:
                 while True:
                     with claim_lock:
-                        job = eng.store.claim_due_job()
+                        job = eng.store.claim_due_job(mine)
                     if not job:
                         return
                     result = eng.run_job(job["id"])
@@ -369,6 +431,8 @@ class Engine:
             on_trace=on_trace,
             on_token=on_token,
             on_ui=on_ui,
+            broker=self.broker,
+            config=self.config,
         )
 
     def _execute(self, run: dict, handler, arg, identity=None, on_trace=None, on_token=None, on_ui=None) -> dict:
@@ -493,10 +557,16 @@ class Engine:
 
     def approve(self, approval_id: str, on_trace=None, on_token=None, on_ui=None,
                 actor: Optional[dict] = None) -> dict:
+        from ..turns import APPROVING
+
         approval = self.store.get_approval(approval_id)
         if approval is None:
             raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
-        if approval["status"] != "pending":
+        # `approving` is a pending approval whose DECISION the control plane has
+        # already recorded and handed to this process (turns.enqueue_resume). It
+        # is accepted here for exactly that reason and is not a state a caller can
+        # reach any other way; `pending` remains the only entry point.
+        if approval["status"] not in ("pending", APPROVING):
             raise RyaError(
                 "E_APPROVAL_NOT_PENDING",
                 f"Approval '{approval_id}' is '{approval['status']}', not pending.",
@@ -564,32 +634,14 @@ class Engine:
                              on_trace=on_trace, on_token=on_token, on_ui=on_ui)
 
     def reject(self, approval_id: str, actor: Optional[dict] = None) -> dict:
-        approval = self.store.get_approval(approval_id)
-        if approval is None:
-            raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
-        if approval["status"] != "pending":
-            raise RyaError(
-                "E_APPROVAL_NOT_PENDING",
-                f"Approval '{approval_id}' is '{approval['status']}', not pending.",
-            )
-        run = self.store.get_run(approval["runId"])
-        if run is None:
-            raise RyaError("E_RUN_NOT_FOUND", f"Run '{approval['runId']}' not found.")
+        """Delegates to ``turns.reject_approval``.
 
-        approval["status"] = "rejected"
-        approval["resolvedAt"] = now_iso()
-        approval["resolvedBy"] = actor
-        self.store.save_approval(approval)
+        Rejecting executes no action and replays no handler — it marks two records
+        and appends a trace step — so unlike ``approve`` it never needed an
+        engine. Moving the body out is what lets the api keep answering rejections
+        itself while handing approvals to a worker (D21).
+        """
+        from ..turns import reject_approval
 
-        entry = self._find_approval_entry(run, approval_id)
-        if entry is not None:
-            entry["status"] = "rejected"
-        run["status"] = "rejected"
-        run["error"] = {"code": "E_APPROVAL_REJECTED", "approvalId": approval_id}
-        run["pendingApproval"] = None
-        run["trace"].append({
-            "seq": len(run["trace"]), "ts": now_iso(), "kind": "approval.rejected",
-            "label": approval["title"], "data": {"approvalId": approval_id, "actor": actor},
-        })
-        self.store.save_run(run)
-        return run
+        return reject_approval(self.store, approval_id, actor=actor)
+

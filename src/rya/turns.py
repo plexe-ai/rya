@@ -21,10 +21,36 @@ durable via the engine's journal replay, as always.
 
 from __future__ import annotations
 
-from typing import List, Optional
+import uuid
+from typing import Any, List, NamedTuple, Optional
 
 from . import queue as q
 from .errors import RyaError
+
+# The queue type carrying "a human approved this; someone go finish the run".
+# Separate from ``chat-turn`` because the two are claimed by the same worker but
+# mean different things: a turn STARTS a run, a resume CONTINUES a paused one and
+# must land on a worker holding the version that paused it.
+RESUME_JOB = "approval-resume"
+
+# The state an approval sits in between the control plane recording the decision
+# and the execution plane carrying it out. Not a cosmetic intermediate: it is what
+# makes a second approve a refusal instead of a second resume.
+APPROVING = "approving"
+
+
+class TurnSource(NamedTuple):
+    """The three things enqueuing a turn actually needs.
+
+    ``Engine`` satisfies this shape structurally, which is why the functions below
+    take either. Under D21 the api has no ``Engine`` — it deliberately imports no
+    handler — but it does have exactly these three facts, so it constructs one of
+    these instead of an engine it has no business building.
+    """
+
+    store: Any
+    manifest: Any                    # anything with a `.name`
+    version: Optional[dict] = None
 
 
 def _summary(run: dict) -> dict:
@@ -37,7 +63,7 @@ def _summary(run: dict) -> dict:
 
 
 def create_turn(engine, type: str, payload: dict, *, identity=None,
-                max_attempts: int = 3) -> dict:
+                max_attempts: int = 3, run_id: Optional[str] = None) -> dict:
     """Enqueue a durable chat turn. Returns ``{turnId, runId: None}`` - the turn
     runs on a worker (inline or reclaimed) and its frames land in the stream
     buffer keyed by ``turnId``.
@@ -55,13 +81,89 @@ def create_turn(engine, type: str, payload: dict, *, identity=None,
     # different version will not claim it (queue.claim's version filter). An
     # unpinned engine (`rya dev`, single-tenant) enqueues without one, and any
     # worker takes it.
+    #
+    # D22: tag the owning agent too. Version pinning alone did not protect this
+    # job — an unpinned worker for another agent would claim it and run it against
+    # the wrong handler — and an unpinned engine is the common case, so the agent
+    # tag is written whether or not there is a version to pin to.
     version = getattr(engine, "version", None) or {}
-    metadata = {"versionId": version["id"]} if version.get("id") else None
+    metadata = {}
+    if version.get("id"):
+        metadata["versionId"] = version["id"]
+    agent_name = getattr(getattr(engine, "manifest", None), "name", None)
+    if agent_name:
+        metadata["agent"] = agent_name
+    # `runId` is present when the CONTROL PLANE already created the run record
+    # (enqueue_event). The executing worker adopts that id instead of minting a
+    # second one, so the id the caller was handed is the id the run ends up with.
     job = q.enqueue(engine.store, "chat-turn",
-                    {"type": type, "payload": payload, "identity": claims},
-                    max_attempts=max_attempts, metadata=metadata,
+                    {"type": type, "payload": payload, "identity": claims,
+                     **({"runId": run_id} if run_id else {})},
+                    max_attempts=max_attempts, metadata=metadata or None,
                     concurrency_key=version.get("id"))
     return {"turnId": job["id"], "status": job["status"]}
+
+
+def enqueue_event(source, type: str, payload: dict, *, trigger_source: str = "api",
+                  identity=None, environment: Optional[str] = None,
+                  max_attempts: int = 3) -> dict:
+    """Create a **queued run** and hand it to a worker. Returns
+    ``{runId, turnId, status, pendingApproval}``.
+
+    What `POST /agents/{id}/events` does now that the api does not execute (D21).
+    The run row is written *before* the job exists, and all three consequences are
+    the point rather than incidental:
+
+    * **The caller gets a run id synchronously.** `GET /runs/{id}` answers while
+      the run is still queued, so a client polls one handle instead of correlating
+      a turn id back to a run later.
+    * **The pin is decided by the control plane.** The version comes from the
+      environment pointer, which only the control plane can read authoritatively.
+      Before this the api enqueued unpinned and whichever worker claimed the turn
+      stamped its own version — so "which code ran this" was decided by
+      scheduling.
+    * **The quota refusal reaches the caller.** Admission is an api-side check
+      because 429 is an answer to a request. Deferring it to the worker would turn
+      an over-quota call into a 200 followed by a silently failed run.
+    """
+    from .quotas import require_admission
+    from .store import now_iso
+
+    store = source.store
+    require_admission(store, kind="run")
+
+    version = getattr(source, "version", None) or {}
+    manifest = getattr(source, "manifest", None)
+    agent_name = getattr(manifest, "name", None)
+    event = {"id": "evt_" + uuid.uuid4().hex[:12], "type": type,
+             "source": trigger_source, "agentId": agent_name,
+             "payload": payload, "createdAt": now_iso()}
+    run = {
+        "id": store.new_run_id(),
+        "agent": agent_name,
+        "agentVersion": version.get("manifestVersion") or getattr(manifest, "version", None),
+        "versionId": version.get("id"),
+        "bundleHash": version.get("bundleHash"),
+        "sdkVersion": version.get("sdkVersion"),
+        "environment": environment,
+        "trigger": "event",
+        # Not "running": nothing is running it yet, and a status that claimed
+        # otherwise would make a queue backlog indistinguishable from a stuck run.
+        "status": "queued",
+        "event": event,
+        "job": None, "journal": {}, "trace": [],
+        "pendingApproval": None, "error": None,
+        "scheduledJobs": [], "parentRunId": None,
+        "createdAt": now_iso(),
+    }
+    if identity is not None:
+        run["identity"] = identity.to_dict() if hasattr(identity, "to_dict") else identity
+    store.save_run(run)
+
+    started = create_turn(source, type, payload, identity=identity,
+                          max_attempts=max_attempts, run_id=run["id"])
+    return {"runId": run["id"], "turnId": started["turnId"], "status": "queued",
+            "pendingApproval": None}
 
 
 def _identity_from_claims(claims):
@@ -94,7 +196,8 @@ def _run_turn(engine, job: dict, worker_id: str) -> None:
     try:
         run = engine.run_event(ev.get("type", "message.received"), ev.get("payload", {}),
                                source="turn", identity=_identity_from_claims(ev.get("identity")),
-                               on_trace=on_trace, on_token=on_token, on_ui=on_ui)
+                               on_trace=on_trace, on_token=on_token, on_ui=on_ui,
+                               run_id=ev.get("runId"))
         if run["status"] == "waiting_approval":
             # Tag the paused run with its turn so the approval resolution can
             # stream the continuation onto this same buffer (resolve_on_stream).
@@ -116,10 +219,18 @@ def execute_pending(engine, worker_id: str = "turn-worker", limit: int = 10,
     """Claim and run due chat-turns. ``q.claim`` reaps expired leases first, so
     this reclaims turns whose executor died AND runs freshly-enqueued ones.
     Call it inline after enqueue (low latency) and/or from a periodic sweeper /
-    ``rya`` worker loop (the durability backstop). Returns the turn ids run."""
+    ``rya`` worker loop (the durability backstop). Returns the turn ids run.
+
+    D22: the engine's own agent is passed as the claim filter, so this never
+    picks up a sibling agent's turn. It is taken from the engine rather than a
+    parameter because every caller — inline api, `rya worker`, the reclaimer —
+    already has exactly one, and letting a caller pass a different one would
+    reintroduce the hole this closes.
+    """
     claimed = q.claim(engine.store, worker_id, types=["chat-turn"], limit=limit,
                       lease_seconds=lease_seconds,
-                      version_id=(getattr(engine, "version", None) or {}).get("id"))
+                      version_id=(getattr(engine, "version", None) or {}).get("id"),
+                      agent=getattr(getattr(engine, "manifest", None), "name", None))
     for job in claimed:
         _run_turn(engine, job, worker_id)
     return [j["id"] for j in claimed]
@@ -174,6 +285,155 @@ def resolve_on_stream(engine, approval_id: str, approve: bool = True,
 
 def read_stream(engine, turn_id: str, after_seq: int = -1) -> List[dict]:
     return engine.store.stream_read(turn_id, after_seq)
+
+
+# ---- approval resume: the decision and the execution, split -----------------
+#
+# Approving does two things that need tenant code — it runs the approved action
+# and then replays the handler against the resolved journal — so the api process
+# must not do it (D13/D21). But the *decision* needs the authenticated human, who
+# is only present in the api. Splitting them is what lets both be true.
+#
+# The split also fixes `E_JOURNAL_DRIFT` on a published run, and that is not a
+# side effect. Before this, the api resumed with whatever code it imported at
+# boot: its working tree, against a journal written by the promoted bundle. The
+# resume job is pinned to `run["versionId"]`, so the process that continues a run
+# is on the same content hash as the one that paused it, by construction.
+def enqueue_resume(store, approval_id: str, *, actor: Optional[dict] = None,
+                   max_attempts: int = 3) -> dict:
+    """Record an approval and hand its resume to a worker. Returns the job.
+
+    Every precondition `Engine.approve` checks is checked HERE, before the job
+    exists, so an invalid approval is a 409 to the caller rather than a job that
+    fails on a worker where nobody is watching. The decision is durable before
+    the job is enqueued, which is what makes a concurrent second approve a
+    refusal instead of a second resume.
+    """
+    approval = store.get_approval(approval_id)
+    if approval is None:
+        raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
+    if approval["status"] != "pending":
+        raise RyaError(
+            "E_APPROVAL_NOT_PENDING",
+            f"Approval '{approval_id}' is '{approval['status']}', not pending.",
+            hint="Only pending approvals can be approved."
+                 if approval["status"] != APPROVING else
+                 "It has already been approved and a worker is resuming the run.")
+    run = store.get_run(approval["runId"])
+    if run is None:
+        raise RyaError("E_RUN_NOT_FOUND", f"Run '{approval['runId']}' not found.")
+    if run["status"] != "waiting_approval":
+        raise RyaError("E_RUN_NOT_PAUSED",
+                       f"Run '{run['id']}' is '{run['status']}', not waiting_approval.")
+
+    approval["status"] = APPROVING
+    approval["resolvedBy"] = actor
+    store.save_approval(approval)
+
+    # D22 + D12: the resume belongs to this run's agent and this run's version.
+    # The version pin is the load-bearing half — an unpinned worker replaying a
+    # journal written by a different bundle is precisely `E_JOURNAL_DRIFT`.
+    metadata = {}
+    if run.get("agent"):
+        metadata["agent"] = run["agent"]
+    if run.get("versionId"):
+        metadata["versionId"] = run["versionId"]
+    return q.enqueue(store, RESUME_JOB,
+                     {"approvalId": approval_id, "actor": actor},
+                     max_attempts=max_attempts, metadata=metadata or None,
+                     concurrency_key=run.get("versionId"))
+
+
+def _run_resume(engine, job: dict, worker_id: str) -> None:
+    payload = job.get("payload") or {}
+    approval_id = payload.get("approvalId") or ""
+    try:
+        run = resolve_on_stream(engine, approval_id, approve=True,
+                                actor=payload.get("actor"))
+        q.complete(engine.store, job["id"], worker_id,
+                   {"runId": run["id"], "status": run["status"]})
+    except RyaError as e:
+        q.fail(engine.store, job["id"], worker_id, e.message)
+    except Exception as e:  # a resume must never leave the job leased forever
+        q.fail(engine.store, job["id"], worker_id, str(e))
+
+
+def execute_resumes(engine, worker_id: str = "turn-worker", limit: int = 10,
+                    lease_seconds: float = 120) -> List[str]:
+    """Claim and run due approval resumes. Same claim discipline as
+    ``execute_pending`` — expired leases are reaped first, so a resume whose
+    worker died is retried rather than stranding a run in ``waiting_approval``
+    with an already-approved approval."""
+    claimed = q.claim(engine.store, worker_id, types=[RESUME_JOB], limit=limit,
+                      lease_seconds=lease_seconds,
+                      version_id=(getattr(engine, "version", None) or {}).get("id"),
+                      agent=getattr(getattr(engine, "manifest", None), "name", None))
+    for job in claimed:
+        _run_resume(engine, job, worker_id)
+    return [j["id"] for j in claimed]
+
+
+def reject_approval(store, approval_id: str, actor: Optional[dict] = None) -> dict:
+    """Reject an approval and fail its run — **without** any tenant code.
+
+    Lives here rather than on `Engine` because it never needed an engine: unlike
+    approving, rejecting executes no action and replays no handler, it only marks
+    two records and appends a trace step. That asymmetry is why `/reject` stays
+    synchronous in every mode while `/approve` is handed to a worker.
+    `Engine.reject` delegates here so there is one implementation.
+    """
+    from .store import now_iso
+
+    approval = store.get_approval(approval_id)
+    if approval is None:
+        raise RyaError("E_APPROVAL_NOT_FOUND", f"Approval '{approval_id}' not found.")
+    if approval["status"] not in ("pending", APPROVING):
+        raise RyaError("E_APPROVAL_NOT_PENDING",
+                       f"Approval '{approval_id}' is '{approval['status']}', not pending.")
+    run = store.get_run(approval["runId"])
+    if run is None:
+        raise RyaError("E_RUN_NOT_FOUND", f"Run '{approval['runId']}' not found.")
+
+    approval["status"] = "rejected"
+    approval["resolvedAt"] = now_iso()
+    approval["resolvedBy"] = actor
+    store.save_approval(approval)
+
+    for entry in run["journal"].values():
+        if entry.get("kind") == "approval" and \
+                (entry.get("result") or {}).get("approvalId") == approval_id:
+            entry["status"] = "rejected"
+            break
+    run["status"] = "rejected"
+    run["error"] = {"code": "E_APPROVAL_REJECTED", "approvalId": approval_id}
+    run["pendingApproval"] = None
+    run["trace"].append({
+        "seq": len(run["trace"]), "ts": now_iso(), "kind": "approval.rejected",
+        "label": approval["title"], "data": {"approvalId": approval_id, "actor": actor},
+    })
+    store.save_run(run)
+    return run
+
+
+def reject_on_stream(store, approval_id: str, actor: Optional[dict] = None) -> dict:
+    """`reject_approval`, plus the turn-buffer frames a tailing client needs.
+
+    The reject half of `resolve_on_stream`, without the engine — so the api can
+    keep answering rejections itself (see `reject_approval`).
+    """
+    approval = store.get_approval(approval_id)
+    run = store.get_run(approval["runId"]) if approval else None
+    turn_id = (run or {}).get("turnId")
+    if turn_id:
+        store.stream_append(turn_id, [{
+            "kind": "trace",
+            "data": {"kind": "approval.rejected", "label": (approval or {}).get("title"),
+                     "data": {"approvalId": approval_id, "actor": actor}},
+        }])
+    rejected = reject_approval(store, approval_id, actor=actor)
+    if turn_id:
+        store.stream_append(turn_id, [{"kind": "run", "data": _summary(rejected)}])
+    return rejected
 
 
 TERMINAL_RUN_STATUSES = ("completed", "failed", "rejected", "needs_reconnect")

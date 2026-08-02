@@ -62,6 +62,40 @@ class Agent:
         the model in ``ctx.llm.run`` uses the right argument names/types instead
         of guessing. A manifest ``input_schema`` on the same tool takes
         precedence over this.
+
+        .. deprecated:: the "real IO" half, in the **untrusted** posture only
+
+           MULTITENANT_DESIGN D18 removes the platform's credentials from the process
+           a handler runs in, and §9 risk 2 is explicit that this is "a breaking SDK
+           change … the migration is a tenant-facing deprecation, not an internal
+           refactor". So it is deprecated here rather than silently altered, and the
+           three affected capabilities are named individually because they change by
+           different amounts:
+
+           **Direct HTTP.** Still legal, and it stops *working* in a sandbox — not
+           because this rule changed but because D24 gives the sandbox no route out.
+           Use a manifest ``url:`` tool (the platform makes the call, applies the
+           allowlist and injects the connection credential) or ``ctx.egress`` from a
+           non-leaf handler.
+
+           **Reading a platform credential from the environment.** Gone. ``os.environ``
+           in a sandbox carries no DSN, seal key, provider key or bucket credential:
+           they are not scrubbed, they are never added (see
+           ``drivers.ContainerDriver.sandbox_env``). A *tenant's own* declared secret is
+           unaffected and reaches the handler through ``ctx.secrets.get``, which is why
+           D18's list of removed credentials is specifically the platform's.
+
+           **Direct database access.** Was always outside the rule — PLATFORM_DESIGN §14
+           lists "reaching the platform's own store from inside leaf tools" among the
+           things the boundary exists to stop — and is now unreachable rather than
+           discouraged.
+
+           **What has not changed, and will not.** The trusted posture. A self-hosted
+           deployment with one trusted tenant runs none of D18/D23/D24 and every leaf
+           tool keeps working exactly as written. This deprecation applies where
+           ``RYA_UNTRUSTED_TENANTS`` is declared, which is a hosted-product decision, so
+           the migration is "your agent behaves differently on our cloud than on your
+           laptop" — stated plainly rather than discovered.
         """
 
         def deco(fn: Callable) -> Callable:

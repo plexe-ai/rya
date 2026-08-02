@@ -56,23 +56,40 @@ def load_manifest(path: Optional[Path] = None) -> Manifest:
             hint="Fix the YAML syntax. `rya init --json` reports the first error location.",
         )
 
+    return parse_manifest(raw, source=path.name)
+
+
+def parse_manifest(raw, *, source: str = "the manifest") -> Manifest:
+    """Validate an already-parsed manifest mapping.
+
+    Split out from :func:`load_manifest` because a manifest no longer only ever
+    arrives as a file. D21 persists the manifest onto the **version record** so a
+    manifest-free control plane can learn what an agent declares, and Phase 5's
+    tenant-scoped claimer is the second reader of that: it has no working tree, so
+    "what routes does this agent declare" is answered from the record. Both paths
+    have to apply the same validation and the same D11 warning, or the deployed
+    behaviour differs from the local one for reasons nobody can see.
+    """
+    if not isinstance(raw, dict):
+        raise RyaError("E_MANIFEST_INVALID",
+                       f"{source} is a {type(raw).__name__}, expected a mapping.")
     # D11 removed `environment:`. Pydantic would ignore the unknown key in
     # silence, which is the exact failure mode the decision names — "a production
     # container declares itself `local` and nothing notices". Say so instead. It
     # is a warning rather than an error because the field was always inert, so
     # upgrading should not break a working project; `rya deploy` refuses it.
-    if isinstance(raw, dict) and "environment" in raw:
+    if "environment" in raw:
         import logging
         logging.getLogger("rya.manifest").warning(
             "%s declares `environment: %s`, which no longer exists. One bundle is "
             "promoted between environments (PLATFORM_DESIGN D11), so the manifest "
             "cannot name one. Remove the line; per-environment values are platform "
             "config. `rya deploy` will refuse a manifest that still has it.",
-            path.name, raw.get("environment"))
+            source, raw.get("environment"))
         raw = {k: v for k, v in raw.items() if k != "environment"}
 
     try:
-        manifest = Manifest.model_validate(raw)
+        return Manifest.model_validate(raw)
     except ValidationError as exc:
         first = exc.errors()[0]
         loc = ".".join(str(p) for p in first.get("loc", []))
@@ -81,5 +98,3 @@ def load_manifest(path: Optional[Path] = None) -> Manifest:
             f"Manifest validation failed at '{loc}': {first.get('msg')}",
             hint="Compare against the example manifest in docs/primitives.md or `rya create`.",
         )
-
-    return manifest

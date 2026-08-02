@@ -144,6 +144,20 @@ def create_version(
         # The author-typed manifest version survives as a LABEL only. It is not
         # the identity (that is bundleHash) and nothing branches on it.
         "manifestVersion": bundle.manifest.get("version"),
+        # The manifest ITSELF, unlike `files` above, IS persisted (D21).
+        #
+        # The size instinct that keeps `files` out applies here too and is
+        # overruled: a manifest is a few KB against `files`' few thousand
+        # path/digest pairs, and D21 makes it load-bearing rather than
+        # informational. A manifest-free `api` learns what agents exist, what
+        # tools they declare and what channels they expose from *this* field —
+        # without it there is nothing to serve, and the api is back to reading a
+        # local `rya.agent.yaml`, which is the one-agent limit.
+        #
+        # Stored unvalidated, exactly as `Bundle.manifest` holds it, so the
+        # record reflects what the author shipped rather than what a later
+        # schema version would make of it.
+        "manifest": bundle.manifest,
         "createdBy": actor,
         "metadata": metadata or {},
     }
@@ -153,6 +167,24 @@ def create_version(
                 actor=actor, force=force)
         version = store.version_get(version["id"]) or version
     return version
+
+
+def manifest_of(version: dict) -> dict | None:
+    """The manifest a version shipped with, or ``None`` for records written
+    before D21 persisted it.
+
+    One accessor rather than ``version.get("manifest")`` at each call site,
+    because the ``None`` is a real state with a real cause and it will outlive
+    this release: ``version_create`` dedupes on ``(agent, bundleHash)`` and
+    returns the existing row untouched, so re-publishing identical content does
+    **not** backfill the manifest onto an old record. Only new content gets one.
+
+    Callers that need a manifest for an old version must fall back to reading it
+    out of the bundle archive (``.rya-bundle.json``), which is authoritative but
+    costs an object fetch — the reason it is not the primary path.
+    """
+    manifest = version.get("manifest")
+    return manifest if isinstance(manifest, dict) and manifest else None
 
 
 def list_versions(store, agent: str | None = None, state: str | None = None) -> list[dict]:

@@ -213,7 +213,15 @@ def _branding(project_root) -> Optional[dict]:
 
 def build_console(manifest, store, agent, project_root) -> dict:
     """Rich aggregate state for the web console — everything one dashboard needs
-    in a single call, computed from the live runtime (not mocked)."""
+    in a single call, computed from the live runtime (not mocked).
+
+    ``agent`` is the IMPORTED handler set and is now optional (D21): a
+    manifest-free api serves agents whose code it has deliberately never
+    unpacked, so it can report what an agent *declares* without being able to
+    report which handlers it registered. ``handlers`` is then ``None`` rather
+    than ``false`` — ``build_snapshot`` has drawn that distinction all along, and
+    "we did not look" must not render as "there is no event handler".
+    """
     from pathlib import Path
 
     from .observability.usage import run_usage
@@ -269,8 +277,9 @@ def build_console(manifest, store, agent, project_root) -> dict:
         "agent": {"name": manifest.name, "version": manifest.version,
                   "runtime": manifest.runtime, "environment": current_environment(),
                   "status": "running",
-                  "handlers": {"event": agent.event_handler() is not None,
-                               "jobs": list(agent._job_handlers.keys())}},
+                  "handlers": ({"event": agent.event_handler() is not None,
+                                "jobs": list(agent._job_handlers.keys())}
+                               if agent is not None else None)},
         "runtime": {"store": store.describe().get("backend"),
                     "llmProvider": resolve_provider(manifest.model.provider),
                     "multiTenant": _multitenant()},

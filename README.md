@@ -154,7 +154,36 @@ service-to-service call — they coordinate through the queue. On the durable pa
 (`POST /agents/{id}/turns`) the api process executes no handler code, which is
 what makes per-tenant isolation mean something — though two routes still bypass
 that, see below. Deploy both with the AWS IaC in [`deploy/`](deploy/AGENTS.md) or
-`docker compose`.
+`docker compose`. Serving many tenants from one deployment is an overlay on that same
+file — `docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d`,
+which rebinds 8787 to loopback and runs one least-privilege claimer per workspace
+([architecture.md](docs/architecture.md#self-host-multi-tenant)).
+
+A third mode is optional, and it is the one that means you stop declaring workers
+by hand:
+
+```bash
+rya supervisor            # watches claimable depth; starts, scales and reaps workers
+rya supervisor --plan      # what it would do, and why — the real decision, no effects
+```
+
+Without it a worker is started by a human, a compose file or an ECS
+`DesiredCount`, so scale-to-zero is one-way: a key exits idle and stays unserved.
+With it, work arriving is what brings the key back. Scheduling policy is ours;
+only the launch mechanism is pluggable (`RYA_EXECUTION_DRIVER`: `local`, `docker`
+or `kubernetes`).
+
+Two more commands exist for the hosted posture, and both are read-first:
+
+```bash
+rya posture                # is this deployment safe for untrusted tenants? all four conditions
+rya orgs budget <org> --usd-per-month 500   # the billing boundary above a workspace (D29)
+rya orgs reconcile         # recompute every org's rollup; run it from a cron
+rya posture --verify       # ...and probe the substrate rather than trusting its declaration
+rya keyring show           # which key provider — and therefore whether a purge can crypto-shred
+rya workspaces disable ws  # stop scheduling, refuse claims, revoke keys. Reversible
+rya workspaces purge ws    # shred the key, delete objects and rows. Not reversible
+```
 
 ## Install
 
@@ -209,29 +238,105 @@ Specifically not done:
   remains the only way to satisfy that gate.
 - **The AWS mutator Lambda is a pattern, not an implementation.** It returns 501
   by design rather than pretending; see [`deploy/aws`](deploy/aws/README.md).
-- **Two routes still execute handler code in the api process.** `POST
-  /agents/{id}/events` runs the handler inline — with zero workers alive, ignoring
-  `RYA_API_INLINE_WORKER=0`, and unpinned (against the api's working tree rather
-  than the promoted content-hashed bundle). `POST /approvals/{id}/approve` resumes
-  a paused run the same way. The durable turn path is correct; these are not.
-  `python scripts/e2e_platform.py` asserts all of this as open GAPs.
+- ~~**Two routes still execute handler code in the api process.**~~ **Fixed
+  (D21).** `POST /agents/{id}/events` now writes a `queued` run — pinned to
+  whatever the environment points at — and hands it to a worker; the caller still
+  gets a run id synchronously and an over-quota call is still a 429 rather than a
+  silently failed run. `POST /approvals/{id}/approve` records the decision and
+  enqueues the resume, pinned to the run's own version. `/reject` stays
+  synchronous because it runs no tenant code at all.
 
-  `rya publish` makes the approval half of this sharper rather than worse: the api
-  imports its mounted entrypoint once at startup, so once a bundle can be published
-  from somewhere else, the code resuming an approval can differ from the code that
-  paused it — including by nothing more than an edit made after the api booted. It
-  **fails closed**: the journal's content keys stop matching and the run ends
-  `E_JOURNAL_DRIFT` (D9) instead of replaying against drifted code. Restarting the
-  api on the promoted bundle clears it. Approvals belong on the worker.
-- **Crashed workers are still reported `alive`.** `lastHeartbeatAt` is written and
-  never read, so `GET /workers` overstates the fleet after a SIGKILL.
-- **Node isolation is an accepted residual.** Process isolation plus RLS contains a
-  buggy tenant, not a hostile one — workers share a kernel.
-- **`rya serve` is one agent per deployment.** `build_app` resolves a single
-  `rya.agent.yaml` at startup, so the routes accept an agent id in the path but
-  resolve the manifest's own name — the workspace → agent → environment tree is one
-  agent wide. `rya publish` is where this stops being cosmetic: it refuses a bundle
-  declaring a different name, because a version filed under a name this deployment
-  does not serve would be listed by nothing and run by nobody. A second agent means
-  a second deployment (its own api, worker and manifest); they can share one
-  Postgres and one bundle store. See [docs/architecture.md](docs/architecture.md).
+  That also ends the `E_JOURNAL_DRIFT` failure this entry used to describe. The
+  api imported its mounted entrypoint at startup, so once a bundle could be
+  published from elsewhere the code resuming an approval could differ from the
+  code that paused it — including by nothing more than an edit made after the api
+  booted. The resume job is pinned to `run["versionId"]`, so the process
+  continuing a run is on the hash that paused it, by construction.
+
+  **One seam is deliberate and unchanged:** a bare single-tenant `rya serve` still
+  executes inline, because there the api *is* the whole deployment and silently
+  running nothing would be the worse failure. `RYA_API_INLINE_WORKER=0` (what
+  `rya dev` and compose set) turns it off, and multi-tenant never executes.
+- ~~**Crashed workers are still reported `alive`.**~~ **Fixed (Phase 3).**
+  Liveness is derived from heartbeat age, so a SIGKILLed worker comes back `lost`
+  rather than `alive` — and it is still *listed*, because an empty worker list means
+  scale-to-zero and a crash must not look like one. This was worse than a cosmetic
+  defect: `quotas` counts live workers against `maxWorkers`, so every crash leaked a
+  slot permanently.
+- **Node isolation is an accepted residual *in the default posture*.** Process
+  isolation plus RLS contains a buggy tenant, not a hostile one — workers share a
+  kernel. Phase 4 built the hostile-tenant posture (no credentials in the tenant
+  process, a gVisor sandbox, egress enforced by the network), but it is **declared,
+  not default**: `RYA_UNTRUSTED_TENANTS=1`. Without it, this bullet is what you have,
+  which is the right answer for a self-host with one tenant. `rya posture` prints
+  which one you are in.
+- **`rya worker` is one agent per process** — the api is not. `build_app` no
+  longer reads a manifest at all (D21): it learns what agents exist from published
+  versions and environment pointers, so one control plane serves as many as the
+  workspace has and `rya publish` accepts an agent it has never heard of. The
+  limit that remains is in the execution plane: `load_agent` mutates `sys.path`
+  and never unloads, so a second agent costs a second **worker** — not a second
+  api, port, database or bundle store. See
+  [docs/architecture.md](docs/architecture.md).
+
+  `rya worker --fork` (Phase 3, D27) moves the import out of the claiming process
+  into a warm interpreter it forks per run, so the long-lived process holds no
+  tenant code at all. It does not lift the one-agent limit — a fork is still one
+  agent on one version, which is the point of D3.
+
+  **Phase 5 lifted the limit on the *claimer*, and it was the configuration change
+  D27 promised.** `rya worker --scope tenant --fork` serves every agent a workspace
+  owns from one process: it reads each item's pinned version, materialises that bundle,
+  and forks an interpreter for it. Five agents with two live versions each is **one**
+  worker holding ten warm interpreters, not ten workers. A promotion costs no extra
+  process, and an approval resuming on a retired version is a fork rather than a
+  deployment. D3 is untouched: each fork still ran exactly one bundle's import.
+- **The fleet can span more than one box, and has not been run doing it.**
+  `rya supervisor` starts, scales and reaps workers on demand through the
+  `ExecutionDriver` seam, and `--all-workspaces` ticks every tenant. Phase 4 added the
+  `docker` and `kubernetes` drivers, so `local` is no longer the only one — but see the
+  gVisor caveat below. `ecs` is still unwritten.
+- **Untrusted tenancy is enforced by a refusal, not by documentation.**
+  `RYA_UNTRUSTED_TENANTS=1` makes the platform check all four of: a sandbox that
+  contains a kernel escape, a tenant process holding no credentials, egress enforced by
+  the network, and a driver that can put the broker somewhere the tenant is not. Any
+  one missing and it refuses to start, naming every unmet condition — because half a
+  security boundary is not a security boundary. The refusal is reachable from
+  `rya worker` as well as `rya supervisor`, which was a real gap until Phase 4: the
+  check existed and only the supervisor called it.
+- **What a container driver launches is a *pair*, and that took two phases to get
+  right.** Phase 5 found that the container drivers build the sandbox's environment
+  from nothing — correct for the process that imports tenant code, and impossible for
+  the process that has to open the database and *be* the broker. They were the same
+  container, so a `docker` or `kubernetes` claimer would have started, opened an empty
+  local store, and claimed nothing while looking healthy. The gate refused for a phase.
+  Phase 6 built the missing piece: `rya template-host`, a credential-free process that
+  serves warm interpreters over a socket, so the sandbox container can run tenant code
+  without the claimer having to be its parent. A launch is now a credentialed claimer
+  container beside a credential-free sandbox container sharing an in-memory volume, and
+  the credential boundary is a container boundary rather than a process one. The
+  framing turned out to be off by one: nothing was wrong with either environment
+  builder — the second container was missing.
+- **Two supervisors no longer double your fleet.** A supervisor takes a per-workspace
+  lease before it applies a plan; a second one goes passive, keeps observing, and logs
+  the plan it did not apply. That last part is deliberate: "why is nothing scaling" is
+  answered by reading a correct plan going unapplied, not by silence. `--no-lease` opts
+  out. Two supervisors over many tenants *split* the fleet rather than duplicating it.
+- **gVisor has now been run, and running it broke something reading it never would.**
+  `scripts/verify_gvisor.sh` puts a real `runsc` sentry under `cryptography`,
+  `pydantic-core`, `psycopg`, `yaml`, `httpx` and `os.fork`; all six work, so D23's
+  third-party-wheel question is answered. The isolation probe was not so lucky. Its
+  `/proc/version` marker was the literal `4.4.0`, copied from a fixture; a real sentry
+  says `4.19.0-gvisor`. That is not a missed signal but an inverted one — a version
+  string that is not gVisor's counts as evidence of a *host* kernel, so a genuine
+  sandbox was actively refuted and the launch gate refused it. And it refused in
+  exactly the configuration the platform ships, because the `--cap-drop=ALL` hardening
+  is what makes the other signal (`dmesg`) unreadable. **A fixture is a recording of an
+  assumption; it confirms that assumption forever.** The platform still will not claim
+  what it cannot verify: an inconclusive probe fails the launch gate.
+
+  What is still not measured is *cost*. The sentry runs nested in a privileged
+  container with `--ignore-cgroups`, because this host has no `runsc`, no passwordless
+  sudo, and AppArmor blocks unprivileged user namespaces. Correctness is unaffected —
+  the syscall interception is real — but the timing numbers keep their caveats, and
+  nothing has been measured on `x86_64` at all.

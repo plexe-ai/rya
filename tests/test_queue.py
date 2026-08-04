@@ -271,3 +271,67 @@ def test_queue_http_batch_and_cancel(project):
     assert client.post(f"/queue/jobs/{ids[0]}/cancel", json={}).json()["status"] == "cancelled"
     r = client.post("/queue/claim", json={"workerId": "w", "limit": 10})
     assert [j["payload"]["i"] for j in r.json()["jobs"]] == [1, 2]
+
+
+# ---- filtering after the claim (D22) ---------------------------------------
+
+def test_a_sibling_agents_job_does_not_consume_the_claim_limit(store):
+    """The starvation bug the wide claimer scope (#19-8b) made systematic.
+
+    D22 filters *after* the claim — a job this caller may not run is released rather
+    than executed — and that release used to count against ``limit``. With one
+    agent's turns ahead of another's in the same queue, a fork asking for one item
+    claimed the oldest, released it because it belonged to a sibling, and reported
+    "nothing to do". At the narrow scope that cost a tick; at the wide scope, where
+    several agents' turns interleave by design, a dispatch had roughly a 1-in-N chance
+    of finding its own work and the deepest backlog decided whose.
+    """
+    for _ in range(3):
+        q.enqueue(store, "chat-turn", {"n": 1}, metadata={"agent": "support"})
+    mine = q.enqueue(store, "chat-turn", {"n": 2}, metadata={"agent": "billing"})
+
+    claimed = q.claim(store, "w-billing", types=["chat-turn"], limit=1, agent="billing")
+    assert [j["id"] for j in claimed] == [mine["id"]]
+    # And the three it walked past are pending again, with their retry budget intact:
+    # refusing a job you are not allowed to run must not consume its attempts.
+    for job in store.queue_list("pending", "chat-turn"):
+        if job["id"] != mine["id"]:
+            assert job["attempts"] == 0
+            assert job["workerId"] is None
+
+
+def test_a_pinned_workers_claim_walks_past_another_versions_turns(store):
+    """The same fix on D12's axis. A promotion leaves both versions live, so a v7
+    worker reaching its own item past a queue of v8 items is the ordinary case during
+    a rollout rather than an edge."""
+    for _ in range(4):
+        q.enqueue(store, "chat-turn", {"v": 8}, metadata={"versionId": "ver_8"})
+    mine = q.enqueue(store, "chat-turn", {"v": 7}, metadata={"versionId": "ver_7"})
+
+    claimed = q.claim(store, "w-v7", types=["chat-turn"], limit=1, version_id="ver_7")
+    assert [j["id"] for j in claimed] == [mine["id"]]
+
+
+def test_the_walk_is_bounded_rather_than_unbounded(store):
+    """Correctness was restored by retrying past a release; the cost was not. A fork
+    can walk up to MAX_CLAIM_LIMIT sibling jobs to reach its own, and beyond that it
+    gives up and tries again next tick — which is what stops one agent's huge backlog
+    from making another agent's claim walk the whole queue."""
+    for _ in range(q.MAX_CLAIM_LIMIT + 5):
+        q.enqueue(store, "chat-turn", {"n": 1}, metadata={"agent": "support"})
+    q.enqueue(store, "chat-turn", {"n": 2}, metadata={"agent": "billing"})
+
+    assert q.claim(store, "w-billing", types=["chat-turn"], limit=1,
+                   agent="billing") == []
+    # Nothing was lost: everything it walked past is pending again.
+    assert len(store.queue_list("pending", "chat-turn")) == q.MAX_CLAIM_LIMIT + 6
+
+
+def test_an_unfiltered_claimer_still_takes_anything(store):
+    """D14's SDK-free surface is untouched: a foreign `/queue/*` consumer names no
+    agent and no version, and claims in order."""
+    first = q.enqueue(store, "chat-turn", {"n": 1}, metadata={"agent": "support"})
+    q.enqueue(store, "chat-turn", {"n": 2}, metadata={"agent": "billing"})
+    claimed = q.claim(store, "w-any", types=["chat-turn"], limit=2)
+    assert [j["id"] for j in claimed][0] == first["id"]
+    assert len(claimed) == 2

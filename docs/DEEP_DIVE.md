@@ -257,7 +257,7 @@ verdict also ships inside `rya context`.
 
 ---
 
-## 11. Action Guard — egress firewall
+## 11. Action Guard — egress policy
 
 [guard.py](../src/rya/guard.py). Every outbound request the runtime makes — HTTP
 tools, model calls, channel sends, embeddings — is evaluated **before the bytes
@@ -281,6 +281,30 @@ SSRF blocklist  →  deny rules  →  allow rules  →  default (deny | allow)
 > Note: the LLM policy *judge* (evaluate-with-a-model when no static rule
 > matches) is scaffolded in the UI but not yet wired to a real model; `default`
 > handles the no-match case today.
+
+### Policy is not the same as enforcement (D24)
+
+An in-process check is bypassed by any code that does not call it, so against a
+*hostile* handler this module enforces nothing — it is a policy, an audit trail and a
+set of attributable verdicts, all of which it is genuinely good at. Enforcement lives
+one layer down, in [egress.py](../src/rya/egress.py) and the sandbox's network:
+
+| layer | answers | mechanism |
+|---|---|---|
+| `guard.py` | *what is allowed* | the reviewable allowlist, versioned and etagged |
+| `egress.py` + the sandbox | *what can physically leave* | no network route; the only way out is a mediated `ctx.egress.fetch` |
+
+Both verdicts are evaluated on every mediated request, and a **divergence** is
+recorded rather than resolved: the sandbox's network rules are a snapshot taken when it
+started and the policy is live, so promoting a new allowlist produces disagreement
+until every sandbox is recycled. Disagreement **fails closed** — trusting the live
+policy would let a request out through a network the operator has not permitted;
+trusting the snapshot would keep enforcing a rule already revoked. `egress.reconcile`
+rolls the divergences up across a fleet with the action to take.
+
+`guard.py` describing itself as a firewall was accurate about a cooperative runtime and
+an overclaim about a hostile one, which is why the wording changed with D24 rather than
+the module being deleted.
 
 ---
 
@@ -328,7 +352,17 @@ prompts for the token when auth is on.
   restart. Your project mounts at `${RYA_PROJECT:-./examples/followup_agent}`
   → `/project`, with `/project/.rya` on a named volume (`rya_project_state`) so
   the containers' root-owned state never lands in your working tree.
-  [docker-compose.yml](../docker-compose.yml). Or
+  [docker-compose.yml](../docker-compose.yml).
+- **Self-host, multi-tenant:**
+  `docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d`
+  layers [docker-compose.multitenant.yml](../docker-compose.multitenant.yml) on top:
+  8787 rebinds to loopback (multi-tenant opens the ungated `POST /v1/signup`), the
+  `default`-workspace `worker` is profiled out, and one tenant-scoped claimer runs per
+  workspace on the least-privilege `rya_worker` DSN — because `--workspace` scopes the
+  store, so a claimer serves exactly one tenant. Explicit `-f` rather than the
+  auto-loaded `docker-compose.override.yml` name, so which posture you are running is
+  visible in the command. See [architecture.md](architecture.md#self-host-multi-tenant).
+  Or
   `rya deploy --target docker|fly|render` generates a self-contained image
   (agent baked in; state external via `RYA_DATABASE_URL`) + the exact command.
   [deploy_templates.py](../src/rya/cli/deploy_templates.py).
@@ -385,6 +419,7 @@ agents(list/inspect) events(send) runs(list/trace) approvals(list/approve/reject
 tools(list/register) models(list/register) channels(list/connect)
 secrets(set/list) schedules(list/create/run) jobs(list/run/dlq/retry)
 skills(install/path) workspaces(create/list) keys(create) token mcp serve worker
+supervisor(--plan/--once/--all-workspaces)   # starts, scales and reaps workers
 ```
 
 `check` (manifest + handler set, starts nothing — what CI runs) and `publish`
@@ -469,18 +504,61 @@ and fails to resolve. Leave it blank on real AWS, which wants the virtual-host f
   enforcement), job retry/DLQ, the TS client, deploy artifacts, and `uvx`.
 - **Mocked:** the default tool/model implementations (deterministic IO; the
   registries/permissions/traces around them are real).
-- **One deployment serves exactly one agent.** `build_app` loads
-  `rya.agent.yaml` once at startup and every handler resolves `manifest.name`, so
-  the `:id` in the route paths above is decorative — and
-  `POST /agents/:id/versions` refuses a bundle declaring a different `name` rather
-  than filing a version nothing would list and nobody would run. Serving a second
-  agent means a second deployment.
+- **One control plane serves many agents; one worker serves one.** `build_app` no
+  longer loads a manifest (D21) — agents come from published versions and
+  environment pointers, so `:id` in the route paths above is real and
+  `POST /agents/:id/versions` accepts an agent this deployment has never heard of.
+  What still holds one agent is the *worker*: `load_agent` mutates `sys.path` and
+  never unloads. `rya worker --fork` (D27) moves that import into a warm interpreter
+  the claimer forks per run, so the long-lived process holds no tenant code — which
+  does not raise the count (a fork is still one agent on one version) but makes
+  raising it later a config change. Agent-scoped routes live under `/agents/{id}/…` (D28); the
+  unprefixed spellings resolve while a deployment serves one agent, with
+  `Deprecation`/`Sunset` headers, and 400 naming the candidates once it serves
+  several. `_` is the reserved "the one agent" alias.
 - **The publish path files no readiness attestation.** The control plane never
   imports a bundle, so readiness is not evaluated: the response says
   `"attested": false, "notAttested": ["readiness"]`, and a readiness-gated
   environment refuses the promotion (`E_PROMOTION_BLOCKED`). There is no
   `rya attest readiness` command — the attestation is filed by
   `rya deploy --env`, which runs the gate locally because it has the store.
-- **Not built:** a *managed* cloud deploy (`rya deploy` emits self-host artifacts
-  — `sam deploy` is manual), the Action Guard LLM judge, remote MCP + OAuth, a
-  PyPI publish, and per-tenant code sandboxing.
+- **Workers schedule themselves.** `rya supervisor` (D25) watches claimable depth per
+  key and the worker registry, then starts, scales, pre-warms and reaps through a
+  pluggable `ExecutionDriver` (D26) — so scale-to-zero is two-way rather than a one-way
+  exit. Three drivers: `local` (a subprocess here, isolation `none`), `docker` and
+  `kubernetes`. It holds a per-workspace lease (D34), so a second replica stands by and
+  logs the plan it did not apply instead of doubling the fleet.
+- **One claimer can serve a whole tenant.** `RYA_CLAIMER_SCOPE=tenant` (D27/#19-8b)
+  makes sandbox count track active tenants rather than the agents×versions product: the
+  claimer peeks at the queue, warms the version the next item is pinned to — which is
+  the preflight, before the claim — and forks a child for it. Dispatches are shared
+  equally across the tenant's own agents (D33), because starving a sibling is the
+  question `concurrency_key` answers between workspaces and this one answers within one.
+- **Orgs are the billing boundary above a workspace** (D29). Usage is metered at
+  `workspace_id` and budgeted at `org_id`; the rollup is computed by
+  `rya orgs reconcile` with the admin DSN and its *verdict* pushed down into each
+  member workspace's own policy row, so no tenant's admission path holds a credential
+  that can read a sibling (D35). The supervisor's multi-workspace fan-out schedules it
+  (`SupervisorPolicy.reconcile_orgs_seconds`, default 300s), and `orgs.freshness`
+  reports a verdict nothing is refreshing — which is the case for a deployment running
+  neither a supervisor nor a cron, and it now says so rather than looking current.
+- **The untrusted-tenant posture is built and gated.** Tenant code runs in a fork with
+  no credentials (D18: it gets a Unix socket and a capability that expires with the
+  dispatch), in a gVisor sandbox with no network route (D23/D24), against per-tenant
+  seal keys that a purge can destroy (D31). `RYA_UNTRUSTED_TENANTS=1` refuses to start
+  unless all four boundaries are in force — `rya posture` shows the answer without a
+  deploy. **The fourth is D32, and both container drivers satisfy it since Phase 6**:
+  a launch is a *pair* — a credentialed claimer container beside a credential-free
+  sandbox container running `rya template-host`, sharing an in-memory volume for the
+  two sockets. Phase 5 had found that one container could not be both, and the fix
+  turned out not to be repairing either environment builder but adding the container
+  that was missing. A driver that launches only the sandbox half is still refused.
+- **Not built / not proven:** a *managed* cloud deploy (`rya deploy` emits self-host
+  artifacts — `sam deploy` is manual), the Action Guard LLM judge, remote MCP + OAuth, a
+  PyPI publish and the `ecs` driver. **gVisor has now been run** —
+  `scripts/verify_gvisor.sh` puts a real sentry under `cryptography`, `pydantic-core`,
+  `psycopg`, `yaml`, `httpx` and `os.fork`, and all six work — and doing it found the
+  isolation probe matching a kernel string no real sentry emits, which made it *refute*
+  a genuine sandbox rather than merely fail to confirm one. What remains unproven is
+  **cost, not correctness**: the sentry runs nested in a privileged container with
+  `--ignore-cgroups`, and nothing has been measured on `x86_64` at all.

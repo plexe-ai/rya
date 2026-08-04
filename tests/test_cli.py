@@ -62,3 +62,47 @@ def test_status_json(project):
     data = json.loads(res.stdout)
     assert data["approvalsPending"] == 1
     assert data["runs"]["total"] == 1
+
+
+def test_project_optional_needs_no_manifest(tmp_path):
+    """`rya serve` must not require a mounted agent project.
+
+    Since D21 `build_app` is manifest-free — it learns what agents exist from
+    published versions and environment pointers — so a control plane serving only
+    published bundles has no `rya.agent.yaml` anywhere. `serve` read one anyway, to
+    print a name in its banner, and that made exactly that deployment unstartable
+    (`E_MANIFEST_NOT_FOUND` on boot, crash-looping).
+    """
+    from rya.cli.main import _project, _project_optional
+
+    old = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        root, manifest = _project_optional()
+        assert manifest is None          # nothing mounted, and that is not an error
+        assert root == tmp_path.resolve()  # still resolves a root for build_app
+
+        # The strict helper still refuses, because every other command acts on one agent.
+        try:
+            _project()
+        except Exception as exc:  # RyaError
+            assert getattr(exc, "code", None) == "E_MANIFEST_NOT_FOUND"
+        else:
+            raise AssertionError("_project must still require a manifest")
+    finally:
+        os.chdir(old)
+
+
+def test_project_optional_reads_the_manifest_when_there_is_one(project):
+    """With a project mounted it behaves exactly as `_project` did, so the
+    single-tenant banner keeps naming the agent it serves."""
+    from rya.cli.main import _project_optional
+
+    old = os.getcwd()
+    os.chdir(project)
+    try:
+        _, manifest = _project_optional()
+        assert manifest is not None
+        assert manifest.name == "test-agent"
+    finally:
+        os.chdir(old)

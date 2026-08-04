@@ -201,8 +201,20 @@ class RuntimeContext:
         on_token=None,
         on_ui=None,
         config=None,
+        broker=None,
     ) -> None:
         self.store = store
+        # D18: the mediated path. When set, this process holds no credentials and
+        # every operation that needed one goes over the socket instead — model
+        # calls, HTTP tools with an injected connection secret, egress, and the
+        # tenant's own declared secrets.
+        #
+        # It is one optional argument rather than a second RuntimeContext because
+        # the mediated and direct paths must stay behaviourally identical: two
+        # classes would drift, and the drift would be invisible until a handler
+        # behaved differently in production than in `rya dev`. The places that
+        # branch on it are marked `# D18` and there are four.
+        self.broker = broker
         # Optional live trace subscriber — fired on every trace event as it
         # happens (the WebSocket surface streams a run to the client in real time).
         self._on_trace = on_trace
@@ -267,6 +279,7 @@ class RuntimeContext:
         self.secrets = _Secrets(self)
         self.events = _Events(self)
         self.guard = _Guard(self)
+        self.egress = _Egress(self)
 
     # ---- core journaling ----------------------------------------------
     def _replay(self, seq: int, kind: str, label: str, data: Optional[dict]):
@@ -682,7 +695,22 @@ class _LLM:
         def run():
             # Provider comes from the RESOLVED route (D8) — already concrete, with
             # its credential attached; no ambient lookup decides it here.
+            #
+            # D18/D30: under mediation the route in THIS process carries no api_key,
+            # so the call is made by the broker with the pooled key, against the
+            # model allowlist and the workspace's quota, and the broker writes the
+            # meter row. The fallback below is deliberately not mediated separately
+            # — the broker returns whatever the provider did, including its failure,
+            # and this arm decides what to do about it exactly as before.
+            broker = self._ctx.broker
             try:
+                if broker is not None:
+                    return broker.llm_call(kind="respond", system=system, input=input,
+                                           schema=schema, route=route,
+                                           model=mroute.model, label=label,
+                                           meterKind="llm.respond",
+                                           runId=self._ctx.run["id"],
+                                           documents=docs, on_token=on_token)
                 return provider_respond(
                     system=system, input=input, route=mroute, schema=schema,
                     on_token=on_token, documents=docs,
@@ -788,6 +816,19 @@ class _LLM:
         try:
             for step in range(max_steps):
                 def turn(_msgs=list(messages)):
+                    # D18/D30: same substitution as `respond`. The loop itself stays
+                    # here — only the model call crosses. Moving the whole loop
+                    # broker-side would put tool dispatch on the platform's side of
+                    # the boundary, and a tool is tenant code.
+                    broker = self._ctx.broker
+                    if broker is not None:
+                        return broker.llm_call(kind="chat", messages=_msgs,
+                                               tools=tool_defs or None, system=system,
+                                               route=route, model=mroute.model,
+                                               label=f"step {step}",
+                                               meterKind="llm.chat",
+                                               runId=self._ctx.run["id"],
+                                               on_token=on_token)
                     return provider_chat(messages=_msgs, tools=tool_defs or None, system=system,
                                          route=mroute, on_token=on_token)
 
@@ -1254,8 +1295,25 @@ class _Tools:
                 return await handler(cur)
         elif url:
             impl = "http"
+            # D18: the one place a *platform-held* credential used to be handed to
+            # tenant code. `_authorize_connection` above still runs and still
+            # produces the early, specific scope error — but under mediation the
+            # connection record arrives redacted, so `secret` is None and there is
+            # nothing to inject here. The broker injects it, having re-checked the
+            # same intersection on its own side (server.py `_authorize_connection`),
+            # because a check that runs in the tenant's process is a courtesy and
+            # not an enforcement.
+            broker = self._ctx.broker
+            ident = self._ctx.identity
+            owner = ident.sub if ident is not None else None
+            user_scopes = list(ident.scopes) if (ident is not None and ident.scopes is not None) else None
 
             async def backend(cur):
+                if broker is not None:
+                    return broker.http_tool(url=url, input=cur, provider=provider,
+                                            owner=owner,
+                                            scopes=getattr(decl, "scopes", []) or [],
+                                            userScopes=user_scopes)
                 return _http_tool(url, cur, auth_secret=secret)
         else:
             spec = self._ctx._tools.get(tool_id)
@@ -1435,14 +1493,18 @@ class _Guard:
         cannot disagree because someone saved the file between them."""
         if self._resolved is not None:
             return self._resolved
-        from ..guard import GUARD_FILE, resolve_policy
+        from ..guard import GUARD_FILE, resolve_policy, store_key_for
         store = self._ctx.store
         gp = None
         if hasattr(store, "policy_get"):
             # The governed source wins. A read FAILURE resolves to a fail-closed
             # policy (carrying `error`) and must not be second-guessed here;
             # only "nothing provisioned" falls through.
-            gp = resolve_policy(store)
+            #
+            # D28: the run names its agent, and the key is qualified by it — so a
+            # second agent in the same workspace is governed by its own policy
+            # rather than by whichever one was written last.
+            gp = resolve_policy(store, key=store_key_for(store, self._ctx.run.get("agent")))
             if not gp.enforced:
                 gp = None
         if gp is None:
@@ -1714,7 +1776,28 @@ class _Connections:
         NEVER return this to the model or put it in a tool result: treat it as
         write-only into the client you build. Returns ``None`` when the caller has
         no active connection for ``provider``.
+
+        **Unavailable under mediation (D18), and it says so.** The secret is sealed
+        with a key the tenant process does not have, so the broker returns the
+        connection record redacted and there is nothing here to hand back. Raising is
+        the point: returning ``None`` would be indistinguishable from "no such
+        connection", so a handler would build a client with no credential and fail
+        somewhere upstream with a 401. The migration is a declared ``url:`` tool, where
+        the platform makes the call and injects the credential on its own side of the
+        boundary — see the deprecation note on ``agent.tool``.
         """
+        if self._ctx.broker is not None:
+            raise RyaError(
+                "E_BROKER_METHOD_DENIED",
+                f"ctx.connections.secret('{provider}') is not available in a mediated "
+                "runtime: this process holds no seal key, so it cannot open a "
+                "credential.",
+                hint="Declare the call as a `url:` tool with `provider:` and `scopes:` "
+                     "in the manifest. The platform then resolves the connection, "
+                     "checks the scope intersection and injects the bearer on its own "
+                     "side — which is the same governance you get here, with the "
+                     "secret never entering the sandbox (D18).",
+            )
         owner = self._ctx.identity.sub if self._ctx.identity is not None else None
         conn = self._ctx.store.get_connection(provider, owner) if hasattr(self._ctx.store, "get_connection") else None
         if conn is None or conn.get("status") != "active":
@@ -1773,7 +1856,11 @@ class _Jobs:
             run_at = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
-            job = self._ctx.store.create_job(self._ctx.run["id"], handler, payload, run_at, max_attempts)
+            # D22: the job is attributed to the run's agent, so only a worker
+            # serving that agent claims it (`store.claim_due_job`).
+            job = self._ctx.store.create_job(self._ctx.run["id"], handler, payload, run_at,
+                                             max_attempts,
+                                             agent=self._ctx.run.get("agent"))
             self._ctx.run.setdefault("scheduledJobs", []).append(job["id"])
             return {"jobId": job["id"], "handler": handler, "runAt": run_at}
 
@@ -1794,7 +1881,8 @@ class _Jobs:
             ids = []
             for handler, payload in jobs:
                 j = self._ctx.store.create_job(self._ctx.run["id"], handler, payload,
-                                               run_at, max_attempts, group_id=group["id"])
+                                               run_at, max_attempts, group_id=group["id"],
+                                               agent=self._ctx.run.get("agent"))
                 ids.append(j["id"])
             self._ctx.run.setdefault("scheduledJobs", []).extend(ids)
             return {"groupId": group["id"], "jobIds": ids, "onComplete": oc_handler}
@@ -1870,9 +1958,70 @@ class _Secrets:
         # NOT journaled or traced — secret values must never be persisted. The
         # value is also added to the redaction vault so if a handler accidentally
         # logs or returns it, it gets scrubbed from traces/logs.
-        value = self._ctx._env.get(name)
+        #
+        # D18: these are the TENANT's own declared secrets and they stay available.
+        # The credentials D18 removes are the platform's — the DSN, the seal key,
+        # the pooled provider key, the bucket credential. A value the tenant
+        # supplied for its own handler is not one of them, and withholding it would
+        # break `ctx.secrets` for no security gain. What changes is the delivery: a
+        # sandbox's environment does not carry them, so the broker hands them over
+        # one name at a time, which also means the process only ever holds the ones
+        # it asked for.
+        broker = self._ctx.broker
+        value = broker.secret_get(name) if broker is not None else self._ctx._env.get(name)
         self._ctx._seed_secret(value)
         return value
+
+
+class _Egress:
+    """The sanctioned way out of a sandbox (D24).
+
+    Exists because D18/D24 take away the one a leaf tool used to have. A sandbox has no
+    network route, so ``urllib`` fails at ``connect()`` — which is the enforcement — and
+    a handler that legitimately needs an allowlisted host needs *something*. This is it,
+    and it is on ``ctx`` rather than available to a leaf because it has to be mediated:
+    the guard verdict, the network verdict and the audit record all live on the
+    platform's side.
+
+    **Journaled**, unlike a leaf tool's raw request. An outbound call is a side effect,
+    so a replay after an approval pause must return the memoized response rather than
+    re-issuing it — the same rule ``ctx.tools.call`` follows and the reason a leaf could
+    never have this.
+
+    In the trusted posture it makes the request in-process after the same guard check,
+    so a handler written against it behaves identically on a laptop.
+    """
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self._ctx = ctx
+
+    def fetch(self, url: str, *, method: str = "GET", headers: Optional[dict] = None,
+              body: Any = None, timeout: float = 30.0) -> dict:
+        """Make one outbound request through the platform. Returns
+        ``{status, headers, body}``.
+
+        An upstream 4xx/5xx comes back as data rather than an exception — the request
+        was permitted and the server answered. A *refusal* raises
+        ``E_EGRESS_DENIED`` (the network or the allowlist said no) or
+        ``E_EGRESS_BLOCKED`` (the guard policy did), and the two are separate codes
+        because after D24 they are separate mechanisms.
+        """
+        def run():
+            broker = self._ctx.broker
+            if broker is not None:
+                return broker.egress_fetch(url, method=method, headers=headers,
+                                           body=body, timeout=timeout)
+            from ..egress import resolve_egress
+
+            service = resolve_egress(store=self._ctx.store,
+                                     agent=self._ctx.run.get("agent") or "")
+            return service.fetch(url, method=method, headers=headers, body=body,
+                                 timeout=timeout)
+
+        # The URL and method are the content key; the body is not, because a retry
+        # with the same body is the same request and D9 keys on what was ASKED for.
+        return self._ctx._step("egress.fetch", f"{method} {url}", run,
+                               {"url": url, "method": method})
 
 
 class _Events:

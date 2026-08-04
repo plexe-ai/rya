@@ -10,7 +10,7 @@ from __future__ import annotations
 import json as jsonlib
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 import yaml
@@ -50,8 +50,14 @@ schedules_app = typer.Typer(no_args_is_help=True, help="Cron schedules.")
 jobs_app = typer.Typer(no_args_is_help=True, help="Background jobs.")
 skills_app = typer.Typer(no_args_is_help=True, help="Install the Rya coding-agent skill.")
 workspaces_app = typer.Typer(no_args_is_help=True, help="Manage tenant workspaces (Postgres/cloud).")
+orgs_app = typer.Typer(no_args_is_help=True,
+                       help="Organizations: the BILLING boundary above a workspace (D29).")
 keys_app = typer.Typer(no_args_is_help=True, help="Manage per-workspace API keys.")
 connections_app = typer.Typer(no_args_is_help=True, help="Scoped connected credentials for tools.")
+# NOT `keys`, which is already the per-workspace API keys. Two things called "key" in
+# one CLI is a support ticket waiting to happen, and the encryption ones are a ring.
+keyring_app = typer.Typer(no_args_is_help=True,
+                          help="Per-tenant encryption keys: rotate, re-seal, inspect (D18/#13).")
 cloud_app = typer.Typer(no_args_is_help=True, help="Drive a hosted Rya (after `rya login`).")
 
 app.add_typer(agents_app, name="agents")
@@ -70,8 +76,10 @@ app.add_typer(schedules_app, name="schedules")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(skills_app, name="skills")
 app.add_typer(workspaces_app, name="workspaces")
+app.add_typer(orgs_app, name="orgs")
 app.add_typer(keys_app, name="keys")
 app.add_typer(connections_app, name="connections")
+app.add_typer(keyring_app, name="keyring")
 app.add_typer(cloud_app, name="cloud")
 
 
@@ -123,10 +131,64 @@ def _project() -> tuple[Path, "load_manifest"]:
     return path.parent, manifest
 
 
+def _project_optional() -> tuple[Path, Optional["load_manifest"]]:
+    """The project root, and its manifest **only if one is mounted**.
+
+    ``_project`` refuses without a ``rya.agent.yaml`` because most commands act on
+    one agent. ``rya serve`` does not: since D21 ``build_app`` is manifest-free and
+    learns what agents exist from published versions and environment pointers, so a
+    control plane that serves only published bundles has no project to mount — and
+    insisting on one made exactly that deployment unrunnable, which is the shape the
+    api is *for*. The manifest was read here to print a name in the banner.
+
+    Same resolution as ``_admin_store``, and the same reason.
+    """
+    from ..agents import project_root as mounted_project
+
+    path = find_manifest()
+    root = mounted_project() or (path.parent if path else Path.cwd())
+    return root, (load_manifest(path) if path else None)
+
+
 def _store() -> tuple[Path, "load_manifest", Store]:
     root, manifest = _project()
     store = open_store(root)
     return root, manifest, store
+
+
+def _admin_store(workspace: str = "") -> tuple[Path, Store]:
+    """A store for a named workspace, with **no manifest required**.
+
+    ``_store`` insists on a project because most commands operate on one. The
+    tenant-lifecycle and key commands do not: under D21 a deployment serves many
+    agents and has no ``rya.agent.yaml`` at all, so demanding one would make
+    `rya workspaces purge` unrunnable exactly where it matters. Same resolution the
+    `supervisor` command uses, and the same reason.
+    """
+    from ..agents import project_root as mounted_project
+    from ..store import open_worker_store
+
+    path = find_manifest()
+    root = mounted_project() or (path.parent if path else Path.cwd())
+    if not workspace:
+        return root, open_store(root)
+    return root, open_worker_store(root, workspace)
+
+
+def _actor() -> str:
+    """Who is running this, for the audit record. Best effort and honest about it.
+
+    A purge and a disable are both recorded, and "unknown" is a worse answer than an
+    OS username — but neither is an authenticated identity, so this must not be
+    mistaken for one. The api's routes carry a real actor; the CLI carries whoever ran
+    it.
+    """
+    import getpass
+    import os
+
+    return (os.environ.get("RYA_ACTOR")
+            or (getpass.getuser() if hasattr(getpass, "getuser") else "")
+            or "cli")
 
 
 def _engine() -> Engine:
@@ -491,7 +553,11 @@ def _deploy_bundle(*, env: str, promote_it: bool, actor: Optional[str],
         # set must upload there, or the worker that later resolves the same store
         # would look in a bucket nothing was ever written to. Falls back to the
         # local content-addressed directory when nothing is declared.
-        archive_store = bundles.resolve_bundle_store(root)
+        # D20: into this store's tenant namespace. On the local FileStore that is
+        # empty and addressing stays flat, which is what keeps `rya dev` and a
+        # single-tenant self-host on the pre-D20 layout.
+        archive_store = bundles.resolve_bundle_store(
+            root, workspace=bundles.workspace_of(store))
         archive = bundles.store_bundle(bundle, archive_store)
 
         # Record, attest, THEN promote — in that order, and not via
@@ -687,9 +753,11 @@ def gate_show(env: Optional[str] = typer.Option(None, "--env", help="Show the ga
         root, manifest, store = _store()
         names = [env] if env else sorted(
             {e["name"] for e in deployments.list_environments(store, agent=manifest.name)}
-            | set((store.policy_get(gates.POLICY_KEY) or {}).get("environments") or {}))
-        rows = [gates.resolve_gate(store, name).describe() for name in names]
-        data = {"gates": rows, "default": gates.resolve_gate(store, "default").describe()}
+            | set((gates.gate_policy(store, manifest.name) or {}).get("environments") or {}))
+        rows = [gates.resolve_gate(store, name, agent=manifest.name).describe()
+                for name in names]
+        data = {"gates": rows,
+                "default": gates.resolve_gate(store, "default", agent=manifest.name).describe()}
 
         def render():
             if not rows:
@@ -726,7 +794,10 @@ def gate_set(env: Optional[str] = typer.Option(None, "--env",
     with guard(json):
         from .. import gates
         root, manifest, store = _store()
-        policy = dict(store.policy_get(gates.POLICY_KEY) or {})
+        # D28: read through the fallback so `gate set` on a workspace that
+        # predates agent-qualified keys TIGHTENS the inherited policy instead of
+        # starting from empty and silently dropping the other requirements.
+        policy = dict(gates.gate_policy(store, manifest.name) or {})
         target = "default" if env is None else env
         if env is None:
             spec = dict(policy.get("default") or {})
@@ -752,8 +823,8 @@ def gate_set(env: Optional[str] = typer.Option(None, "--env",
             environments[env] = spec
             policy["environments"] = environments
 
-        gates.set_gate(store, policy, actor=actor)
-        resolved = gates.resolve_gate(store, target).describe()
+        gates.set_gate(store, policy, actor=actor, agent=manifest.name)
+        resolved = gates.resolve_gate(store, target, agent=manifest.name).describe()
         emit(json, {"ok": True, "gate": resolved}, lambda: console.print(
             f"[green]✓[/green] gate for [bold]{target}[/bold]: "
             + (", ".join(k for k in ("requireReadiness", "requireEvals", "requireActor")
@@ -767,7 +838,7 @@ def gate_clear(actor: Optional[str] = typer.Option(None, "--actor"),
     with guard(json):
         from .. import gates
         root, manifest, store = _store()
-        gates.set_gate(store, None, actor=actor)
+        gates.set_gate(store, None, actor=actor, agent=manifest.name)
         emit(json, {"ok": True, "cleared": True},
              lambda: console.print("[yellow]gates cleared[/yellow] — every environment now "
                                    "accepts any version."))
@@ -1850,6 +1921,431 @@ def keys_create(workspace: str = typer.Option(..., "--workspace", help="Workspac
                       console.print("  [dim]store it now — not retrievable later[/dim]")))
 
 
+@orgs_app.command("create")
+def orgs_create(name: str = typer.Argument(..., help="Display name."),
+                json: bool = typer.Option(False, "--json")):
+    """Create an organization — the billing entity that owns workspaces (D29).
+
+    Creating one does not move any isolation boundary: `workspace_id` stays the
+    thing RLS pins to, and no policy anywhere references `org_id`. What an org
+    owns is a bill.
+    """
+    with guard(json):
+        org = _tenancy().create_organization(name)
+        emit(json, {"org": org},
+             lambda: console.print(f"[green]✓[/green] organization "
+                                   f"[bold]{org['id']}[/bold] ({name})"))
+
+
+@orgs_app.command("list")
+def orgs_list(json: bool = typer.Option(False, "--json")):
+    """List organizations, their workspace counts and their budgets."""
+    with guard(json):
+        items = _tenancy().list_organizations()
+
+        def render():
+            t = Table("id", "name", "workspaces", "budget")
+            for o in items:
+                budget = o.get("budget") or {}
+                t.add_row(o["id"], o["name"], str(o["workspaces"]),
+                          ", ".join(f"{k}={v}" for k, v in sorted(budget.items())) or "-")
+            console.print(t)
+        emit(json, {"orgs": items}, render)
+
+
+@orgs_app.command("assign")
+def orgs_assign(workspace: str = typer.Argument(..., help="Workspace id."),
+                org: str = typer.Option(..., "--org", help="Organization id."),
+                json: bool = typer.Option(False, "--json")):
+    """Move a workspace's BILLING to another org. Its isolation is unaffected."""
+    with guard(json):
+        rec = _tenancy().assign_workspace_to_org(workspace, org)
+        emit(json, rec,
+             lambda: console.print(f"[green]✓[/green] {workspace} now bills to {org}"))
+
+
+@orgs_app.command("budget")
+def orgs_budget(org: str = typer.Argument(..., help="Organization id."),
+                tokens_per_day: Optional[int] = typer.Option(None, "--tokens-per-day"),
+                usd_per_day: Optional[float] = typer.Option(None, "--usd-per-day"),
+                usd_per_month: Optional[float] = typer.Option(None, "--usd-per-month"),
+                clear: bool = typer.Option(False, "--clear", help="Remove the budget."),
+                json: bool = typer.Option(False, "--json")):
+    """Set an organization's shared budget.
+
+    Money limits only. An org is the billing boundary, so a concurrency cap there
+    would be a scheduling limit at a boundary that does no scheduling — those stay
+    per workspace, with `rya quotas set`.
+
+    Writing a budget does not enforce it on its own: `rya orgs reconcile` computes
+    the rollup and pushes the verdict to each member workspace, which is what the
+    admission path reads. Run it from a cron.
+    """
+    with guard(json):
+        spec = None if clear else {k: v for k, v in (
+            ("maxTokensPerDay", tokens_per_day),
+            ("maxCostUsdPerDay", usd_per_day),
+            ("maxCostUsdPerMonth", usd_per_month)) if v is not None}
+        if spec is not None and not spec:
+            raise RyaError("E_VALIDATION", "Name at least one limit, or pass --clear.",
+                           hint="e.g. `rya orgs budget org_x --usd-per-month 500`.")
+        rec = _tenancy().set_org_budget(org, spec)
+        emit(json, rec, lambda: console.print(
+            f"[green]✓[/green] budget for {org}: "
+            + (", ".join(f"{k}={v}" for k, v in sorted((spec or {}).items())) or "cleared")))
+
+
+@orgs_app.command("show")
+def orgs_show(org: str = typer.Argument(..., help="Organization id."),
+              json: bool = typer.Option(False, "--json")):
+    """One org's budget, members, and current aggregate usage.
+
+    `byWorkspace` is the field to read first when an org has stopped: the total says
+    the budget is gone and this says which tenant spent it.
+
+    `freshness` is the field to read when an org has *not* stopped and should have.
+    The numbers above it are computed live by this command; the numbers the platform
+    *enforces* are the derived verdict a reconciler last wrote, and if nothing is
+    running one, those are two different things.
+    """
+    with guard(json):
+        import os as _os
+
+        from .. import orgs as O
+        from ..store import open_worker_store
+
+        record = _tenancy().get_organization(org)
+        if record is None:
+            raise RyaError("E_NOT_FOUND", f"No organization '{org}'.")
+        dsn = _os.environ.get("RYA_DATABASE_URL") or _os.environ.get("DATABASE_URL") or ""
+        usage = O.org_usage(dsn, org)
+        budget = O.coerce_budget(record.get("budget") or {})
+        breaches = O.violations_for(budget, usage)
+        # Asked per member workspace, because the verdict is per workspace: a
+        # reconcile that failed halfway leaves some members current and some stale,
+        # and reporting only the first would hide it.
+        fresh = {}
+        for ws in record.get("workspaces") or []:
+            member = open_worker_store(Path.cwd(), ws)
+            try:
+                fresh[ws] = O.freshness(member)
+            finally:
+                closer = getattr(member, "close", None)
+                if closer is not None:
+                    closer()
+        out = {"org": record, "budget": budget.describe(), "usage": usage,
+               "violations": breaches, "freshness": fresh}
+
+        def render():
+            console.print(f"[bold]{record['name']}[/bold] ({org}) — "
+                          f"{len(record['workspaces'])} workspace(s)")
+            t = Table("workspace", "tokens today", "USD today", "USD month")
+            for ws, row in sorted(usage["byWorkspace"].items()):
+                t.add_row(ws, str(row["tokensToday"]), f"{row['costUsdToday']:.4f}",
+                          f"{row['costUsdMonth']:.4f}")
+            t.add_row("[bold]total[/bold]", str(usage["tokensToday"]),
+                      f"{usage['costUsdToday']:.4f}", f"{usage['costUsdMonth']:.4f}")
+            console.print(t)
+            for v in breaches:
+                console.print(f"  [red]✗[/red] {v['label']} {v['current']}/{v['max']}")
+            if not breaches:
+                console.print("  [green]✓[/green] within budget")
+            # The gap §9 named: a budget nothing reconciles caps nothing. Said out
+            # loud here rather than left for someone to infer from a `computedAt`.
+            behind = sorted(w for w, f in fresh.items() if f["stale"])
+            if behind and budget.enforced:
+                console.print(
+                    f"  [yellow]![/yellow] {len(behind)} workspace(s) have a stale or "
+                    f"missing org verdict ({', '.join(behind[:4])}"
+                    f"{'…' if len(behind) > 4 else ''}) — this budget is not being "
+                    "enforced. Run `rya supervisor --all-workspaces`, or "
+                    "`rya orgs reconcile` from a cron.")
+        emit(json, out, render)
+
+
+@orgs_app.command("reconcile")
+def orgs_reconcile(org: Optional[str] = typer.Option(None, "--org",
+                                                     help="One org; default every org."),
+                   dry_run: bool = typer.Option(False, "--dry-run",
+                                                help="Compute and report; write nothing."),
+                   json: bool = typer.Option(False, "--json")):
+    """Recompute every org's rollup and push its verdict to member workspaces.
+
+    The enforcement half of an org budget, and it is a separate step on purpose.
+    Summing an org's meter needs a connection that spans tenants; putting one on
+    every tenant's admission path would hand the hot path a credential that can read
+    every other tenant — which is what Phase 4 spent itself removing from a far less
+    privileged process. So this computes the aggregate out here and writes only the
+    *verdict* into each workspace's own policy row, where an ordinary tenant-scoped
+    read finds it.
+
+    Idempotent. Run it from a cron; the staleness between ticks is the same trade
+    §11.12 already made for token limits, with a wider bound.
+    """
+    with guard(json):
+        import os as _os
+
+        from .. import orgs as O
+
+        dsn = _os.environ.get("RYA_DATABASE_URL") or _os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise RyaError("E_VALIDATION", "Org budgets require Postgres.",
+                           hint="Organizations are a multi-tenant feature; set "
+                                "RYA_DATABASE_URL.")
+        _tenancy()  # idempotent setup, so `budget` and the org tables exist
+        results = O.reconcile(dsn, org_id=org, dry_run=dry_run)
+        over = [r for r in results if r.get("exhausted")]
+
+        def render():
+            for r in results:
+                if not r.get("ok"):
+                    console.print(f"  [red]✗[/red] {r['orgId']}: {r.get('error')}")
+                    continue
+                mark = "[red]✗[/red]" if r["exhausted"] else "[green]✓[/green]"
+                console.print(f"  {mark} {r['name']} ({r['orgId']}) — "
+                              f"{len(r['workspaces'])} workspace(s), "
+                              f"${r['usage']['costUsdMonth']:.4f} this month"
+                              + (" — over budget" if r["exhausted"] else ""))
+            console.print(f"[green]✓[/green] reconciled {len(results)} org(s), "
+                          f"{len(over)} over budget"
+                          + (" (dry run — nothing written)" if dry_run else ""))
+        emit(json, {"orgs": results, "exhausted": len(over), "dryRun": dry_run}, render)
+
+
+@workspaces_app.command("disable")
+def workspaces_disable(workspace: str = typer.Argument(..., help="Workspace id."),
+                       reason: str = typer.Option("", "--reason",
+                                                  help="Recorded on the audit stub."),
+                       retention_days: int = typer.Option(
+                           None, "--retention-days",
+                           help="Days before a purge is allowed. Default 30; 0 for none."),
+                       json: bool = typer.Option(False, "--json")):
+    """Phase one of D31: stop scheduling, refuse claims, revoke keys. Reversible.
+
+    The step a billing failure or an abuse report should trigger. Nothing is destroyed,
+    queued work is refused rather than dropped, and `rya workspaces enable` undoes it.
+    """
+    with guard(json):
+        from .. import purge as P
+
+        _, store = _admin_store(workspace)
+        kwargs = {} if retention_days is None else {"retention_days": retention_days}
+        # Key revocation needs the tenancy tables, which only exist on Postgres. A
+        # single-tenant self-host has no per-workspace API keys to revoke, and refusing
+        # to disable it for want of a table it does not need would make the local arm
+        # unable to exercise the lifecycle at all.
+        try:
+            tenancy = _tenancy()
+        except RyaError:
+            tenancy = None
+        out = P.disable(store, reason=reason, actor=_actor(), tenancy=tenancy,
+                        workspace=workspace, **kwargs)
+        emit(json, {"ok": True, **out},
+             lambda: console.print(
+                 f"[yellow]●[/yellow] workspace [bold]{workspace}[/bold] disabled"
+                 + (f" ({reason})" if reason else "")
+                 + f" · {out['keysRevoked']} key(s) revoked · purgeable after "
+                 f"{out['purgeableAt'] or 'immediately'}"))
+
+
+@workspaces_app.command("enable")
+def workspaces_enable(workspace: str = typer.Argument(..., help="Workspace id."),
+                      json: bool = typer.Option(False, "--json")):
+    """Undo a disable. Refuses on a purged workspace, which cannot be undone."""
+    with guard(json):
+        from .. import purge as P
+
+        _, store = _admin_store(workspace)
+        out = P.enable(store, actor=_actor())
+        emit(json, {"ok": True, **out},
+             lambda: console.print(f"[green]✓[/green] workspace [bold]{workspace}[/bold] "
+                                   "re-enabled · queued work resumes"))
+
+
+@workspaces_app.command("purge")
+def workspaces_purge(workspace: str = typer.Argument(..., help="Workspace id."),
+                     force: bool = typer.Option(
+                         False, "--force",
+                         help="Skip the disabled-state and retention-window checks."),
+                     dry_run: bool = typer.Option(
+                         False, "--dry-run",
+                         help="Report what would be destroyed, and destroy nothing."),
+                     json: bool = typer.Option(False, "--json")):
+    """Phase two of D31: crypto-shred the key, delete objects and rows. IRREVERSIBLE.
+
+    Prints an attestation — one sentence written by the code that did the work,
+    distinguishing "unreadable by construction" from "rows deleted". The difference
+    matters when answering a deletion request, and it depends on whether this
+    deployment uses a per-tenant key provider (`rya keyring show`).
+    """
+    with guard(json):
+        import os
+
+        from .. import purge as P
+        from ..bundles import resolve_bundle_store
+
+        root, store = _admin_store(workspace)
+        keyring = None
+        try:
+            from ..keys import resolve_keyring
+
+            keyring = resolve_keyring(root=root)
+        except RyaError:
+            pass    # reported in the attestation, not fatal
+        try:
+            bundle_store = resolve_bundle_store(root, workspace=workspace)
+        except RyaError:
+            bundle_store = None
+        report = P.purge(store, workspace=workspace, keyring=keyring,
+                         bundle_store=bundle_store,
+                         admin_dsn=(os.environ.get("RYA_DATABASE_URL")
+                                    or os.environ.get("DATABASE_URL") or ""),
+                         force=force, dry_run=dry_run, actor=_actor())
+        emit(json, report.describe(),
+             lambda: (console.print(("[dim]dry run — nothing destroyed[/dim]"
+                                     if dry_run else
+                                     "[red]●[/red] purged" if report.ok else
+                                     "[red]![/red] purge INCOMPLETE")),
+                      console.print(f"  {report.attestation()}"),
+                      *[console.print(f"  [red]✗[/red] {e}") for e in report.errors]))
+
+
+@keyring_app.command("show")
+def keyring_show(json: bool = typer.Option(False, "--json")):
+    """Which key provider this deployment uses, and what it can therefore promise.
+
+    The field to read is `shreddable`: only a provider that stores a random per-tenant
+    key can make a purge cryptographic (D31). The default `deployment` provider cannot,
+    and that is not a bug — it is the right default for a single-tenant self-host.
+    """
+    with guard(json):
+        from ..keys import resolve_keyring
+
+        root, _store_ = _admin_store()
+        ring = resolve_keyring(root=root)
+        info = ring.describe()
+        emit(json, info,
+             lambda: console.print(
+                 f"provider: [bold]{info['provider']}[/bold]  "
+                 f"per-tenant: {'yes' if info['perTenant'] else 'no'}  "
+                 f"shreddable: {'[green]yes[/green]' if info['shreddable'] else '[yellow]no[/yellow]'}"
+                 + (f"  wrapper: {info['wrapper']}" if info.get("wrapper") else "")))
+
+
+@keyring_app.command("rotate")
+def keyring_rotate(workspace: str = typer.Option("", "--workspace",
+                                                 help="Workspace to rotate. Empty = this store's."),
+                   reseal: bool = typer.Option(False, "--reseal",
+                                               help="Re-seal existing secrets under the new key."),
+                   json: bool = typer.Option(False, "--json")):
+    """Mint the next key generation. Old ciphertext keeps opening until re-sealed.
+
+    Rotation and re-sealing are separate because minting is instant and a re-seal walks
+    every sealed row — so an operator can rotate now and re-seal on a schedule. Pass
+    `--reseal` to do both.
+    """
+    with guard(json):
+        from ..keys import reseal as reseal_all
+        from ..keys import resolve_keyring
+
+        root, store = _admin_store(workspace)
+        ring = resolve_keyring(root=root)
+        ws = workspace or str(getattr(store, "workspace_id", "") or "")
+        key = ring.rotate(ws)
+        out = {"ok": True, "key": key.describe()}
+        if reseal:
+            out["reseal"] = reseal_all(store, keyring=ring, workspace=ws)
+        emit(json, out,
+             lambda: console.print(
+                 f"[green]✓[/green] new key generation [bold]{key.generation}[/bold] "
+                 f"for {ws or '(this store)'}"
+                 + (f" · re-sealed {out['reseal']['resealed']} secret(s)" if reseal
+                    else " · run `rya keyring reseal` to re-protect existing secrets")))
+
+
+@keyring_app.command("reseal")
+def keyring_reseal(workspace: str = typer.Option("", "--workspace"),
+                   json: bool = typer.Option(False, "--json")):
+    """Re-seal every connection secret under the workspace's current key.
+
+    Wider than `rya connections reseal`, which only converts plaintext: this also moves
+    a v1 envelope to v2 and a superseded generation to the current one. Reports per-row
+    failures rather than stopping, because one unreadable secret must not prevent the
+    other ninety-nine being re-protected.
+    """
+    with guard(json):
+        from ..keys import reseal as reseal_all
+        from ..keys import resolve_keyring
+
+        root, store = _admin_store(workspace)
+        ring = resolve_keyring(root=root)
+        ws = workspace or str(getattr(store, "workspace_id", "") or "")
+        res = reseal_all(store, keyring=ring, workspace=ws)
+        emit(json, {"ok": not res["failed"], **res},
+             lambda: (console.print(
+                 f"[green]✓[/green] re-sealed [bold]{res['resealed']}[/bold] · "
+                 f"{res['current']} already current, {res['empty']} without a secret "
+                 f"({res['scanned']} scanned)"),
+                 *[console.print(f"  [red]✗[/red] {e['provider']}: {e['error']}")
+                   for e in res["errors"]]))
+
+
+@app.command()
+def posture(verify: bool = typer.Option(
+                False, "--verify",
+                help="Probe the substrate for real. Costs a container/pod start."),
+            json: bool = typer.Option(False, "--json")):
+    """The launch gate: does this deployment meet the untrusted-tenant posture?
+
+    Reports all three conditions at once — a sandbox that contains a kernel escape
+    (D23), a tenant process holding no credentials (D18), and egress enforced by the
+    network (D24) — because any one of them missing makes the other two insufficient.
+
+    `--verify` asks the substrate what kernel it is actually running rather than
+    trusting the flag that was passed. That check is the residual MULTITENANT §9 risk 8
+    named, and it is off by default only because it costs a container start.
+    """
+    with guard(json):
+        from ..broker.inventory import take_inventory
+        from ..execution.drivers import check_untrusted_posture, resolve_driver
+
+        driver = resolve_driver()
+        report = check_untrusted_posture(driver, verify=verify)
+        inventory = take_inventory()
+        payload = {**report.describe(), "driver": driver.describe(),
+                   "credentials": inventory.describe()}
+
+        def render():
+            # A trusted deployment with none of the three met is CORRECT, and marking
+            # it with a red cross would train an operator to ignore the mark on the one
+            # deployment where it means something.
+            satisfied = report.ok or not report.untrusted
+            mark = "[green]✓[/green]" if satisfied else "[red]✗[/red]"
+            state = ("untrusted tenancy" if report.untrusted
+                     else "trusted tenancy (untrusted not declared)")
+            console.print(f"{mark} {state} · driver [bold]{driver.name}[/bold] "
+                          f"({driver.isolation})")
+            for name, ok, detail in (("isolation (D23)", report.isolation_ok,
+                                      report.isolation_detail),
+                                     ("mediation (D18)", report.broker_ok,
+                                      report.broker_detail),
+                                     ("egress (D24)", report.egress_ok,
+                                      report.egress_detail)):
+                tick = "[green]✓[/green]" if ok else "[yellow]○[/yellow]"
+                console.print(f"  {tick} {name}: {detail}")
+            console.print(
+                f"  {'[green]✓[/green]' if inventory.clean else '[yellow]○[/yellow]'} "
+                f"this process holds "
+                + ("no platform credentials" if inventory.clean else
+                   ", ".join(sorted({f.group or f.name for f in inventory.violations}))))
+            if not report.untrusted:
+                console.print("[dim]  RYA_UNTRUSTED_TENANTS is not set, so none of the "
+                              "above is enforced. The trusted posture is supported — "
+                              "just do not advertise hostile-tenant isolation.[/dim]")
+
+        emit(json, payload, render)
+
+
 @jobs_app.command("dlq")
 def jobs_dlq(json: bool = typer.Option(False, "--json")):
     """List dead-lettered jobs (exhausted all retries)."""
@@ -1882,9 +2378,29 @@ def worker(once: bool = typer.Option(False, "--once", help="Drain due work once 
            version: Optional[str] = typer.Option(None, "--version", help="Serve a pinned deployment version."),
            env: Optional[str] = typer.Option(None, "--env", help="Serve whichever version this environment points at."),
            workspace: str = typer.Option("default", "--workspace"),
+           agent: Optional[str] = typer.Option(
+               None, "--agent",
+               help="Which agent to serve. Defaults to the mounted manifest's, which "
+                    "is only unambiguous while a deployment serves one (D21)."),
            concurrency: int = typer.Option(1, "--concurrency", help="Parallel job execution."),
            idle_exit: float = typer.Option(0, "--idle-exit",
                                            help="Exit after N idle seconds with an empty queue (scale to zero)."),
+           fork: bool = typer.Option(False, "--fork",
+                                     help="D27: run each item in a fork of a warm interpreter; "
+                                          "this process imports no agent code."),
+           run_timeout: float = typer.Option(0, "--run-timeout",
+                                             help="With --fork, kill a run that exceeds N seconds "
+                                                  "(0 = no limit, the in-process behaviour)."),
+           scope: Optional[str] = typer.Option(
+               None, "--scope",
+               help="Claimer scope (D27/#19-8b): `version` (default) serves one "
+                    "(workspace, agent, version); `tenant` serves the whole workspace, "
+                    "forking whichever version each item is pinned to. Defaults to "
+                    "RYA_CLAIMER_SCOPE."),
+           prewarm: Optional[List[str]] = typer.Option(
+               None, "--prewarm",
+               help="With --scope tenant, warm the current version of this environment "
+                    "before claiming. Repeatable."),
            json: bool = typer.Option(False, "--json")):
     """Run an execution-plane worker: claim and execute due turns and jobs.
 
@@ -1896,15 +2412,62 @@ def worker(once: bool = typer.Option(False, "--once", help="Drain due work once 
     it loads that bundle, verifies its hash, advertises its handler set, refuses
     to start on a mismatch, and claims only work pinned to it (D3, D12). Without
     either it runs the working tree, which is `rya dev` and single-tenant serve.
+
+    `--fork` selects D27's execution mode: this process claims but never imports
+    the bundle, and each item runs in a fork of a warm interpreter keyed by the
+    bundle's content hash. Same scope, same preflight, same durability — what
+    changes is that the long-lived process holds no tenant code.
+
+    `--scope tenant` is the widening that mode was built for (#19-8b). One claimer
+    serves the whole workspace: it peeks at the queue, warms the version the next
+    item is pinned to, and forks a child to claim it — so five agents with two live
+    versions each occupy one sandbox rather than ten, a promotion costs no extra
+    sandbox, and an approval resuming on a retired version is a fork rather than a
+    deployment. It implies `--fork`, takes no `--agent` and no `--version`, and
+    needs no mounted project.
     """
     with guard(json):
         from ..worker import start_worker
 
-        root, manifest, store = _store()
+        from ..store import open_worker_store
+
+        from ..execution.scope import SCOPE_TENANT, resolve_scope
+
+        if resolve_scope(scope) == SCOPE_TENANT:
+            # Deliberately NOT `_project()`, for the same reason `rya supervisor`
+            # is not: a tenant claimer runs where there is no `rya.agent.yaml` at
+            # all. It learns its agents from published versions (D21) and
+            # materialises each bundle from the object store, so requiring a
+            # mounted manifest would make the wide scope only usable in exactly
+            # the deployment shape it exists to replace.
+            from ..agents import project_root as mounted_project
+
+            found = find_manifest()
+            root = mounted_project() or (found.parent if found else Path.cwd())
+            manifest = None
+        else:
+            root, manifest = _project()
+        # NOT `_store()`: the execution plane needs a store scoped to
+        # `--workspace` and connected as the weaker `rya_worker` role. Using the
+        # control plane's builder here is what made `--workspace` decorative —
+        # the key said `acme`, the store read everything (#5 / D19).
+        store = open_worker_store(root, workspace)
+        # `--agent` overrides the mounted manifest, which stopped being a sufficient
+        # answer at D21: a deployment serving two agents has one manifest on disk, so
+        # `--env prod` resolved the pointer for whichever agent that file happened to
+        # name. With `--version` the version record names the agent and it did not
+        # matter; with `--env` it decided which agent got served, silently.
         w = start_worker(project_root=root, store=store, workspace=workspace,
                          version_id=version, environment=env,
-                         agent_name=manifest.name, concurrency=concurrency,
-                         idle_exit_seconds=idle_exit, poll_seconds=interval)
+                         agent_name=agent or (manifest.name if manifest else None),
+                         concurrency=concurrency,
+                         idle_exit_seconds=idle_exit, poll_seconds=interval,
+                         # `or None`, so an absent --fork reaches `start_worker` as
+                         # "the scope decides" rather than as an explicit refusal. A
+                         # typer bool flag cannot distinguish the two, and `--scope
+                         # tenant` needs it to: the help below says it implies --fork.
+                         fork=fork or None, run_timeout_seconds=run_timeout,
+                         scope=scope, prewarm=tuple(prewarm or ()))
         if once:
             w.preflight()
             w.register()
@@ -1918,14 +2481,188 @@ def worker(once: bool = typer.Option(False, "--once", help="Drain due work once 
                  lambda: console.print(f"[green]✓[/green] drained {tick['count']} item(s)"))
             return
         if not json:
-            pin = w.key.version_id or "working tree"
-            console.print(f"[green]✓[/green] worker {w.id} serving [bold]{w.key.agent}[/bold] "
-                          f"({pin}) — polling every {interval}s (Ctrl-C to stop)")
+            if w.key.tenant_scoped:
+                warm = ", ".join(f"{p['agent']}@{p['versionId'][:12]}" for p in w.prewarmed)
+                console.print(f"[green]✓[/green] claimer {w.id} serving all of "
+                              f"[bold]{w.key.workspace}[/bold] — "
+                              f"{('warm: ' + warm) if warm else 'nothing pre-warmed'} — "
+                              f"polling every {interval}s (Ctrl-C to stop)")
+            else:
+                pin = w.key.version_id or "working tree"
+                console.print(f"[green]✓[/green] worker {w.id} serving [bold]{w.key.agent}[/bold] "
+                              f"({pin}) — polling every {interval}s (Ctrl-C to stop)")
         result = w.run(max_iterations=max_iterations,
                        on_tick=None if json else lambda t: (
                            console.print(f"  ran {t['count']} item(s)") if t["count"] else None))
         if json:
             emit(json, result, lambda: None)
+
+
+@app.command("template-host")
+def template_host(
+    socket: Optional[str] = typer.Option(None, "--socket",
+                                         help="Where to listen. Defaults to RYA_TEMPLATE_HOST."),
+    max_entries: Optional[int] = typer.Option(None, "--max-entries",
+                                              help="Warm interpreters to hold. Defaults to the "
+                                                   "tenant-scope pool size."),
+    run_timeout: float = typer.Option(0, "--run-timeout",
+                                      help="Kill a forked run that exceeds N seconds "
+                                           "(0 = no limit)."),
+    status: bool = typer.Option(False, "--status",
+                                help="Ask a running host what it is holding, and exit."),
+    json: bool = typer.Option(False, "--json"),
+):
+    """Serve warm interpreters over a socket — the sandbox half of the D32 pair.
+
+    This process holds **no credentials** and claims nothing. It imports tenant
+    bundles on request and forks one child per dispatch, which is exactly what the
+    claimer's own warm pool did before — the difference is that it can now be in a
+    different container, so the claimer (which holds the database credential, the seal
+    key and the pooled provider key) no longer has to be the tenant process's parent.
+
+    Run it as the sandbox container's entrypoint, beside a `rya worker --fork` that
+    has RYA_TEMPLATE_HOST pointing at the same socket on a shared volume. Both
+    containers must be the same build (D5). The `docker` and `kubernetes` drivers
+    render that pair for you; this command is for running one by hand, and for
+    `--status` against one that is already up.
+    """
+    with guard(json):
+        from ..execution.host import (HOST_SOCKET_ENV, HostedTemplateProbe,
+                                      TemplateHost, host_socket, host_token)
+        from ..execution.pool import default_pool_size
+        from ..execution.scope import SCOPE_TENANT
+
+        path = (socket or host_socket()).strip()
+        if not path:
+            raise RyaError(
+                "E_VALIDATION",
+                "A template host needs a socket path and none was given.",
+                hint=f"Pass --socket, or set {HOST_SOCKET_ENV} to the shared path the "
+                     "claimer beside it will connect to. In Kubernetes that is a file "
+                     "on the `broker` emptyDir; with docker it is the bind mount both "
+                     "halves of the pair are given.")
+        if status:
+            emit(json, HostedTemplateProbe(path, host_token()).status(),
+                 lambda: console.print(f"[green]✓[/green] template host on {path}"))
+            return
+        host = TemplateHost(
+            socket_path=Path(path), token=host_token(),
+            max_entries=max_entries or default_pool_size(SCOPE_TENANT),
+            run_timeout_seconds=run_timeout)
+        if not json:
+            console.print(f"[green]✓[/green] template host on [bold]{path}[/bold] — "
+                          f"holding up to {host.pool.max_entries} warm interpreter(s), "
+                          "no credentials (Ctrl-C to stop)")
+        host.serve_forever()
+
+
+@app.command()
+def supervisor(
+    once: bool = typer.Option(False, "--once", help="One observe/plan/apply tick, then exit."),
+    plan_only: bool = typer.Option(False, "--plan", help="Decide and print; launch nothing."),
+    interval: float = typer.Option(5, "--interval", help="Seconds between ticks."),
+    max_ticks: Optional[int] = typer.Option(None, "--max-ticks", help="Stop after N ticks."),
+    workspace: str = typer.Option("default", "--workspace"),
+    env: Optional[str] = typer.Option(None, "--env", help="The environment its workers serve."),
+    all_workspaces: bool = typer.Option(False, "--all-workspaces",
+                                        help="Fan out over every workspace (needs the admin DSN)."),
+    prewarm: Optional[str] = typer.Option(None, "--prewarm",
+                                          help="Comma-separated environments to keep one warm worker for."),
+    max_replicas: int = typer.Option(4, "--max-replicas", help="Cap on workers per key."),
+    backlog: int = typer.Option(5, "--backlog-per-worker", help="Queued items one worker is assumed to absorb."),
+    idle_exit: float = typer.Option(60, "--idle-exit", help="Idle seconds before a launched worker exits."),
+    scope: Optional[str] = typer.Option(
+        None, "--scope",
+        help="Claimer scope to schedule (D27/#19-8b). Must match what the claimers "
+             "actually run: `version` plans one worker per (agent, version), `tenant` "
+             "plans one per workspace. Defaults to RYA_CLAIMER_SCOPE."),
+    lease: bool = typer.Option(
+        True, "--lease/--no-lease",
+        help="Hold a per-workspace lease before applying a plan, so a second "
+             "supervisor stands by instead of doubling the fleet."),
+    json: bool = typer.Option(False, "--json"),
+):
+    """Start, scale and reap workers on demand (D25) — the scheduling half of §6.
+
+    Nothing else in the platform starts a worker, which is why scale-to-zero was
+    one-way: a key could idle out and then stay unserved. This watches claimable
+    queue depth and the worker registry, and launches through the configured
+    execution driver (`RYA_EXECUTION_DRIVER`, default `local`).
+
+    `--plan` is the honest way to see what it would do. The decision is a pure
+    function of (registry, depth, quota), so printing it is not a dry-run
+    approximation of the real thing — it *is* the real decision, without the
+    effects.
+    """
+    with guard(json):
+        from ..agents import project_root as mounted_project
+        from ..config import current_environment
+        from ..execution.drivers import require_untrusted_posture, resolve_driver
+        from ..execution.supervisor import Supervisor, SupervisorPolicy, supervise_workspaces
+        from ..store import open_worker_store
+
+        # Deliberately NOT `_project()`. A supervisor must run where there is no
+        # `rya.agent.yaml` at all — that is the D21 deployment, which learns its
+        # agents from published versions. `RYA_PROJECT` names a mounted tree when
+        # one exists, and only unpinned (working-tree) keys need it.
+        manifest_path = find_manifest()
+        root = mounted_project() or (manifest_path.parent if manifest_path else Path.cwd())
+        policy = SupervisorPolicy(
+            backlog_per_worker=backlog, max_replicas_per_key=max_replicas,
+            idle_exit_seconds=idle_exit,
+            prewarm_environments=tuple(e.strip() for e in (prewarm or "").split(",") if e.strip()),
+            require_lease=lease,
+        )
+        # The launch gate, all three conditions, and with `verify=True` — this is the
+        # one place worth paying a container start for. `start_worker` runs the same
+        # check on every worker but only against the *declaration*, because probing
+        # per scale-up would cost a sandbox start per replica. So the split is: the
+        # supervisor proves the substrate once at boot, and every worker re-checks the
+        # cheap half so a hand-started one cannot slip past.
+        driver = require_untrusted_posture(resolve_driver(), verify=True)
+
+        if all_workspaces:
+            import os as _os
+
+            dsn = _os.environ.get("RYA_DATABASE_URL") or _os.environ.get("DATABASE_URL") or ""
+            if not dsn:
+                raise RyaError(
+                    "E_VALIDATION", "--all-workspaces needs a Postgres DSN.",
+                    hint="Set RYA_DATABASE_URL. Workspaces are a Postgres feature; "
+                         "the file store has exactly one.")
+            out = supervise_workspaces(admin_dsn=dsn, driver=driver, project_root=root,
+                                       environment=env or current_environment(),
+                                       policy=policy, scope=scope)
+            emit(json, {"workspaces": out},
+                 lambda: console.print(f"[green]✓[/green] ticked {len(out)} workspace(s)"))
+            return
+
+        # Defaulted, not left None: an unpinned item is scheduled onto whatever
+        # this environment promoted, and Phase 2 showed what an api and its workers
+        # disagreeing about the environment costs — every turn sits unclaimed.
+        environment = env or current_environment()
+        store = open_worker_store(root, workspace)
+        sup = Supervisor(store, driver, workspace=workspace, environment=environment,
+                         project_root=root, policy=policy, scope=scope)
+        if plan_only:
+            actions = [a.describe() for a in sup.plan()]
+            emit(json, {"driver": driver.describe(), "actions": actions},
+                 lambda: console.print(f"[green]✓[/green] {len(actions)} action(s) planned"
+                                       + ("" if actions else " — the fleet matches the work")))
+            return
+        if once:
+            emit(json, sup.tick(),
+                 lambda: console.print("[green]✓[/green] one tick applied"))
+            return
+        if not json:
+            console.print(f"[green]✓[/green] supervisor up on the [bold]{driver.name}[/bold] "
+                          f"driver (isolation: {driver.isolation}, scope: {sup.scope}) "
+                          f"— every {interval}s")
+        result = sup.run(max_ticks=max_ticks, tick_seconds=interval,
+                         on_tick=None if json else lambda t: (
+                             console.print(f"  {len(t['actions'])} action(s), "
+                                           f"{t['alive']} alive") if t["actions"] else None))
+        emit(json, result, lambda: None)
 
 
 @app.command()
@@ -1939,10 +2676,11 @@ def serve(host: str = typer.Option("127.0.0.1", "--host"), port: int = typer.Opt
         except ImportError:
             raise RyaError("E_RUNTIME", "API extra not installed.", hint="Install with: pip install 'rya[api]'")
         import os
-        root, manifest = _project()
+        root, manifest = _project_optional()
         auth_on = bool(os.environ.get("RYA_TOKEN"))
         sig_on = bool(os.environ.get("RYA_WEBHOOK_SECRET"))
-        info = {"ok": True, "serving": f"http://{host}:{port}", "agent": manifest.name,
+        info = {"ok": True, "serving": f"http://{host}:{port}",
+                "agent": manifest.name if manifest else None,
                 "authEnabled": auth_on, "webhookSignature": sig_on,
                 "webhook": f"http://{host}:{port}/inbound"}
         info["console"] = f"http://{host}:{port}/"

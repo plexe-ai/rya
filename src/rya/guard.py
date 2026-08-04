@@ -1,12 +1,34 @@
-"""Action Guard — the agent's egress firewall, grounding gate and id-secrecy scrub.
+"""Action Guard — egress **policy**, grounding gate and id-secrecy scrub.
 
 Every outbound request the runtime makes (HTTP tools, model calls, channel
 sends) is checked here *before the bytes leave the process*:
 
     SSRF blocklist  →  static deny rules  →  static allow rules  →  default
 
-A blocked request raises ``E_EGRESS_BLOCKED`` and never goes out — real
-network-level blocking, not advice.
+A blocked request raises ``E_EGRESS_BLOCKED`` and never goes out.
+
+**What this is and is not, after D24.** This module used to describe itself as "an
+egress firewall … real network-level blocking, not advice", and that was a fair
+description of a *cooperative* runtime and an overclaim about a hostile one. An
+in-process check is bypassed by any code that does not call it, so against a tenant
+that imports ``urllib`` directly it enforces nothing. MULTITENANT_DESIGN D24 moves
+enforcement to the network layer and keeps this module as the **policy, audit and
+governance** surface — which is the role it was always genuinely good at:
+attributable verdicts, a reviewable allowlist, a version and an etag on every
+decision, and grounding/secrecy checks the network cannot do at all.
+
+So the division after D24 is:
+
+======================  ==================================================
+this module             *what is allowed*, and the audit record of asking
+:mod:`rya.egress`       *what can physically leave*, and the reconciliation
+======================  ==================================================
+
+Both verdicts exist because they fail differently, and a **divergence** between
+them is itself a signal — a stale sandbox network snapshot against a live policy is
+the ordinary cause, and :func:`rya.egress.EgressService.divergences` is what makes
+it alertable rather than invisible. Keeping the old "firewall" wording here would
+have been exactly the kind of claim MULTITENANT_DESIGN §9 risk 4 exists to prevent.
 
 Rule kinds: ``prefix`` (url startswith), ``glob`` (fnmatch), ``exact``. ``deny``
 always beats ``allow``. ``default`` is ``deny`` | ``allow``.
@@ -76,9 +98,48 @@ from .errors import RyaError
 
 GUARD_FILE = "rya.guard.yaml"
 
-# The single store key the whole guard lives under. One key, one current version;
+# The store key one agent's guard lives under. One key, one current version;
 # history is the store's append-only policy log, not our problem.
+#
+# The bare literal is the UNQUALIFIED key, which is now only correct for a
+# deployment serving one agent. `rya_policy` is keyed `(workspace_id, key)`, so
+# before D28 two agents in one workspace silently shared a guard policy — and a
+# guard is authored per project (`rya.guard.yaml` ships inside the bundle), so
+# they cannot mean the same thing. Use `policy_key(agent)`.
 POLICY_KEY = "guard"
+
+
+def policy_key(agent: str | None = None) -> str:
+    """The `rya_policy` key holding ``agent``'s guard policy (D28).
+
+    ``None`` keeps the unqualified key, which is what a single-agent deployment
+    wrote before this change and what `migrate_policy_keys` reads when it moves
+    those rows. New writes always name an agent.
+    """
+    return f"{POLICY_KEY}:{agent}" if agent else POLICY_KEY
+
+
+def store_key_for(store, agent: str | None = None) -> str:
+    """Which key holds the policy ``agent`` is actually governed by (D28).
+
+    The agent-qualified key once one has been written, else the pre-D28
+    unqualified row. Read-time fallback rather than a rename at upgrade, for the
+    same reason ``gates.gate_policy`` uses one: a rename can only be right where
+    the workspace has exactly one agent, which is precisely where the fallback is
+    already right — and a guard that quietly stopped enforcing at upgrade is a
+    security regression, not an inconvenience.
+
+    A read FAILURE returns the qualified key rather than falling back, so an
+    unreachable store resolves to the agent's own (fail-closed) policy instead of
+    a sibling's.
+    """
+    if agent:
+        try:
+            if store.policy_get(policy_key(agent)) is not None:
+                return policy_key(agent)
+        except Exception:
+            return policy_key(agent)
+    return POLICY_KEY
 
 SOURCE_NONE = "none"
 SOURCE_STORE = "store"
@@ -342,7 +403,8 @@ def load_policy(path: str | None = None, source: PolicySource = None) -> dict | 
 
 
 def save_policy(policy: dict, path: str | None = None, *,
-                source: PolicySource = None, actor: str | None = None) -> dict:
+                source: PolicySource = None, actor: str | None = None,
+                key: str = POLICY_KEY) -> dict:
     """Write a new policy version and return its **audit record**.
 
     The record is the JSON-able envelope handed to ``policy_set(POLICY_KEY, …)``
@@ -360,16 +422,16 @@ def save_policy(policy: dict, path: str | None = None, *,
     store = target if (target is not None and not isinstance(target, (str, Path, dict))
                        and hasattr(target, "policy_set")) else None
     if store is not None:
-        prev = resolve_policy(store)
+        prev = resolve_policy(store, key=key)
         record = _audit_record(prev.policy if prev.enforced else None, prev.version if prev.enforced else None,
-                              new, actor)
+                              new, actor, key=key)
         # `actor` is advisory: a store that predates it still gets the actor inside
         # the record. Sniffed rather than try/except TypeError so a TypeError raised
         # *inside* policy_set can never cause a duplicate write.
         if _accepts_actor(store.policy_set):
-            store.policy_set(POLICY_KEY, record, actor=actor)
+            store.policy_set(key, record, actor=actor)
         else:
-            store.policy_set(POLICY_KEY, record)
+            store.policy_set(key, record)
         return record
 
     # LEGACY file fallback (dev). Still returns the same audit record so the CLI
@@ -377,7 +439,7 @@ def save_policy(policy: dict, path: str | None = None, *,
     p = Path(target) if isinstance(target, (str, Path)) else _legacy_ambient_path()
     before = _from_file(p)
     record = _audit_record(before.policy if before.enforced else None,
-                           before.version if before.enforced else None, new, actor)
+                           before.version if before.enforced else None, new, actor, key=key)
     p.write_text(yaml.safe_dump(policy, sort_keys=False))
     record["path"] = str(p)
     return record
@@ -399,14 +461,14 @@ def _rule_id(rule: dict) -> str:
 
 
 def _audit_record(before: dict | None, before_version: str | None,
-                  after: dict, actor: str | None) -> dict:
+                  after: dict, actor: str | None, *, key: str = POLICY_KEY) -> dict:
     """{version, actor, changedAt, diff} + the new policy. Plain JSON-able dict."""
     old_rules = {_rule_id(r) for r in ((before or {}).get("rules") or [])}
     new_rules = {_rule_id(r) for r in (after.get("rules") or [])}
     changed = sorted(k for k in set(after) | set(before or {})
                      if k != "rules" and (before or {}).get(k) != after.get(k))
     return {
-        "key": POLICY_KEY,
+        "key": key,
         "version": _etag(after),
         "previousVersion": before_version,
         "actor": actor,

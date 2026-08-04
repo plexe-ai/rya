@@ -190,6 +190,19 @@ class _Guard:
     def check_secrecy(self, text: str) -> dict: ...
     def scrub(self, obj: Any) -> Any: ...
 
+class _Egress:
+    """The sanctioned outbound request (MULTITENANT D24).
+
+    New in Phase 4, and the replacement for the "may do real IO" half of the
+    leaf-tool rule: a sandboxed handler has no network route, so a raw `urllib`
+    request fails at connect(). This one is mediated — guard verdict, network
+    verdict, audit record — and journaled, so a replay after an approval pause
+    returns the memoized response rather than re-issuing the call.
+    """
+
+    def fetch(self, url: str, *, method: str = ..., headers: Optional[dict] = ...,
+              body: Any = ..., timeout: float = ...) -> dict: ...
+
 class RuntimeContext:
     """What a handler is handed. Constructed by the platform, never by a client.
 
@@ -228,5 +241,6 @@ class RuntimeContext:
     secrets: _Secrets
     events: _Events
     guard: _Guard
+    egress: _Egress
 
     def emit_ui(self, component: str, data: Optional[dict] = ...) -> dict: ...

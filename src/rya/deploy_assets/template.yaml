@@ -60,6 +60,19 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Admin token gating self-serve project provisioning (RYA_ADMIN_TOKEN).
+  RyaAppDbPassword:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >-
+      Password for the non-superuser rya_app / rya_worker Postgres roles
+      (RYA_APP_DB_PASSWORD). SET THIS for a multi-tenant deployment: it is what
+      lets the worker task be given a least-privilege DSN instead of the RDS
+      master credential. Superusers bypass row-level security, so a worker
+      holding the master DSN makes every RLS policy decorative for exactly the
+      process that imports tenant code. Left empty, the worker falls back to
+      deriving the rya_worker role from the master DSN at runtime, which still
+      leaves the master DSN in its environment.
   RyaEnvironment:
     Type: String
     Default: prod
@@ -90,6 +103,9 @@ Conditions:
   LangfuseEnabled: !Not [!Equals [!Ref LangfuseHost, ""]]
   UseAnthropicKey: !Equals [!Ref AnthropicKeyEnabled, "true"]
   UseMultiAZ: !Equals [!Ref DBMultiAZ, "true"]
+  # #5: only when an explicit role password exists can the worker be handed a DSN
+  # that is not the RDS master credential.
+  WorkerLeastPrivilegeDsn: !Not [!Equals [!Ref RyaAppDbPassword, ""]]
 
 Resources:
 
@@ -132,7 +148,7 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}/app"
       Description: Application secrets — encryption key, admin token (set at deploy).
-      SecretString: !Sub '{"RYA_JWT_SECRET":"jwks-mode-unused","RYA_SECRET_KEY":"${RyaSecretKey}","RYA_ADMIN_TOKEN":"${RyaAdminToken}"}'
+      SecretString: !Sub '{"RYA_JWT_SECRET":"jwks-mode-unused","RYA_SECRET_KEY":"${RyaSecretKey}","RYA_ADMIN_TOKEN":"${RyaAdminToken}","RYA_APP_DB_PASSWORD":"${RyaAppDbPassword}"}'
 
   # ---- Networking (security groups) --------------------------------------
   AlbSecurityGroup:
@@ -354,6 +370,12 @@ Resources:
               ValueFrom: !Sub "${AppSecret}:RYA_SECRET_KEY::"
             - Name: RYA_ADMIN_TOKEN
               ValueFrom: !Sub "${AppSecret}:RYA_ADMIN_TOKEN::"
+            # The api runs `tenancy.setup()`, which CREATEs the rya_app and
+            # rya_worker roles. It must use the same password the worker task
+            # connects with, or role-create and connect disagree and the worker
+            # cannot start.
+            - Name: RYA_APP_DB_PASSWORD
+              ValueFrom: !Sub "${AppSecret}:RYA_APP_DB_PASSWORD::"
             # Model key: added to the AppSecret OUT of band (operator step, see
             # README "model keys populated post-deploy") - CloudFormation never
             # sees the value. The task fails to start if the JSON key is absent,
@@ -481,14 +503,41 @@ Resources:
               - LangfuseEnabled
               - { Name: LANGFUSE_SECRET_KEY, Value: !Ref LangfuseSecretKey }
               - !Ref "AWS::NoValue"
+            # #5 / PLATFORM_DESIGN §8: the EXECUTION plane gets the least-
+            # privileged DSN available, and — when RyaAppDbPassword is set — never
+            # receives the RDS master credential at all. `rya_worker` is subject
+            # to RLS (superusers are not) and holds SELECT-only on the governance
+            # tables, so worker-side code cannot write policy, flip an environment
+            # pointer or forge a version.
+            #
+            # Both names carry the same value on purpose: RYA_WORKER_DATABASE_URL
+            # is what `open_worker_store` prefers, and overwriting
+            # RYA_DATABASE_URL is what removes the master credential from this
+            # task's environment rather than merely leaving it unused.
             - Name: RYA_DATABASE_URL
-              Value: !Sub
-                - "postgresql://${DBUsername}:${pw}@${Endpoint}:5432/rya"
-                - pw: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
-                  Endpoint: !GetAtt Database.Endpoint.Address
+              Value: !If
+                - WorkerLeastPrivilegeDsn
+                - !Sub
+                  - "postgresql://rya_worker:${pw}@${Endpoint}:5432/rya"
+                  - pw: !Sub "{{resolve:secretsmanager:${AppSecret}:SecretString:RYA_APP_DB_PASSWORD}}"
+                    Endpoint: !GetAtt Database.Endpoint.Address
+                - !Sub
+                  - "postgresql://${DBUsername}:${pw}@${Endpoint}:5432/rya"
+                  - pw: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+                    Endpoint: !GetAtt Database.Endpoint.Address
+            - !If
+              - WorkerLeastPrivilegeDsn
+              - Name: RYA_WORKER_DATABASE_URL
+                Value: !Sub
+                  - "postgresql://rya_worker:${pw}@${Endpoint}:5432/rya"
+                  - pw: !Sub "{{resolve:secretsmanager:${AppSecret}:SecretString:RYA_APP_DB_PASSWORD}}"
+                    Endpoint: !GetAtt Database.Endpoint.Address
+              - !Ref "AWS::NoValue"
           Secrets:
             - Name: RYA_SECRET_KEY
               ValueFrom: !Sub "${AppSecret}:RYA_SECRET_KEY::"
+            - Name: RYA_APP_DB_PASSWORD
+              ValueFrom: !Sub "${AppSecret}:RYA_APP_DB_PASSWORD::"
             - !If
               - UseAnthropicKey
               - Name: ANTHROPIC_API_KEY

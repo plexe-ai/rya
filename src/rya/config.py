@@ -77,6 +77,26 @@ def legacy_env() -> Mapping[str, str]:
     return os.environ
 
 
+def multitenant_enabled() -> bool:
+    """Whether workspace isolation is active: ``RYA_MULTITENANT=1`` **and** Postgres.
+
+    Both halves are required because tenancy is a Postgres feature — RLS, the
+    ``rya_app``/``rya_worker`` roles and the per-workspace policies have no
+    equivalent on ``FileStore``, so the flag alone would advertise an isolation
+    that is not there.
+
+    Lives here rather than in ``api/app.py`` (where it began) so the execution
+    plane can ask the same question: `rya worker` must know whether to connect as
+    ``rya_worker`` and scope to its ``--workspace``, and importing the API module
+    to find out would drag FastAPI into every worker process. ``app.py``
+    re-exports this name, so the control plane is unchanged.
+    """
+    import os
+
+    has_pg = bool(os.environ.get("RYA_DATABASE_URL") or os.environ.get("DATABASE_URL"))
+    return os.environ.get("RYA_MULTITENANT") == "1" and has_pg
+
+
 # The environment name every process in one deployment agrees on. D11 deleted
 # `environment:` from the manifest because one content-hashed bundle is promoted
 # BETWEEN environments — so the name is a property of the deployment, not of the

@@ -537,20 +537,62 @@ def default_archive_root(project_root: Path) -> Path:
     return Path(project_root) / ".rya" / "bundles"
 
 
-def bundle_archive_path(bundle_hash: str, archive_root: Path) -> Path:
-    """``<archive_root>/<hash[:2]>/<hash>.tar.gz`` — two-level fan-out so a
-    workspace with thousands of versions does not get one giant directory."""
-    return Path(archive_root) / bundle_hash[:2] / f"{bundle_hash}.tar.gz"
+# The single-tenant sentinel. `PostgresStore` defaults `workspace_id` to this and
+# `FileStore` has no workspace at all, so "default" and "" are two spellings of
+# "no tenant" — real workspaces are `ws_*`, minted by `tenancy`. Both normalise to
+# the un-namespaced address, which keeps every single-tenant deployment on
+# exactly the pre-D20 layout instead of migrating it into a namespace of one.
+UNTENANTED = "default"
+
+# Opt-in read fallback to the pre-D20 un-namespaced address, for a deployment
+# that was ALREADY multi-tenant before D20. Its archives are flat — bundle keys
+# had no workspace dimension at all then — so its named workspaces would
+# otherwise 404 on every archive after the upgrade.
+#
+# Default OFF, because the fallback lets one tenant read an archive that another
+# may have written. That exposure is not created by the fallback (a flat
+# namespace was already shared) but it is not closed by the upgrade either, so it
+# has to be something an operator turns on knowingly and turns off once the
+# archives are re-published under their namespaces.
+S3_LEGACY_FALLBACK_ENV = "RYA_BUNDLES_LEGACY_FALLBACK"
 
 
-def bundle_archive_key(bundle_hash: str, prefix: str = DEFAULT_S3_PREFIX) -> str:
-    """``<prefix>/<hash>.tar.gz`` — the object-store address of an archive.
+def _normalize_workspace(workspace: str) -> str:
+    ws = (workspace or "").strip("/")
+    return "" if ws == UNTENANTED else ws
 
-    Flat rather than fanned out like the local layout: a bucket has no directory
-    to get slow, and a flat key makes ``s3://bucket/bundles/<hash>.tar.gz``
-    something an operator can paste into `aws s3` from a version record.
+
+def bundle_archive_path(bundle_hash: str, archive_root: Path,
+                        workspace: str = "") -> Path:
+    """``<archive_root>/[<workspace>/]<hash[:2]>/<hash>.tar.gz`` — two-level
+    fan-out so a workspace with thousands of versions does not get one giant
+    directory, under a per-tenant namespace (D20)."""
+    base = Path(archive_root)
+    ws = _normalize_workspace(workspace)
+    if ws:
+        base = base / ws
+    return base / bundle_hash[:2] / f"{bundle_hash}.tar.gz"
+
+
+def bundle_archive_key(bundle_hash: str, prefix: str = DEFAULT_S3_PREFIX,
+                       workspace: str = "") -> str:
+    """``<prefix>/[<workspace>/]<hash>.tar.gz`` — the object-store address.
+
+    Flat within the namespace rather than fanned out like the local layout: a
+    bucket has no directory to get slow, and a flat key makes
+    ``s3://bucket/bundles/<ws>/<hash>.tar.gz`` something an operator can paste
+    into `aws s3` from a version record.
+
+    **The workspace segment is what makes per-tenant credential scoping
+    possible** (D20). An IAM policy, bucket policy or MinIO user can be scoped to
+    ``<prefix>/<workspace>/*`` — but only because that prefix exists. While keys
+    were flat and content-addressed there was no prefix to grant on, so every
+    holder of the bucket credential could read every tenant's archive. Content
+    addressing justifies *dedupe*; it does not justify a shared read namespace
+    for code we now treat as hostile (D17).
     """
-    return f"{prefix.strip('/')}/{bundle_hash}.tar.gz" if prefix.strip("/") else f"{bundle_hash}.tar.gz"
+    parts = [prefix.strip("/"), _normalize_workspace(workspace), f"{bundle_hash}.tar.gz"]
+    return "/".join(p for p in parts if p)
 
 
 @dataclass(frozen=True)
@@ -568,16 +610,39 @@ class BundleStore:
     prefix: str = DEFAULT_S3_PREFIX
     region: str = ""             # "" = boto3's own resolution chain
     endpoint: str = ""           # "" = real AWS; set for MinIO/Ceph/R2
+    workspace: str = ""          # D20: the tenant namespace; "" = un-namespaced
+    legacy_fallback: bool = False  # read pre-D20 flat keys too (opt-in migration)
 
     @property
     def is_local(self) -> bool:
         return self.kind == "local"
 
+    def read_workspaces(self) -> tuple[str, ...]:
+        """Namespaces to look in, in order. **Writes only ever go to the first.**
+
+        A single-tenant store normalises to the un-namespaced address, so it has
+        exactly one entry and pays no extra lookup — its layout is unchanged by
+        D20 and there is nothing to migrate.
+
+        A named workspace gets a second entry only when ``legacy_fallback`` is
+        set, which is the opt-in upgrade path for a deployment that was already
+        multi-tenant before D20. Off by default: reading a flat key from a named
+        tenant is a cross-tenant read, and it must be a decision rather than a
+        silent default.
+        """
+        ws = _normalize_workspace(self.workspace)
+        if not ws:
+            return ("",)
+        return (ws, "") if self.legacy_fallback else (ws,)
+
     def describe(self) -> str:
         """A location an operator can act on — it lands in error messages."""
+        ws = _normalize_workspace(self.workspace)
         if self.is_local:
-            return str(self.root)
+            return str(Path(self.root) / ws) if ws and self.root else str(self.root)
         base = f"s3://{self.bucket}/{self.prefix.strip('/')}"
+        if ws:
+            base = f"{base}/{ws}"
         # Appended only when set: an operator debugging a real-AWS deployment
         # should not have to read past an empty "@".
         return f"{base} @ {self.endpoint}" if self.endpoint else base
@@ -588,6 +653,7 @@ def resolve_bundle_store(
     *,
     env: Mapping[str, str] | None = None,
     root: Path | None = None,
+    workspace: str = "",
 ) -> BundleStore:
     """Resolve the declared bundle store, defaulting to the local directory.
 
@@ -598,13 +664,22 @@ def resolve_bundle_store(
     An explicit ``root`` wins over a declared bucket: a caller that names a
     directory has declared a local store, and silently uploading to S3 instead
     would be exactly the ambient surprise D8 exists to stop.
+
+    ``workspace`` is the D20 tenant namespace. It is a parameter rather than
+    something read from the environment on purpose: the workspace is a property
+    of *whose request this is*, not of how the deployment is configured, and a
+    store resolved from ambient state could not distinguish two tenants inside
+    one process. Callers pass the workspace their store is already scoped to.
+    Left empty, addressing is un-namespaced and identical to pre-D20 behaviour.
     """
-    if root is not None:
-        return BundleStore(kind="local", root=Path(root))
     if env is None:
         from .config import legacy_env
 
         env = legacy_env()
+    fallback = (env.get(S3_LEGACY_FALLBACK_ENV) or "").strip().lower() in ("1", "true", "yes")
+    if root is not None:
+        return BundleStore(kind="local", root=Path(root), workspace=workspace,
+                           legacy_fallback=fallback)
     bucket = (env.get(S3_BUCKET_ENV) or "").strip()
     if bucket:
         return BundleStore(
@@ -613,6 +688,8 @@ def resolve_bundle_store(
             prefix=(env.get(S3_PREFIX_ENV) or DEFAULT_S3_PREFIX).strip(),
             region=(env.get(S3_REGION_ENV) or "").strip(),
             endpoint=(env.get(S3_ENDPOINT_ENV) or "").strip(),
+            workspace=workspace,
+            legacy_fallback=fallback,
         )
     if project_root is None:
         raise RyaError(
@@ -622,7 +699,18 @@ def resolve_bundle_store(
             hint=f"Pass an archive root, or set {S3_BUCKET_ENV} to the bucket "
             "holding this workspace's bundle archives.",
         )
-    return BundleStore(kind="local", root=default_archive_root(project_root))
+    return BundleStore(kind="local", root=default_archive_root(project_root),
+                       workspace=workspace)
+
+
+def workspace_of(store) -> str:
+    """The workspace a state store is scoped to, for use as a bundle namespace.
+
+    ``FileStore`` has no workspace at all (it is the single-tenant local arm), so
+    this returns ``""`` and addressing stays un-namespaced — which is what keeps
+    `rya dev` and the test suite on the pre-D20 layout.
+    """
+    return str(getattr(store, "workspace_id", "") or "")
 
 
 def _as_store(archive_root: BundleStore | Path | str) -> BundleStore:
@@ -711,13 +799,29 @@ def _store_unreachable(store: BundleStore, action: str, exc: Exception) -> RyaEr
 # The object-store seam. These three functions are the ONLY places bundle bytes
 # are read, written or probed for; every arm is a branch here and nothing else in
 # this module — or in worker.py — learns which store it is talking to.
+def _local_root(store: BundleStore) -> Path:
+    """A local store's archive root, refusing the impossible case loudly.
+
+    ``BundleStore.root`` is Optional because the s3 arm has none; every caller
+    below has already branched on ``is_local``, so a None here is a construction
+    bug rather than a configuration one.
+    """
+    if store.root is None:  # pragma: no cover - defensive
+        raise RyaError("E_BUNDLE_STORE", "Local bundle store has no archive root.")
+    return Path(store.root)
+
+
 def _put_archive(bundle_hash: str, data: bytes, store: BundleStore) -> Path | str:
+    # Writes go to the store's OWN namespace only — never to a fallback. A write
+    # that could land outside the tenant prefix would defeat the point of having
+    # one (D20).
+    write_ws = store.read_workspaces()[0]
     if store.is_local:
-        path = bundle_archive_path(bundle_hash, store.root)
+        path = bundle_archive_path(bundle_hash, _local_root(store), write_ws)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         return path
-    key = bundle_archive_key(bundle_hash, store.prefix)
+    key = bundle_archive_key(bundle_hash, store.prefix, write_ws)
     client = _s3_client(store)
     try:
         client.put_object(Bucket=store.bucket, Key=key, Body=data,
@@ -731,16 +835,21 @@ def _get_archive(bundle_hash: str, store: BundleStore) -> bytes | None:
     """The archive's bytes, or None when the store is reachable and has no such
     object. A store that cannot be reached raises instead of returning None."""
     if store.is_local:
-        path = bundle_archive_path(bundle_hash, store.root)
-        return path.read_bytes() if path.is_file() else None
-    key = bundle_archive_key(bundle_hash, store.prefix)
+        for ws in store.read_workspaces():
+            path = bundle_archive_path(bundle_hash, _local_root(store), ws)
+            if path.is_file():
+                return path.read_bytes()
+        return None
     client = _s3_client(store)
-    try:
-        return client.get_object(Bucket=store.bucket, Key=key)["Body"].read()
-    except Exception as exc:
-        if _s3_error_code(exc) in _S3_ABSENT_CODES:
-            return None
-        raise _store_unreachable(store, "read from", exc) from exc
+    for ws in store.read_workspaces():
+        key = bundle_archive_key(bundle_hash, store.prefix, ws)
+        try:
+            return client.get_object(Bucket=store.bucket, Key=key)["Body"].read()
+        except Exception as exc:
+            if _s3_error_code(exc) in _S3_ABSENT_CODES:
+                continue
+            raise _store_unreachable(store, "read from", exc) from exc
+    return None
 
 
 def _archive_exists(bundle_hash: str, store: BundleStore) -> bool:
@@ -750,17 +859,126 @@ def _archive_exists(bundle_hash: str, store: BundleStore) -> bool:
     it must not pull a whole archive body across the network to discover there is
     nothing to do.
     """
+    return _find_archive_workspace(bundle_hash, store) is not None
+
+
+def _find_archive_workspace(bundle_hash: str, store: BundleStore) -> str | None:
+    """Which namespace holds this archive, or None if no reachable one does.
+
+    Returns the *workspace* rather than a bool so callers can report the address
+    they actually found. Under the legacy fallback the archive may live at the
+    un-namespaced address, and reporting the namespaced one — where nothing is —
+    would hand an operator a path that 404s.
+    """
     if store.is_local:
-        return bundle_archive_path(bundle_hash, store.root).is_file()
-    key = bundle_archive_key(bundle_hash, store.prefix)
+        for ws in store.read_workspaces():
+            if bundle_archive_path(bundle_hash, _local_root(store), ws).is_file():
+                return ws
+        return None
+    client = _s3_client(store)
+    for ws in store.read_workspaces():
+        key = bundle_archive_key(bundle_hash, store.prefix, ws)
+        try:
+            client.head_object(Bucket=store.bucket, Key=key)
+            return ws
+        except Exception as exc:
+            if _s3_error_code(exc) in _S3_ABSENT_CODES:
+                continue
+            raise _store_unreachable(store, "read from", exc) from exc
+    return None
+
+
+def list_workspace_objects(archive_root: BundleStore | Path | str,
+                           workspace: str) -> list[str]:
+    """Every archive under one tenant's namespace (D20), for D31's purge.
+
+    **This function is why D31 named #7 a prerequisite.** Before D20 the key was flat
+    and content-addressed with no workspace dimension, so "which archives belong to
+    this tenant" had no answer that did not involve reading every version row and
+    hoping none was missing. With the workspace in the key it is a prefix listing.
+
+    Deliberately does NOT honour ``legacy_fallback``. That flag lets a *read* fall
+    through to the un-namespaced address, which is right for serving a bundle written
+    before the migration and catastrophic here: the flat namespace is shared, so a
+    purge that followed the fallback would delete other tenants' archives. A purge
+    addresses one namespace, and an un-namespaced store has no tenant to purge.
+    """
+    store = _as_store(archive_root)
+    ws = _normalize_workspace(workspace)
+    if not ws:
+        raise RyaError(
+            "E_BUNDLE_STORE",
+            "Refusing to enumerate bundle objects for an un-namespaced store.",
+            hint="An empty workspace addresses the SHARED namespace, so deleting what "
+                 "this returned would delete every tenant's archives. A purge needs "
+                 "workspace-prefixed keys (D20/#7), which is why D31 lists that as a "
+                 "prerequisite.")
+    if store.is_local:
+        root = _local_root(store) / ws
+        if not root.is_dir():
+            return []
+        return sorted(str(p.relative_to(_local_root(store)))
+                      for p in root.rglob("*.tar.gz") if p.is_file())
+    client = _s3_client(store)
+    prefix = f"{store.prefix.strip('/')}/{ws}/"
+    keys: list[str] = []
+    token = None
+    try:
+        while True:
+            kw = {"Bucket": store.bucket, "Prefix": prefix}
+            if token:
+                kw["ContinuationToken"] = token
+            page = client.list_objects_v2(**kw)
+            keys.extend(obj["Key"] for obj in (page.get("Contents") or []))
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+    except Exception as exc:
+        raise _store_unreachable(store, "list", exc) from exc
+    return sorted(keys)
+
+
+def delete_workspace_objects(archive_root: BundleStore | Path | str,
+                             workspace: str) -> int:
+    """Delete every archive under one tenant's namespace. Returns the count.
+
+    Enumerates through :func:`list_workspace_objects`, so the same refusal protects it:
+    an un-namespaced store cannot be purged, because there is no tenant to purge.
+    """
+    store = _as_store(archive_root)
+    keys = list_workspace_objects(store, workspace)
+    if not keys:
+        return 0
+    if store.is_local:
+        root = _local_root(store)
+        for key in keys:
+            try:
+                (root / key).unlink()
+            except OSError:  # pragma: no cover - already gone is success here
+                pass
+        # Prune the now-empty fan-out directories, so a purged workspace leaves no
+        # directory tree behind to suggest it still exists.
+        ws_root = root / _normalize_workspace(workspace)
+        for path in sorted(ws_root.rglob("*"), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            ws_root.rmdir()
+        except OSError:  # pragma: no cover
+            pass
+        return len(keys)
     client = _s3_client(store)
     try:
-        client.head_object(Bucket=store.bucket, Key=key)
-        return True
+        # 1000 per call is the API's limit, so batch rather than loop per key.
+        for start in range(0, len(keys), 1000):
+            batch = [{"Key": k} for k in keys[start:start + 1000]]
+            client.delete_objects(Bucket=store.bucket, Delete={"Objects": batch})
     except Exception as exc:
-        if _s3_error_code(exc) in _S3_ABSENT_CODES:
-            return False
-        raise _store_unreachable(store, "read from", exc) from exc
+        raise _store_unreachable(store, "delete from", exc) from exc
+    return len(keys)
 
 
 def store_bundle(bundle: Bundle, archive_root: BundleStore | Path) -> Path | str:
@@ -775,10 +993,13 @@ def store_bundle(bundle: Bundle, archive_root: BundleStore | Path) -> Path | str
     idempotency on ``(agent, bundleHash)``).
     """
     store = _as_store(archive_root)
-    if _archive_exists(bundle.hash, store):
+    found = _find_archive_workspace(bundle.hash, store)
+    if found is not None:
+        # Report where it actually is, which under the legacy fallback may be the
+        # un-namespaced address rather than this store's own namespace.
         if store.is_local:
-            return bundle_archive_path(bundle.hash, store.root)
-        return f"s3://{store.bucket}/{bundle_archive_key(bundle.hash, store.prefix)}"
+            return bundle_archive_path(bundle.hash, _local_root(store), found)
+        return f"s3://{store.bucket}/{bundle_archive_key(bundle.hash, store.prefix, found)}"
     with tempfile.TemporaryDirectory(prefix="rya-pack-") as td:
         archive = pack(bundle, Path(td) / f"{bundle.hash}.tar.gz")
         data = archive.read_bytes()

@@ -46,7 +46,41 @@ from typing import Any, Mapping, Optional
 from .errors import RyaError
 
 # The privileged policy key holding gate configuration (see store.policy_set).
+#
+# The bare literal is the UNQUALIFIED key, correct only for a deployment serving
+# one agent. `rya_policy` is keyed `(workspace_id, key)`, so before D28 two agents
+# in one workspace shared one promotion gate — and "prod requires evals" is a
+# statement about an agent's release process, not about a workspace.
 POLICY_KEY = "promotion"
+
+
+def policy_key(agent: Optional[str] = None) -> str:
+    """The `rya_policy` key holding ``agent``'s promotion gate (D28)."""
+    return f"{POLICY_KEY}:{agent}" if agent else POLICY_KEY
+
+
+def gate_policy(store, agent: Optional[str]) -> Any:
+    """``agent``'s gate policy, falling back to the pre-D28 unqualified row.
+
+    Read-time fallback rather than a one-shot rename at upgrade, deliberately.
+    A rename has to guess which agent an existing shared row belonged to, and it
+    can only be right where the workspace has exactly one — precisely the case
+    where the fallback is already correct. Where it has two, a rename would
+    silently hand one agent's gate to whichever name sorted first and leave the
+    other ungated, which for a promotion gate is a governance regression rather
+    than an inconvenience.
+
+    So the legacy row keeps enforcing for every agent that has not been given its
+    own, and the first qualified write for an agent takes over for that agent
+    alone. `None` (not `{}`) is the miss: an operator who deliberately cleared a
+    gate must not have the legacy one resurrected under them.
+    """
+    if agent:
+        own = store.policy_get(policy_key(agent))
+        if own is not None:
+            return own
+    return store.policy_get(POLICY_KEY) or {}
+
 
 # Attestation kinds. Kept as constants because they are matched on read.
 ATTEST_READINESS = "readiness"
@@ -166,7 +200,7 @@ def _coerce(spec: Mapping[str, Any], environment: str, source: str) -> Promotion
     return PromotionGate(environment=environment, source=source, **kwargs)
 
 
-def resolve_gate(store, environment: str) -> PromotionGate:
+def resolve_gate(store, environment: str, agent: Optional[str] = None) -> PromotionGate:
     """The gate for ``environment``. Never ``None`` — an unconfigured platform
     resolves to an unenforced gate.
 
@@ -179,7 +213,7 @@ def resolve_gate(store, environment: str) -> PromotionGate:
     "readiness everywhere, evals additionally on prod" is expressible without
     restating the common requirements per environment.
     """
-    policy = store.policy_get(POLICY_KEY) or {}
+    policy = gate_policy(store, agent)
     if not isinstance(policy, Mapping):
         # Fail closed: privileged state we cannot parse is not "no requirements".
         raise RyaError(
@@ -201,7 +235,8 @@ def resolve_gate(store, environment: str) -> PromotionGate:
     return _coerce(merged, environment, source)
 
 
-def set_gate(store, policy: Mapping[str, Any] | None, *, actor: Optional[str] = None) -> dict:
+def set_gate(store, policy: Mapping[str, Any] | None, *, actor: Optional[str] = None,
+             agent: Optional[str] = None) -> dict:
     """Write the gate policy, validating it first.
 
     Validation happens here rather than at read time so a bad gate is rejected by
@@ -209,7 +244,7 @@ def set_gate(store, policy: Mapping[str, Any] | None, *, actor: Optional[str] = 
     nobody can explain. Passing ``None`` clears the policy.
     """
     if policy is None:
-        return store.policy_set(POLICY_KEY, None, actor=actor)
+        return store.policy_set(policy_key(agent), None, actor=actor)
     if not isinstance(policy, Mapping):
         raise RyaError("E_VALIDATION", "The promotion policy must be an object.",
                        hint='Shape: {"default": {...}, "environments": {"prod": {...}}}')
@@ -222,7 +257,7 @@ def set_gate(store, policy: Mapping[str, Any] | None, *, actor: Optional[str] = 
     _coerce(policy.get("default") or {}, "default", "policy")
     for name, spec in (policy.get("environments") or {}).items():
         _coerce(spec or {}, str(name), "policy")
-    return store.policy_set(POLICY_KEY, dict(policy), actor=actor)
+    return store.policy_set(policy_key(agent), dict(policy), actor=actor)
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +332,10 @@ def check_promotion(store, *, version: Mapping[str, Any], environment: str,
     show an operator what is missing before they try. :func:`require_promotion`
     is the enforcing wrapper.
     """
-    gate = resolve_gate(store, environment)
+    # D28 Rule 1: the agent is DERIVED from the version row rather than passed.
+    # A caller that could name a different one would be able to evaluate the
+    # wrong agent's gate against this version.
+    gate = resolve_gate(store, environment, agent=version.get("agent"))
     version_id = version.get("id") or "?"
     checks: list[dict] = []
 

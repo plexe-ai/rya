@@ -17,13 +17,40 @@ Six limits, all optional, all meaning "unlimited" when unset:
 ``maxWorkers``          live registered worker processes (§6)
 ======================  =============================================
 
-**Where enforcement happens, and why it is admission-only.** A quota is checked
+**Where enforcement happens, and why it was admission-only.** A quota is checked
 when new work is *admitted* — a run starts, a job is enqueued, a worker
 registers. It is never checked mid-run. Killing a run halfway because its
 workspace crossed a token budget would leave a journal that can never replay to a
 terminal state, which is a durability bug traded for a billing nicety. Token and
 cost limits therefore throttle the *next* piece of work, and the overshoot is
 bounded by one run rather than by nothing.
+
+**D30 added one more enforcement point, and only one.** The broker checks
+``kind="model"`` before every inference call (MULTITENANT #21). The reasoning above
+still holds for *runs* and is why nothing else moved: what changed is who pays for an
+overrun. While the tenant held the provider key, an overshoot bounded by one run spent
+the tenant's money; with a pooled platform key it spends ours, so theft-of-service
+became a billing control rather than an abuse nicety. The distinction that keeps the
+durability argument intact is that a refused **model call** is an exception a handler
+can catch and a journal can record, whereas a killed **run** is a journal that can
+never reach a terminal state. ``kind="model"`` therefore selects only the two limits
+that map to money — ``maxTokensPerDay`` and ``maxCostUsdPerDay``, the ``any`` rows in
+``_LIMITS`` — and never the concurrency or queue-depth caps.
+
+**D31 sits in front of all of it.** ``require_admission`` refuses a *disabled*
+workspace before reading a quota at all, which is the enforcement half of
+``purge.disable``: revoking API keys stops new callers, and this is what stops the
+work already queued.
+
+**D29 sits beside it, one boundary up.** Every limit here is per *workspace*, which
+is the isolation boundary; an organization is the *billing* boundary and owns many
+workspaces, so a budget belongs to it. :func:`check_admission` therefore appends the
+org's violations to this workspace's own, read from a derived policy row that a
+privileged reconciler writes — see :mod:`rya.orgs` for why the aggregate is not
+computed here, and why the staleness that buys is the same trade §11.12 already made
+for token limits. Usage stays metered at ``workspace_id`` throughout: the org total
+is a sum of tenant rows, never a replacement for them, so "which workspace spent it"
+remains answerable.
 
 **Who may set a quota.** In a multi-tenant deployment, obviously not the tenant:
 a limit the limited party can raise is not a limit. The api routes that write this
@@ -248,7 +275,27 @@ def check_admission(store, *, kind: str = "run", usage: Optional[dict] = None,
         if current >= limit:
             violations.append({
                 "limit": attr, "label": label, "current": current, "max": limit,
+                "scope": "workspace",
             })
+    # D29: the org's budget, appended to this workspace's own verdict.
+    #
+    # Read from a *derived* policy row rather than computed here, and that is the whole
+    # design (see `rya.orgs`): summing an org's meter needs a connection that spans
+    # tenants, and putting one on every tenant's admission path would undo what Phase 4
+    # spent itself removing. The rollup is computed by a privileged reconciler and its
+    # verdict pushed down, so this stays a read of the caller's own row.
+    #
+    # Appended *after* the workspace violations so the more local reason is named first
+    # when both are exhausted: "you are over your own token cap" is actionable by the
+    # tenant, and "your organization is over its monthly budget" is not.
+    #
+    # Applied for every `kind`, including `worker` and `job`. An org over budget should
+    # not merely stop spending on inference — it should stop accepting work that will
+    # spend, and a queue that keeps filling behind an exhausted budget is a backlog
+    # somebody still has to pay for later.
+    from .orgs import org_violations
+
+    violations += org_violations(store)
     return QuotaVerdict(allowed=not violations, policy=policy,
                         violations=violations, usage=usage)
 
@@ -261,16 +308,35 @@ def require_admission(store, *, kind: str = "run", usage: Optional[dict] = None,
     exceeded" alone tells a caller nothing about whether to retry in a second or
     to go buy more capacity.
     """
+    # D31: a disabled workspace is refused before its quota is even read, and this is
+    # the hook rather than each of the four admission call sites, because "may this
+    # workspace do work at all" is the same question they were already asking here —
+    # and a fifth admission path added later would otherwise miss it. Ordered first
+    # because "this tenant is disabled" is a more useful refusal than "and it is also
+    # over its token budget".
+    from .purge import require_active
+
+    require_active(store)
     verdict = check_admission(store, kind=kind, usage=usage, now=now)
     if verdict.allowed:
         return verdict
     detail = "; ".join(f"{v['label']} {v['current']}/{v['max']}" for v in verdict.violations)
     daily = [v for v in verdict.violations if "Day" in v["limit"] or "today" in v["label"]]
+    org = [v for v in verdict.violations if v.get("scope") == "org"]
+    # Which *boundary* refused is the first thing the reader needs. A tenant told
+    # "workspace quota exhausted" while its own usage is near zero will go looking in
+    # the wrong place — the limit that stopped it belongs to its organization, which
+    # may have eleven other workspaces spending the budget (D29).
+    subject = ("Organization budget exhausted" if org and len(org) == len(verdict.violations)
+               else "Workspace quota exhausted")
     raise RyaError(
         "E_QUOTA_EXCEEDED",
-        f"Workspace quota exhausted, refusing to admit a new {kind}: {detail}.",
+        f"{subject}, refusing to admit a new {kind}: {detail}.",
         hint=("Daily limits reset at 00:00 UTC. " if daily else
               "In-flight work will free capacity; retry after it completes. ")
+        + ("An org budget is shared across every workspace the organization owns, and "
+           "is recomputed periodically — `rya orgs show <id>` names which workspace "
+           "spent it. " if org else "")
         + "Inspect with `rya quotas show --json`; raise the limit with `rya quotas set` "
         "(admin token required in a multi-tenant deployment).",
     )

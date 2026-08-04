@@ -110,7 +110,7 @@ the **real** provider seam.
 
 ## 4. The primitives (`ctx.*`)
 
-Seventeen primitives, all journaled:
+Eighteen primitives, all journaled:
 
 | Primitive | What it does |
 |---|---|
@@ -131,6 +131,7 @@ Seventeen primitives, all journaled:
 | `ctx.events` | Emit/consume events |
 | `ctx.files` | Uploaded files: `get`, `list`, `read`, `as_document` (feeds `ctx.knowledge`) |
 | `ctx.guard` | `check_grounding` (grounding gate), `scrub`/`check_secrecy` (id-secrecy) |
+| `ctx.egress` | `fetch(url, method, headers, body)` — the sanctioned outbound request. Mediated (guard verdict + network verdict + audit) and journaled, so a replay after an approval pause returns the memoized response. In a sandbox this is the only route out |
 
 ---
 
@@ -255,11 +256,14 @@ connect  connections           # scoped credentials (list | reseal | revoke)
 provision                      # stand up the full base infrastructure
 context                        # one-shot machine-readable snapshot (for coding agents)
 status logs                    # runtime state, structured logs for a run
-serve worker mcp token         # control plane / job worker / MCP server / operator token
+serve worker supervisor mcp    # control plane / job worker / the thing that STARTS workers / MCP
+template-host                  # the sandbox half of the D32 pair: warm interpreters, no credentials
+posture                        # which tenancy posture is in force, and what is unmet
+token                          # operator token
 agents events runs approvals   # drive the runtime
 tools models channels secrets
 schedules jobs skills
-workspaces keys cloud
+workspaces orgs keys cloud     # tenants / the billing boundary above them / seal keys
 ```
 
 ---
@@ -348,9 +352,26 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 | `RYA_MAX_BUNDLE_BYTES` | Publish body cap, default 20 MB — over it, `413` |
 | `RYA_ALLOW_UNAUTHENTICATED_PUBLISH` | `1` → allow `POST /agents/{id}/versions` with auth off (local loops only) |
 | `RYA_PROJECT` | Which project tree `docker compose` mounts at `/project` |
+| `RYA_WORKSPACE_A`, `RYA_WORKSPACE_B` | Which workspaces `docker-compose.multitenant.yml`'s two tenant claimers serve; `rya supervisor --all-workspaces` is the answer past a worked example |
 | `RYA_REMOTE_URL`, `RYA_API_KEY` | Point the CLI at a hosted Rya |
 | `RYA_CORS_ORIGINS`, `RYA_WEBHOOK_SECRET`, `RYA_SLACK_SIGNING_SECRET` | Edge config |
 | `RYA_HOME`, `RYA_GUARD_PATH`, `RYA_APP_DB_PASSWORD` | Paths / infra |
+| `RYA_EXECUTION_DRIVER` | How the supervisor launches workers: `local` (default), `docker`, `kubernetes` |
+| `RYA_CONTAINER_RUNTIME` | `runsc` makes the `docker` driver `sandboxed`; anything else is a shared kernel |
+| `RYA_K8S_RUNTIME_CLASS` | The gVisor RuntimeClass, default `gvisor`; `none` opts out and downgrades the claim |
+| `RYA_SANDBOX_IMAGE`, `RYA_SANDBOX_MEMORY`, `RYA_SANDBOX_CPUS` | What a sandbox runs and what it may consume |
+| `RYA_UNTRUSTED_TENANTS` | `1` → declare the hostile-tenant posture. Refuses to start unless mediation, a sandbox, network egress AND a driver that launches the broker outside the tenant's sandbox are ALL in force (D32) |
+| `RYA_TEMPLATE_HOST` | Path to the template host's socket (D32). Set on **both** halves of the pair: the sandbox container binds it, the claimer dials it. Unset → the claimer spawns its own templates (the weak topology, and the default) |
+| `RYA_TEMPLATE_HOST_TOKEN` | Shared secret for the host's control surface. Not a credential to anything outside the pair, and scrubbed from a template's environment before tenant code runs — a tenant that could drive it could evict a sibling agent's warm interpreter |
+| `RYA_CLAIMER_MEMORY`, `RYA_CLAIMER_CPUS` | The *claimer* half's limits, separate from `RYA_SANDBOX_*`. Default `256m` / `0.5`: it imports nothing and mostly waits on a socket |
+| `RYA_CLAIMER_SCOPE` | `version` (default: one claimer per workspace+agent+version) \| `tenant` (one per workspace, forking whichever version each item is pinned to). An unrecognised value is refused, not defaulted |
+| `RYA_POOL_MAX_ENTRIES` | Warm interpreters one claimer holds. Default 4 at version scope, 12 at tenant scope |
+| `RYA_BROKER` | `1` → mediate tenant IO (D18). Requires `--fork` (implied by `--scope tenant`); the tenant process gets a socket instead of the DSN, the seal keys and the provider key |
+| `RYA_BROKER_SOCKET` | Where the broker listens. On the claimer it means *bind here* — needed on the D32 pair so the other container can reach it; unset, the broker picks a private 0700 temp directory |
+| `RYA_EGRESS` | `none` (default, restricts nothing) \| `proxy` \| `netpolicy` — what the substrate actually enforces |
+| `RYA_KEY_PROVIDER` | `deployment` (default) \| `derived` \| `wrapped`. Only `wrapped` can crypto-shred a tenant (D31) |
+| `RYA_KMS_KEY_ID` | Wrap per-tenant keys with AWS KMS instead of the root key |
+| `RYA_ACTOR` | Who a CLI lifecycle action is recorded as. Falls back to the OS user |
 
 ---
 
@@ -379,13 +400,14 @@ mock-expecting tests to the live API (`RYA_FORCE_MOCK=1` overrides it); and pin
 | Gap | Reality |
 |---|---|
 | **No TLS on the AWS deploy** | HTTP-only. Passwords + API keys travel in **plaintext**. Must fix before sharing publicly. |
-| **One agent per deployment** | `build_app` loads `rya.agent.yaml` once at startup and every handler resolves `manifest.name`, so `{id}` in the route paths is decorative — `POST /agents/{id}/versions` refuses a bundle declaring a different `name`. A second agent means a second deployment. |
+| **One agent per WORKER, not per deployment** | `build_app` reads no manifest since D21: agents come from `rya_versions`/`rya_environments` and `{id}` in the route paths is real, so one api serves many and `POST /agents/{id}/versions` accepts an unknown name. `load_agent` mutates `sys.path` and never unloads, so a second agent costs a second worker — not a second api, port, database or bundle store. |
 | **Publish files no readiness attestation** | The control plane never imports a bundle, so `POST /agents/{id}/versions` cannot evaluate readiness: the response says `"attested": false`, and a readiness-gated environment refuses the promotion (`E_PROMOTION_BLOCKED`). Use `rya deploy --env` from a box with store access. |
 | **Evals are single-tenant only** | `POST /evals/run` → `400 "Evals are single-tenant only."` The console's Run-evals button fails on the cloud. |
 | **Connections + knowledge are read-only from the cloud** | No HTTP endpoint to *create* them (CLI/MCP/`ctx` only), so the console shows the views but can't populate them. |
 | **Remote MCP** | Unauthenticated when `RYA_TOKEN` is unset, and operates on the baked `/project` rather than the caller's workspace. |
 | **LLM defaults to mock** | With no provider key, a new user's agent returns canned output (`tokens: 0`). |
 | **Some built-in tools are mocks** | `crm.lookup`, `calendar.read`, `email.send` are mocks (flagged `mock: true`); `web.fetch` and `http.request` are real. |
+| **The fleet spans boxes on paper, and has never done it** | `rya supervisor` starts, scales and reaps through the `ExecutionDriver` seam, and `docker`/`kubernetes` exist beside `local`. Both container drivers launch the D32 *pair* — a credentialed claimer container beside a credential-free sandbox running `rya template-host` — so `RYA_UNTRUSTED_TENANTS=1` is launchable rather than a permanent refusal. What has not happened is a cluster: the `kubernetes` driver renders a manifest and applies it with `kubectl`, and none has been applied. `ecs` is unwritten. |
 | **Infra** | Single Fargate task; RDS has no backups/Multi-AZ; no DB connection pooling; no email verification, rate limiting, password reset, or billing. |
 
 The honest summary: **the runtime — the hard part — is real and works in
@@ -407,6 +429,8 @@ src/rya/
   api/app.py       FastAPI control plane + console + remote MCP mount
   console/         the built-in dashboard (single-file HTML)
   worker.py        the execution plane — claims from the queue, loads the bundle
+  execution/       who starts the workers: drivers.py (substrate seam),
+                   supervisor.py (the policy), pool.py (fork per run)
   bundles.py       content-hash / pack / verify + the archive store (local | S3)
   deployments.py   immutable versions, environments, promote, rollback
   gates.py         promotion gates — readiness + evals as admission checks

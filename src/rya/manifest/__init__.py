@@ -1,5 +1,5 @@
 from .schema import Manifest, ToolDecl, ModelDecl, ChannelDecl, TriggerDecl
-from .loader import load_manifest, find_manifest, ManifestError
+from .loader import load_manifest, parse_manifest, find_manifest, ManifestError
 
 __all__ = [
     "Manifest",
@@ -8,6 +8,7 @@ __all__ = [
     "ChannelDecl",
     "TriggerDecl",
     "load_manifest",
+    "parse_manifest",
     "find_manifest",
     "ManifestError",
 ]

@@ -128,11 +128,18 @@ class RemoteClient:
     def info(self) -> dict:
         return self._req("GET", "/v1/info")
 
-    def send_event(self, type: str, payload: dict) -> dict:
-        return self._req("POST", "/agents/_/events", {"type": type, "payload": payload})
+    # `agent="_"` is the platform's sole-agent alias: it resolves while the
+    # instance serves one agent and refuses, naming the candidates, once it serves
+    # several (D21). Pass a name to address one explicitly.
+    def list_agents(self) -> dict:
+        return self._req("GET", "/agents")
 
-    def list_runs(self) -> dict:
-        return self._req("GET", "/agents/_/runs")
+    def send_event(self, type: str, payload: dict, agent: str = "_") -> dict:
+        return self._req("POST", f"/agents/{agent}/events",
+                         {"type": type, "payload": payload})
+
+    def list_runs(self, agent: str = "_") -> dict:
+        return self._req("GET", f"/agents/{agent}/runs")
 
     def get_trace(self, run_id: str) -> dict:
         return self._req("GET", f"/runs/{run_id}/trace")

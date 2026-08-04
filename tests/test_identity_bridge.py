@@ -54,6 +54,28 @@ def _mt_client(tmp_path, monkeypatch):
     return TestClient(build_app(tmp_path))
 
 
+def _drain(root, key: str) -> None:
+    """Be the execution plane.
+
+    Since D21 the multi-tenant api records decisions and queues work; it never
+    runs a handler. Both halves matter here: `/inbound` queues the run, and
+    `/approve` records the approval and enqueues the RESUME. A test about who
+    acted therefore has to drain both, exactly as `rya worker` does.
+    """
+    from rya import turns
+    from rya.manifest import load_manifest
+    from rya.runtime import Engine, load_agent
+    from rya.store_postgres import PostgresStore
+    from rya.tenancy import Tenancy
+
+    workspace = Tenancy(PG).resolve_key(key)
+    manifest = load_manifest(root / "rya.agent.yaml")
+    engine = Engine(manifest, load_agent(manifest, root),
+                    PostgresStore(PG, workspace), root)
+    turns.execute_pending(engine, worker_id="test-worker")
+    turns.execute_resumes(engine, worker_id="test-worker")
+
+
 @needs_pg
 def test_approval_records_who_acted(tmp_path, monkeypatch):
     c = _mt_client(tmp_path, monkeypatch)
@@ -66,13 +88,18 @@ def test_approval_records_who_acted(tmp_path, monkeypatch):
 
     run = c.post("/inbound", json={"email": "x@y.com"},
                  headers={"Authorization": f"Bearer {key}"}).json()
-    assert run["status"] == "waiting_approval"
+    assert run["status"] == "queued"
+    _drain(tmp_path, key)
     apr = c.get("/approvals?status=pending",
                 headers={"Authorization": f"Bearer {key}"}).json()["approvals"][0]
 
     out = c.post(f"/approvals/{apr['id']}/approve",
                  headers={"Authorization": f"Bearer {key}", "X-Rya-User-Token": ut}).json()
+    # The actor is resolved and recorded by the CONTROL plane — that is the half
+    # that needs the authenticated human — and the worker carries out the resume.
     assert out["resolvedBy"]["email"] == "sarah@bbg.bank"
+    assert out["queued"] is True
+    _drain(tmp_path, key)
 
     resolved = c.get("/approvals", headers={"Authorization": f"Bearer {key}"}).json()["approvals"]
     mine = next(a for a in resolved if a["id"] == apr["id"])
@@ -92,8 +119,9 @@ def test_enforcement_blocks_anonymous_approval(tmp_path, monkeypatch):
     res = c.post("/v1/signup", json={"email": "amit@bbg.bank", "password": "renewals-2026x",
                                      "workspaceName": "BBG"}).json()
     key = res["apiKey"]
-    run = c.post("/inbound", json={"email": "x@y.com"},
-                 headers={"Authorization": f"Bearer {key}"}).json()
+    c.post("/inbound", json={"email": "x@y.com"},
+           headers={"Authorization": f"Bearer {key}"})
+    _drain(tmp_path, key)
     apr = c.get("/approvals?status=pending",
                 headers={"Authorization": f"Bearer {key}"}).json()["approvals"][0]
 

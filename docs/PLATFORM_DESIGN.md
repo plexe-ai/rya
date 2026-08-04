@@ -290,14 +290,24 @@ on a handler-set hole or a version/manifest disagreement; a process reports its
 cold start against `COLD_START_TARGET_MS`, and `--idle-exit` makes it leave when
 its own claimable queue depth is zero.
 
-What remains greenfield is **scheduling**: nothing *starts* a worker on demand,
-nothing varies replica count with queue depth, and nothing pre-warms a promoted
-version. Every process above is started by a human, a compose file or an ECS
-`DesiredCount`, so scale-to-zero is currently one-way — a worker can exit idle,
-and then that key is simply unserved until someone starts another. The
-process-side halves of §6 are built; the supervisor that decides when to run them
-is not, and it is where the idle-cost argument that opens this section actually
-gets settled.
+~~What remains greenfield is **scheduling**~~ — **built in Phase 3 of
+[MULTITENANT_PLAN](MULTITENANT_PLAN.md)** (D25/D26). `rya supervisor` watches
+claimable depth per key and the worker registry, and starts, scales, pre-warms and
+reaps through a pluggable `ExecutionDriver`, so **scale-to-zero is two-way**: a key
+that idled out comes back when work arrives instead of staying unserved until
+someone notices. `maxWorkers` is enforced when scheduling rather than only at
+registration, which is the difference between a cap and a receipt.
+
+Two things that paragraph assumed have also changed. `lastHeartbeatAt` used to be
+written and never read, so a SIGKILLed worker stayed `alive` forever — a signal no
+scheduler could act on, and one that leaked a `maxWorkers` slot per crash; liveness
+is now derived from heartbeat age (`store.worker_liveness`). And
+`COLD_START_TARGET_MS` is no longer one global number: it is a per-driver property,
+because a Fargate task is tens of seconds and a warm Kubernetes pool is hundreds of
+milliseconds.
+
+What the supervisor deliberately does **not** settle is fairness *within* one
+tenant, which only arises once D27's claimer scope widens past one agent-version.
 
 ---
 
@@ -375,6 +385,19 @@ Three layers, in order of preference:
   kernel. This design contains a **buggy** tenant — a runaway loop, a memory leak,
   a crash — and does **not** contain a **hostile** one. Per-tenant node pools or
   gVisor/Kata are the answer if that threat model changes; deliberately not in v1.
+
+  **Superseded for one posture, and only one.** MULTITENANT_DESIGN D17 changes the
+  threat model to a hostile tenant, and Phase 4 built three of the four boundaries that
+  answer it: no credentials in the tenant process (D18), a gVisor sandbox (D23), and
+  egress enforced by the network (D24). Phase 5 added the fourth — where the broker runs
+  (D32) — and found no shipped driver satisfied it; Phase 6 built the template host that
+  closes it, so both container drivers now launch the pair and the posture is
+  launchable. But that posture is **declared, not
+  default**: without `RYA_UNTRUSTED_TENANTS=1` a deployment runs exactly what this
+  bullet describes, and every self-host does. So both statements are live at once and
+  the distinction is not rhetorical — `rya posture` prints which one a given
+  deployment is in, and `require_untrusted_posture` refuses to start a deployment that
+  claims the stronger one without backing it.
 - **Config is state, not ambience (D8)** — per-environment values are stored,
   versioned, access-controlled and audited, then delivered per run.
 - **Privileged writes** — the commit path connects as a distinct write-privileged
@@ -389,7 +412,10 @@ Three layers, in order of preference:
 - **A queue job is not a governed run (D14).** It gets leases, retries,
   dead-lettering and crash reclaim. It does not get permission resolution, pin
   resolution, a guard verdict or an approval gate.
-- **A worker is not a security sandbox.** See D13.
+- **A worker is not a security sandbox.** See D13 — and note that since Phase 4 the
+  worker is not where tenant code runs at all in the untrusted posture: it claims, and
+  a sandboxed fork executes. The *worker* is still not a sandbox; the thing beside it
+  is.
 
 **One thing it now does claim, which the prior draft denied:** because D1 makes
 the whole platform one deployment, **self-hosting is a residency control.** A
@@ -559,6 +585,16 @@ reworking under D8.
 1. **Client code runs in a platform-operated process.** Contained per D13 to a
    buggy-tenant threat model. If a hostile-tenant requirement appears, node
    isolation is the answer and it is not in v1.
+
+   **That requirement appeared, and the answer is built and now exercised** —
+   MULTITENANT_DESIGN D17, Phase 4, and Phase 6. gVisor has been run
+   (`scripts/verify_gvisor.sh`): D23's third-party-wheel criterion holds, and running it
+   found the isolation probe matching a kernel string no real sentry emits — which had
+   it *refuting* genuine sandboxes rather than merely failing to confirm them. What
+   keeps this risk live rather than closed is that it is a *declared* posture, so the
+   default deployment is still what this bullet describes. What the platform will not do
+   is *claim* the stronger posture without evidence: an unverifiable isolation probe
+   fails the launch gate.
 2. **Bundle/journal drift.** Mitigated by D9 and D12 — content-keyed steps,
    version pinning, retention, fail closed.
 3. **The process lifecycle is still greenfield, and it is the scheduling half.**

@@ -21,6 +21,7 @@ from rya.deployments import (
     history,
     list_environments,
     list_versions,
+    manifest_of,
     pinned_runs,
     promote,
     resolve_for_run,
@@ -101,6 +102,34 @@ def test_version_record_carries_provenance(tmp_path):
     assert version["metadata"]["gitSha"] == "abc123"
     # The per-file digest map stays in the archive, not on a record read per run.
     assert "files" not in version
+
+
+def test_version_record_carries_the_manifest(tmp_path):
+    """D21: a manifest-free `api` learns what an agent is from the version
+    record. Without this field there is nothing to serve and the api falls back
+    to a local rya.agent.yaml — which IS the one-agent limit."""
+    store = _store(tmp_path)
+    root = _project(tmp_path, "demo")
+    version = create_version(store, agent="demo", bundle=build_bundle(root))
+
+    assert manifest_of(version) is not None
+    assert manifest_of(version)["name"] == "demo"
+    assert manifest_of(version)["entrypoint"] == "src/agent.py"
+    # It survives a round trip through the store, not just the in-memory return.
+    assert manifest_of(store.version_get(version["id"]))["name"] == "demo"
+
+
+def test_manifest_of_reports_the_gap_on_pre_d21_records(tmp_path):
+    """Records written before D21 have no manifest, and re-publishing identical
+    content does not backfill one — `version_create` dedupes on content and
+    returns the old row untouched. Callers must see None, not a crash."""
+    store = _store(tmp_path)
+    root = _project(tmp_path, "demo")
+    version = create_version(store, agent="demo", bundle=build_bundle(root))
+
+    legacy = {k: v for k, v in version.items() if k != "manifest"}
+    assert manifest_of(legacy) is None
+    assert manifest_of({"manifest": {}}) is None      # empty is absent, not a manifest
 
 
 def test_version_agent_must_match_the_manifest(tmp_path):

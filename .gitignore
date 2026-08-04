@@ -9,11 +9,25 @@ dist/
 venv/
 .preview/
 
+# frontend (web/console) — deps and build output. `dist/` above already covers
+# src/rya/console/dist; the compiled console is built at release time by CI and
+# force-included into the wheel, never committed. See docs/PACKAGING.md.
+node_modules/
+.vite/
+vite.config.ts.timestamp-*
+
 # secrets / local env — never commit (use .env.example for the template)
 .env
+.env.bak*
 *.key
 *.pem
 secret.key
+
+# A developer's own compose tweaks. Compose auto-loads this name, so it is the right
+# place for machine-specific overrides (a mounted path, a port that is already taken)
+# and the wrong place for a posture: docker-compose.multitenant.yml is passed with an
+# explicit `-f` so that which stack you are running stays visible.
+docker-compose.override.yml
 
 # os / editor
 .DS_Store

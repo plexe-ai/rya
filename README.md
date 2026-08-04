@@ -154,7 +154,10 @@ service-to-service call — they coordinate through the queue. On the durable pa
 (`POST /agents/{id}/turns`) the api process executes no handler code, which is
 what makes per-tenant isolation mean something — though two routes still bypass
 that, see below. Deploy both with the AWS IaC in [`deploy/`](deploy/AGENTS.md) or
-`docker compose`.
+`docker compose`. Serving many tenants from one deployment is an overlay on that same
+file — `docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d`,
+which rebinds 8787 to loopback and runs one least-privilege claimer per workspace
+([architecture.md](docs/architecture.md#self-host-multi-tenant)).
 
 A third mode is optional, and it is the one that means you stop declaring workers
 by hand:

@@ -1,5 +1,14 @@
 # Rya self-host: `cp .env.example .env && docker compose up`
 #
+# This file is the SINGLE-TENANT stack. For many tenants in one deployment, layer the
+# overlay on top rather than editing this file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d
+#
+# See docker-compose.multitenant.yml — it rebinds 8787 to loopback (multi-tenant opens
+# the ungated `POST /v1/signup`), profiles out the `default`-workspace worker, and runs
+# one least-privilege claimer per workspace.
+#
 # ONE DEPLOYMENT, TWO PROCESSES (PLATFORM_DESIGN §2). Both are the same platform
 # image against the same Postgres; they are run modes, not microservices, and
 # they coordinate through the queue table rather than by calling each other:

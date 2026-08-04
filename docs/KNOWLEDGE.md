@@ -352,6 +352,7 @@ image updates *without* `--disable-rollback`; from `UPDATE_FAILED` you must
 | `RYA_MAX_BUNDLE_BYTES` | Publish body cap, default 20 MB — over it, `413` |
 | `RYA_ALLOW_UNAUTHENTICATED_PUBLISH` | `1` → allow `POST /agents/{id}/versions` with auth off (local loops only) |
 | `RYA_PROJECT` | Which project tree `docker compose` mounts at `/project` |
+| `RYA_WORKSPACE_A`, `RYA_WORKSPACE_B` | Which workspaces `docker-compose.multitenant.yml`'s two tenant claimers serve; `rya supervisor --all-workspaces` is the answer past a worked example |
 | `RYA_REMOTE_URL`, `RYA_API_KEY` | Point the CLI at a hosted Rya |
 | `RYA_CORS_ORIGINS`, `RYA_WEBHOOK_SECRET`, `RYA_SLACK_SIGNING_SECRET` | Edge config |
 | `RYA_HOME`, `RYA_GUARD_PATH`, `RYA_APP_DB_PASSWORD` | Paths / infra |

@@ -69,6 +69,35 @@ somewhere new would leave them serving different code. Platform state
 `docker compose --profile pinned up worker-pinned` adds a worker that serves
 whichever version `prod` points at, rather than the mounted tree.
 
+### Self-host, multi-tenant
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d
+```
+
+An overlay rather than a second stack, and passed with an explicit `-f` rather than
+named `docker-compose.override.yml`: that filename is auto-loaded, and multi-tenancy
+changes what a credential *means*, so it should be the most visible thing about the
+command that starts it. Reserve the auto-loaded name for a developer's own untracked
+tweaks.
+
+It needs `RYA_MULTITENANT=1`, `RYA_APP_DB_PASSWORD` and `RYA_WORKER_DATABASE_URL` in
+`.env`, and it differs from the base file in three ways:
+
+- **8787 binds to loopback.** Multi-tenant mode opens `POST /v1/signup`, and unlike
+  `/v1/projects` that route is *not* gated by `RYA_ADMIN_TOKEN` — deliberately, since
+  the premise is self-serve signup by untrusted tenants. The base file publishes on
+  `0.0.0.0`, so the combination would let anyone who can reach the host mint a
+  workspace. Put a TLS-terminating, rate-limiting proxy in front, then republish.
+- **The default `worker` is profiled out**, because it serves workspace `default` —
+  the one workspace no API key maps to once tenancy is on. `--profile singletenant`
+  brings it back to drain rows written before the switch.
+- **There is one claimer per tenant**, because `--workspace` is load-bearing:
+  `open_worker_store` scopes the store to that workspace and connects as the weaker
+  `rya_worker` role, where `open_store` would return a store on `default` whatever
+  the caller intended. Two are declared (`RYA_WORKSPACE_A`/`_B`) as a worked example
+  of the isolation, not as a scaling plan — see the next section.
+
 ### Nothing has to declare the workers
 
 Compose declares one worker because a compose file is a static list, and a static

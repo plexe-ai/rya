@@ -131,6 +131,25 @@ def _project() -> tuple[Path, "load_manifest"]:
     return path.parent, manifest
 
 
+def _project_optional() -> tuple[Path, Optional["load_manifest"]]:
+    """The project root, and its manifest **only if one is mounted**.
+
+    ``_project`` refuses without a ``rya.agent.yaml`` because most commands act on
+    one agent. ``rya serve`` does not: since D21 ``build_app`` is manifest-free and
+    learns what agents exist from published versions and environment pointers, so a
+    control plane that serves only published bundles has no project to mount — and
+    insisting on one made exactly that deployment unrunnable, which is the shape the
+    api is *for*. The manifest was read here to print a name in the banner.
+
+    Same resolution as ``_admin_store``, and the same reason.
+    """
+    from ..agents import project_root as mounted_project
+
+    path = find_manifest()
+    root = mounted_project() or (path.parent if path else Path.cwd())
+    return root, (load_manifest(path) if path else None)
+
+
 def _store() -> tuple[Path, "load_manifest", Store]:
     root, manifest = _project()
     store = open_store(root)
@@ -2657,10 +2676,11 @@ def serve(host: str = typer.Option("127.0.0.1", "--host"), port: int = typer.Opt
         except ImportError:
             raise RyaError("E_RUNTIME", "API extra not installed.", hint="Install with: pip install 'rya[api]'")
         import os
-        root, manifest = _project()
+        root, manifest = _project_optional()
         auth_on = bool(os.environ.get("RYA_TOKEN"))
         sig_on = bool(os.environ.get("RYA_WEBHOOK_SECRET"))
-        info = {"ok": True, "serving": f"http://{host}:{port}", "agent": manifest.name,
+        info = {"ok": True, "serving": f"http://{host}:{port}",
+                "agent": manifest.name if manifest else None,
                 "authEnabled": auth_on, "webhookSignature": sig_on,
                 "webhook": f"http://{host}:{port}/inbound"}
         info["console"] = f"http://{host}:{port}/"

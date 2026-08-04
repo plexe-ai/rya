@@ -352,7 +352,17 @@ prompts for the token when auth is on.
   restart. Your project mounts at `${RYA_PROJECT:-./examples/followup_agent}`
   → `/project`, with `/project/.rya` on a named volume (`rya_project_state`) so
   the containers' root-owned state never lands in your working tree.
-  [docker-compose.yml](../docker-compose.yml). Or
+  [docker-compose.yml](../docker-compose.yml).
+- **Self-host, multi-tenant:**
+  `docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d`
+  layers [docker-compose.multitenant.yml](../docker-compose.multitenant.yml) on top:
+  8787 rebinds to loopback (multi-tenant opens the ungated `POST /v1/signup`), the
+  `default`-workspace `worker` is profiled out, and one tenant-scoped claimer runs per
+  workspace on the least-privilege `rya_worker` DSN — because `--workspace` scopes the
+  store, so a claimer serves exactly one tenant. Explicit `-f` rather than the
+  auto-loaded `docker-compose.override.yml` name, so which posture you are running is
+  visible in the command. See [architecture.md](architecture.md#self-host-multi-tenant).
+  Or
   `rya deploy --target docker|fly|render` generates a self-contained image
   (agent baked in; state external via `RYA_DATABASE_URL`) + the exact command.
   [deploy_templates.py](../src/rya/cli/deploy_templates.py).

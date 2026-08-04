@@ -1,0 +1,103 @@
+# Multi-tenant overlay: `docker-compose.yml` + this = one deployment, many tenants.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.multitenant.yml up -d
+#
+# This is an OVERLAY, not a replacement, and it is passed with an explicit `-f`
+# rather than being named `docker-compose.override.yml` on purpose: that filename is
+# auto-loaded, which makes "am I running single- or multi-tenant?" invisible at the
+# command line. Multi-tenancy changes what a credential means, so it should be the
+# most visible thing about the command that starts it.
+#
+# It needs three things in `.env` (see .env.example):
+#
+#   RYA_MULTITENANT=1
+#   RYA_APP_DB_PASSWORD=…            # the rya_app / rya_worker role password
+#   RYA_WORKER_DATABASE_URL=postgresql://rya_worker:<pw>@postgres:5432/rya
+#
+# and RYA_ADMIN_TOKEN if you want self-serve `POST /v1/projects`.
+#
+# What the base file's three differences are, and why:
+#
+# 1. THE PORT IS LOOPBACK-ONLY.
+#
+#    Multi-tenant mode opens `POST /v1/signup`, and unlike `/v1/projects` it is NOT
+#    gated by RYA_ADMIN_TOKEN — deliberately, since the design's premise is
+#    self-serve signup by untrusted tenants. But the base file publishes 8787 on
+#    0.0.0.0, so combining the two would let anyone who can reach the host mint
+#    themselves a workspace. Put a proxy that terminates TLS and rate-limits in
+#    front, then republish deliberately.
+#
+# 2. THE DEFAULT `worker` IS PROFILED OUT.
+#
+#    It serves workspace `default`, which under multi-tenancy is the one workspace no
+#    API key maps to. Adding a profile to it here means it no longer starts by
+#    default; `--profile singletenant` brings it back if you want to drain rows left
+#    over from before the switch.
+#
+# 3. THERE IS ONE CLAIMER PER TENANT, because `--workspace` is load-bearing.
+#
+#    `open_worker_store` scopes the store handle to the named workspace and connects
+#    as `rya_worker`; `open_store` would "return a store on the default workspace
+#    whatever the caller intended" (store.py), i.e. a worker whose *key* said `acme`
+#    and whose *store* read everything. So a claimer serves exactly one tenant, and a
+#    second tenant needs a second claimer.
+#
+#    Two are declared below as a worked example, driven by RYA_WORKSPACE_A/_B. That
+#    does not scale, and it is not meant to: a static list is exactly what a fleet of
+#    N tenants cannot be. `rya supervisor --all-workspaces` is the real answer — it
+#    reads claimable depth per key and starts, scales and reaps claimers itself. Use
+#    these two to see the isolation; use the supervisor to run a fleet.
+
+# Common to every tenant claimer. The tenant claimer's environment deliberately does
+# NOT include RYA_DATABASE_URL's admin DSN: deriving the weaker role from the admin
+# credential still leaves the admin credential in the environment, "where a hostile
+# bundle can read it and connect as a superuser — and superusers bypass RLS entirely"
+# (store.py). Supplying RYA_WORKER_DATABASE_URL is the correct path; deriving is the
+# convenience one.
+x-tenant-claimer: &tenant-claimer
+  build: .
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  environment:
+    RYA_DATABASE_URL: ${RYA_WORKER_DATABASE_URL:?set RYA_WORKER_DATABASE_URL to the rya_worker DSN}
+    RYA_WORKER_DATABASE_URL: ${RYA_WORKER_DATABASE_URL}
+    RYA_MULTITENANT: "1"
+    RYA_ENVIRONMENT: ${RYA_ENVIRONMENT:-prod}
+    RYA_SECRET_KEY: ${RYA_SECRET_KEY:-}
+    RYA_BUNDLES_S3_BUCKET: ${RYA_BUNDLES_S3_BUCKET-rya-bundles}
+    RYA_BUNDLES_S3_ENDPOINT: ${RYA_BUNDLES_S3_ENDPOINT-http://minio:9000}
+    RYA_BUNDLES_S3_REGION: ${RYA_BUNDLES_S3_REGION:-us-east-1}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-miniosecret}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    RYA_LLM_MODEL: ${RYA_LLM_MODEL:-claude-haiku-4-5-20251001}
+  # No project mount. A tenant-scoped claimer "takes no --agent and no --version, and
+  # needs no mounted project" — it materialises whichever version each queued item is
+  # pinned to and forks an interpreter for it. Only the unpacked-bundle cache is
+  # shared, and that is platform state rather than anyone's source tree.
+  volumes:
+    - rya_project_state:/project/.rya
+
+services:
+  rya:
+    ports: !override
+      - "127.0.0.1:8787:8787"
+
+  worker:
+    profiles: ["singletenant"]
+
+  worker-tenant-a:
+    <<: *tenant-claimer
+    command: ["rya", "worker", "--scope", "tenant",
+              "--workspace", "${RYA_WORKSPACE_A:?set RYA_WORKSPACE_A to a workspace id (rya workspaces list)}",
+              "--interval", "2", "--concurrency", "4"]
+
+  worker-tenant-b:
+    <<: *tenant-claimer
+    command: ["rya", "worker", "--scope", "tenant",
+              "--workspace", "${RYA_WORKSPACE_B:?set RYA_WORKSPACE_B to a workspace id (rya workspaces list)}",
+              "--interval", "2", "--concurrency", "4"]

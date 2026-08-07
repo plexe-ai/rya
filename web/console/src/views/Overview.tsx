@@ -145,7 +145,19 @@ export function OverviewView({
           icon={Box}
           name="Runtime"
           line="Pauses, resumes, retries."
-          tags={[state.agent.handlers.event ? 'handler ✓' : 'no handler', state.runtime.store]}
+          // `handlers` is null whenever the control plane holds no loaded agent
+          // module, which since D21 is the NORMAL case for a published bundle: the
+          // api never imports one, so it cannot know what the code registers. A
+          // third state, not a missing value — "no handler" here would accuse a
+          // working agent of having none.
+          tags={[
+            state.agent.handlers
+              ? state.agent.handlers.event
+                ? 'handler ✓'
+                : 'no handler'
+              : 'handlers not introspected',
+            state.runtime.store,
+          ]}
           onClick={() => onNavigate('runs')}
         />
         <PrimitiveCard

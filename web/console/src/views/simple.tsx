@@ -186,16 +186,3 @@ export function JobsView({ state }: { state: ConsoleState }) {
  * beats an empty panel: an operator who lands here needs to know the data exists
  * and where to find it, not wonder whether the page is broken.
  */
-export function NotYetMigrated({ title, legacyHash }: { title: string; legacyHash: string }) {
-  return (
-    <>
-      <ViewHeader title={title} />
-      <Empty>
-        <span>
-          Not migrated to this console yet — open it in the{' '}
-          <a href={`/#${legacyHash}`}>current console</a>.
-        </span>
-      </Empty>
-    </>
-  )
-}

@@ -1,5 +1,6 @@
 import { Bot, Menu, RefreshCw, Zap } from 'lucide-react'
-import type { ConsoleState } from '../lib/types'
+import { hasAgent } from '../lib/types'
+import type { ConsoleResponse } from '../lib/types'
 
 export function TopBar({
   state,
@@ -9,19 +10,23 @@ export function TopBar({
   onSendEvent,
   onToggleNav,
 }: {
-  state: ConsoleState | null
+  state: ConsoleResponse | null
   live: boolean
   loading: boolean
   onRefresh: () => void
   onSendEvent: () => void
   onToggleNav: () => void
 }) {
-  const badges = state
+  // Every badge here describes the SELECTED AGENT, so with none selected there is
+  // nothing truthful to show and the row is simply empty. `Send test event` is
+  // disabled for the same reason: it posts to an agent-scoped route.
+  const loaded = hasAgent(state) ? state : null
+  const badges = loaded
     ? [
-        `env: ${state.agent.environment}`,
-        `runtime: ${state.agent.runtime}`,
-        `store: ${state.runtime.store}`,
-        `llm: ${state.runtime.llmProvider}`,
+        `env: ${loaded.agent.environment}`,
+        `runtime: ${loaded.agent.runtime}`,
+        `store: ${loaded.runtime.store}`,
+        `llm: ${loaded.runtime.llmProvider}`,
       ]
     : []
 
@@ -37,13 +42,17 @@ export function TopBar({
         <Bot aria-hidden="true" focusable="false" />
       </div>
       <div>
-        <h1>{(state?.branding && workspace) || state?.agent.name || '—'}</h1>
+        <h1>
+          {(state?.branding && workspace) ||
+            loaded?.agent.name ||
+            (state ? 'No agent selected' : '—')}
+        </h1>
         <div className="meta">
-          {state && (
+          {loaded && (
             <>
               <span className="badge run">
                 <span className="d" />
-                {state.agent.status}
+                {loaded.agent.status}
               </span>
               {badges.map((b) => (
                 <span className="badge mono" key={b}>
@@ -63,7 +72,12 @@ export function TopBar({
           <RefreshCw aria-hidden="true" focusable="false" />
           Refresh
         </button>
-        <button className="btn dark sm" onClick={onSendEvent}>
+        <button
+          className="btn dark sm"
+          onClick={onSendEvent}
+          disabled={!loaded}
+          title={loaded ? undefined : 'Select an agent first — an event is addressed to one'}
+        >
           <Zap aria-hidden="true" focusable="false" />
           Send test event
         </button>

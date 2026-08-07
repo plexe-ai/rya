@@ -328,15 +328,31 @@ the module being deleted.
 
 ## 13. The web console
 
-`rya serve` serves a built-in console at `/`
-([console/index.html](../src/rya/console/index.html)). It's a data-driven
-frontend over `GET /console` (auth-gated), with views: **Overview** (stats +
-primitive grid + `rya context` terminal), **Infrastructure** (compute, data
-substrate, auth/RLS, observability — live from the process), **Manifest**,
-**Tools/Memory/Models/Channels**, **Runs & traces** (clickable forensic trace),
-**Approvals** (working approve/reject), **Action Guard** (editable policy + test
-suite), **Jobs & cron**, **Secrets**. Same-origin by default; a Connect dialog
-prompts for the token when auth is on.
+`rya serve` serves a built-in console at `/` — a Vite + React + TypeScript app whose
+source is [`web/console/`](../web/console/) and whose compiled bundle ships in the
+wheel at [`console/dist`](../src/rya/console/dist). It's a data-driven frontend over
+`GET /console` (auth-gated), with views: **Overview** (stats + primitive grid +
+`rya context` terminal), **Infrastructure** (compute, data substrate, auth/RLS,
+observability — live from the process), **Manifest**,
+**Tools/Memory/Knowledge/Models/Channels/Connections**, the deployment drill-down
+(**Environments → Versions → Workers**, plus **Quota & usage** with the org budget and
+launch-gate posture), **Runs & traces** (clickable forensic trace),
+**Conversations**, **Evals**, **Jobs & cron**, **Queue & turns** (with a resumable
+turn-stream inspector), **Governance**, **Approvals** (working approve/reject),
+**Action Guard** (editable egress policy), **Secrets** and **Team & access**.
+Same-origin by default; a Connect dialog prompts for a workspace key or signs you in
+when auth is on.
+
+Because one deployment serves many agents (D21), every agent-scoped call is prefixed
+with the selected agent and the sidebar carries a picker; `GET /console` reporting
+`agent: null` is an ordinary state (nothing published, or several published and none
+chosen) rather than an error.
+
+> Until parity, this console lived at `/v2` beside a legacy single-file SPA at `/` —
+> the Prefect `ui`/`ui-v2` pattern. All 23 views are now React components, so the
+> legacy file is deleted and `/v2` redirects to `/`. Two things that removal bought
+> outright: the CSP no longer needs `script-src 'unsafe-inline'`, and ~530KB of
+> vendored icon JavaScript left the repo and the wheel.
 
 ---
 

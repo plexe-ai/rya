@@ -72,13 +72,15 @@ packages = ["src/rya"]
 # is a maintainer/CI dependency at release time, never an install-time one, so
 # `pip install rya` still needs nothing but Python.
 #
-# Absent dist -> the pattern matches nothing and the wheel builds fine; the console
-# route then serves its "not bundled" fallback (api/app.py `_load_console_dist`).
+# Absent dist -> the pattern matches nothing and the wheel builds fine; `GET /` then
+# serves a 503 naming the build command (api/app.py `_console_index`).
+#
+# This is now the ONLY console asset. The force-include that used to carry
+# `console/index.html` and `console/lucide.min.js` is gone with the legacy single-file
+# SPA: every view it had is a React component now, and a self-hosted icon library is
+# not needed when icons are `lucide-react` imports compiled into the bundle. That also
+# removed ~530KB of committed vendored JS from the wheel.
 artifacts = ["src/rya/console/dist/**"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/rya/console/index.html" = "rya/console/index.html"
-"src/rya/console/lucide.min.js" = "rya/console/lucide.min.js"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

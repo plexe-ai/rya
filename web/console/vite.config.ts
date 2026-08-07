@@ -14,9 +14,11 @@ const OUT = fileURLToPath(new URL('../../src/rya/console/dist', import.meta.url)
 
 export default defineConfig({
   plugins: [react()],
-  // Served under /v2 alongside the legacy console at / until parity (the
-  // Prefect `ui` / `ui-v2` pattern). Change this and the mount in app.py together.
-  base: '/v2/',
+  // The console is served at the ROOT now — the legacy single-file SPA that held `/`
+  // during the migration is deleted, so there is one console and one address. Assets
+  // resolve to `/assets/*`, which `api/app.py` mounts; `/v2` 308-redirects here for
+  // bookmarks. Change this and that mount together.
+  base: '/',
   build: {
     outDir: OUT,
     emptyOutDir: true,

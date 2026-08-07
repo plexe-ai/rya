@@ -1,27 +1,66 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactElement } from 'react'
 import './styles.css'
 
-import { api, clearAuth, getToken, onUnauthorized } from './lib/api'
+import { ApiError, api, clearAuth, getToken, onUnauthorized } from './lib/api'
 import { usePoll } from './lib/usePoll'
-import { NAV, ALL_VIEWS } from './lib/nav'
+import { ALL_VIEWS } from './lib/nav'
 import type { CountKey, ViewId } from './lib/nav'
-import type { ConsoleState, QueueCounts } from './lib/types'
+import { hasAgent } from './lib/types'
+import { ag as agentPath, readAgent, writeAgent } from './lib/agent'
+import type { ConsoleResponse, QueueCounts } from './lib/types'
+import { AgentChooser } from './components/AgentChooser'
 
 import { AuthModal } from './components/AuthModal'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
-import { Toast } from './components/ui'
+import { Empty, Toast } from './components/ui'
 
 import { OverviewView, RuntimeDown } from './views/Overview'
 import { RunsView } from './views/Runs'
 import { ApprovalsView } from './views/Approvals'
-import {
-  ChannelsView, JobsView, ManifestView, MemoryView, ModelsView, NotYetMigrated, SecretsView,
-} from './views/simple'
+import { ChannelsView, JobsView, ManifestView, MemoryView, ModelsView, SecretsView } from './views/simple'
+import { ConnectionsView } from './views/Connections'
+import { ConversationsView } from './views/Conversations'
+import { EnvironmentsView, VersionsView, WorkersView } from './views/Deploy'
+import { EvalsView } from './views/Evals'
+import { GovernanceView } from './views/Governance'
+import { GuardView } from './views/Guard'
+import { InfrastructureView } from './views/Infrastructure'
+import { KnowledgeView } from './views/Knowledge'
+import { QuotasView } from './views/Quotas'
+import { QueueView } from './views/Queue'
+import { TeamView } from './views/Team'
+import { ToolsView } from './views/Tools'
 
 const POLL_MS = 6000
 
-const LABEL = new Map<ViewId, string>(NAV.flatMap((g) => g.items.map((i) => [i.id, i.label] as const)))
+// Deployment topology moves on a promote, not per second, so the envs/versions/workers
+// counts get their own slow timer instead of riding the 6s poll — the same 30s the
+// legacy console used (`refreshDeployCts`) and for the same reason. Three extra reads
+// every six seconds would be three reads too many for a number in a sidebar.
+const DEPLOY_COUNT_MS = 30_000
+
+// The selected agent is remembered per browser under `rya_agent`. Reading, writing and
+// path-prefixing live in lib/agent.ts so a VIEW can make an agent-scoped call without
+// importing the shell — see `ag()` there for why the prefix is not optional.
+
+/**
+ * The end of the view chain, typed `never`.
+ *
+ * This is what replaced `NotYetMigrated`. While the port was in flight the fallback
+ * arm rendered "not migrated yet" for any view without a component, which meant
+ * forgetting to wire one up looked like a deliberate state. Now every `ViewId` has a
+ * branch, so `view` is narrowed to `never` here — and adding a nav entry without a
+ * branch is a BUILD error instead of a blank page.
+ *
+ * It still renders something, because the hash is user-editable: `viewFromHash`
+ * validates against `ALL_VIEWS`, so this is unreachable in practice, and throwing to
+ * prove a point would turn a typo in the address bar into a white screen.
+ */
+function assertAllViewsHandled(view: never): ReactElement {
+  return <Empty>Unknown view “{String(view)}”.</Empty>
+}
 
 function viewFromHash(): ViewId {
   const h = location.hash.replace(/^#/, '')
@@ -72,11 +111,65 @@ export default function App() {
     [showToast],
   )
 
-  const { data: state, error, loading, live, refresh } = usePoll<ConsoleState>(
-    () => api<ConsoleState>('/console'),
+  const [agent, setAgentState] = useState<string | null>(readAgent)
+
+  const selectAgent = useCallback((name: string | null) => {
+    writeAgent(name)
+    setAgentState(name)
+  }, [])
+
+  /** `/agents/{selected}{path}` — every agent-scoped call must go through this. */
+  const ag = useCallback((path: string) => agentPath(agent ?? '_', path), [agent])
+
+  const load = useCallback(async (): Promise<ConsoleResponse> => {
+    const qs = agent ? `?agent=${encodeURIComponent(agent)}` : ''
+    try {
+      return await api<ConsoleResponse>(`/console${qs}`)
+    } catch (e) {
+      // A remembered selection the workspace does not serve is NOT an outage — it is
+      // what happens when the same browser is pointed at a different tenant. Drop it
+      // and retry once, so the page lands on the picker rather than on a
+      // "can't reach the runtime" card that sends you to inspect Docker.
+      if (e instanceof ApiError && e.code === 'E_AGENT_NOT_FOUND' && agent) {
+        writeAgent(null)
+        setAgentState(null)
+        showToast(`"${agent}" is not served here — pick an agent`)
+        return await api<ConsoleResponse>('/console')
+      }
+      throw e
+    }
+  }, [agent, showToast])
+
+  const { data: state, error, loading, live, refresh } = usePoll<ConsoleResponse>(
+    load,
     POLL_MS,
     { enabled: !authOpen, onError: onPollError },
   )
+
+  // The narrowing every view depends on. `state` may legitimately carry no agent;
+  // `loaded` is the shape that has one.
+  const loaded = hasAgent(state) ? state : null
+  const roster = state?.agents ?? []
+
+  // A workspace that serves exactly one agent needs no choosing — the server already
+  // selected it, so adopt that name rather than leaving the UI in an "unset" state
+  // that would send `_` on the next agent-scoped call.
+  useEffect(() => {
+    if (!agent && loaded?.agent?.name) selectAgent(loaded.agent.name)
+  }, [agent, loaded, selectAgent])
+
+  // Switching agents has to refetch NOW. `usePoll` keeps its fetcher in a ref on
+  // purpose — changing it must not restart the interval — so without this the new
+  // selection would sit unapplied for up to a full poll period, and the page would
+  // keep showing the previous agent's runs under the new agent's name.
+  const firstPoll = useRef(true)
+  useEffect(() => {
+    if (firstPoll.current) {
+      firstPoll.current = false
+      return
+    }
+    void refresh()
+  }, [agent, refresh])
   useEffect(() => {
     if (live) wasLive.current = true
   }, [live])
@@ -99,35 +192,81 @@ export default function App() {
     }
   }, [authOpen])
 
+  // Sidebar counts for the deploy group. Failures are swallowed on purpose: a count is
+  // decoration, and a toast for one would cry outage over a number nobody was reading.
+  const [deployCts, setDeployCts] = useState<{ envs?: number; versions?: number; workers?: number }>({})
+  useEffect(() => {
+    if (authOpen || !agent) return
+    let alive = true
+    const one = <T,>(path: string) => api<T>(path).catch(() => null)
+    const tick = async () => {
+      const [envs, versions, workers] = await Promise.all([
+        one<{ environments?: unknown[] }>(ag('/environments')),
+        one<{ versions?: unknown[] }>(ag('/versions')),
+        one<{ workers?: unknown[] }>('/workers?status='),
+      ])
+      if (!alive) return
+      setDeployCts({
+        envs: envs?.environments?.length,
+        versions: versions?.versions?.length,
+        // `status=` empty on purpose: every status, not the `alive` default. An empty
+        // list is scale-to-zero, and a crashed worker filtered out would make an
+        // outage look identical to the designed idle state.
+        workers: workers?.workers?.length,
+      })
+    }
+    void tick()
+    const id = setInterval(tick, DEPLOY_COUNT_MS)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [authOpen, agent, ag])
+
   const counts = useMemo((): Partial<Record<CountKey, { value: number; amber?: boolean }>> => {
-    if (!state) return {}
-    const violations = state.governance?.violations?.length ?? 0
-    return {
-      tools: { value: state.tools.length },
-      models: { value: state.models.length },
-      channels: { value: state.channels.length },
-      memory: { value: state.memory.collections.length },
-      knowledge: { value: state.knowledge?.documents.length ?? 0 },
-      connections: { value: (state.connections ?? []).length },
-      secrets: { value: state.secrets.length },
-      sessions: { value: state.stats.sessions ?? 0 },
-      approvals: { value: state.stats.approvalsPending, amber: state.stats.approvalsPending > 0 },
-      violations: { value: violations, amber: violations > 0 },
+    // Queue depth is workspace-scoped, so it is known even with no agent selected;
+    // everything else is agent-scoped and simply absent until one is.
+    const queueCount = {
       queue: {
         value: (queue.pending ?? 0) + (queue.running ?? 0),
         amber: (queue.failed ?? 0) > 0,
       },
     }
-  }, [state, queue])
+    if (!loaded) return queueCount
+    const violations = loaded.governance?.violations?.length ?? 0
+    return {
+      tools: { value: loaded.tools.length },
+      models: { value: loaded.models.length },
+      channels: { value: loaded.channels.length },
+      memory: { value: loaded.memory.collections.length },
+      knowledge: { value: loaded.knowledge?.documents.length ?? 0 },
+      connections: { value: (loaded.connections ?? []).length },
+      secrets: { value: loaded.secrets.length },
+      sessions: { value: loaded.stats.sessions ?? 0 },
+      approvals: { value: loaded.stats.approvalsPending, amber: loaded.stats.approvalsPending > 0 },
+      violations: { value: violations, amber: violations > 0 },
+      ...(deployCts.envs === undefined ? {} : { envs: { value: deployCts.envs } }),
+      ...(deployCts.versions === undefined ? {} : { versions: { value: deployCts.versions } }),
+      ...(deployCts.workers === undefined ? {} : { workers: { value: deployCts.workers } }),
+      ...queueCount,
+    }
+  }, [loaded, queue, deployCts])
 
   useEffect(() => {
     const name = state?.branding?.name ?? 'Rya'
-    document.title = state ? `${name} · ${state.agent.name}` : 'Rya — Agent backend console'
-  }, [state])
+    document.title = loaded
+      ? `${name} · ${loaded.agent.name}`
+      : state
+        ? `${name} · no agent selected`
+        : 'Rya — Agent backend console'
+  }, [state, loaded])
 
   async function sendEvent() {
     try {
-      await api('/events', {
+      // Agent-PREFIXED. The unprefixed spelling still answers via the deprecated
+      // Rule 6 fallback, which resolves the `_` alias — so it 400s with
+      // E_AGENT_AMBIGUOUS the moment a workspace serves a second agent.
+      await api(ag('/events'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ type: 'message.received', payload: { email: 'ada@example.com' } }),
@@ -151,6 +290,9 @@ export default function App() {
           view={view}
           onNavigate={navigate}
           state={state}
+          roster={roster}
+          selected={loaded?.agent.name ?? null}
+          onSelectAgent={selectAgent}
           counts={counts}
           open={navOpen}
           onWorkspaceClick={() => setAuthOpen(true)}
@@ -180,26 +322,59 @@ export default function App() {
                 />
               ) : !state ? (
                 <div className="empty">Loading…</div>
+              ) : !loaded ? (
+                /* A real state, not an error: nothing published yet, or several
+                   agents and none chosen. Every view below needs a selected agent,
+                   so this stands in for all of them rather than each guarding. */
+                <AgentChooser roster={roster} onSelect={selectAgent} />
               ) : view === 'overview' ? (
-                <OverviewView state={state} onNavigate={navigate} />
+                <OverviewView state={loaded} onNavigate={navigate} />
               ) : view === 'runs' ? (
-                <RunsView state={state} onToast={showToast} />
+                <RunsView state={loaded} onToast={showToast} />
               ) : view === 'approvals' ? (
-                <ApprovalsView state={state} onToast={showToast} onResolved={refresh} />
+                <ApprovalsView state={loaded} onToast={showToast} onResolved={refresh} />
               ) : view === 'manifest' ? (
-                <ManifestView state={state} />
+                <ManifestView state={loaded} />
               ) : view === 'models' ? (
-                <ModelsView state={state} />
+                <ModelsView state={loaded} />
               ) : view === 'channels' ? (
-                <ChannelsView state={state} />
+                <ChannelsView state={loaded} />
               ) : view === 'secrets' ? (
-                <SecretsView state={state} />
+                <SecretsView state={loaded} />
               ) : view === 'memory' ? (
-                <MemoryView state={state} />
+                <MemoryView state={loaded} />
               ) : view === 'jobs' ? (
-                <JobsView state={state} />
+                <JobsView state={loaded} />
+              ) : view === 'infra' ? (
+                <InfrastructureView state={loaded} onToast={showToast} />
+              ) : view === 'tools' ? (
+                <ToolsView state={loaded} onToast={showToast} />
+              ) : view === 'knowledge' ? (
+                <KnowledgeView state={loaded} onToast={showToast} />
+              ) : view === 'connections' ? (
+                <ConnectionsView state={loaded} onToast={showToast} />
+              ) : view === 'deploy' ? (
+                <EnvironmentsView state={loaded} onToast={showToast} />
+              ) : view === 'versions' ? (
+                <VersionsView state={loaded} onToast={showToast} />
+              ) : view === 'workers' ? (
+                <WorkersView state={loaded} onToast={showToast} />
+              ) : view === 'quotas' ? (
+                <QuotasView state={loaded} onToast={showToast} />
+              ) : view === 'conversations' ? (
+                <ConversationsView state={loaded} onToast={showToast} />
+              ) : view === 'evals' ? (
+                <EvalsView state={loaded} onToast={showToast} />
+              ) : view === 'queue' ? (
+                <QueueView state={loaded} onToast={showToast} />
+              ) : view === 'governance' ? (
+                <GovernanceView state={loaded} onToast={showToast} />
+              ) : view === 'guard' ? (
+                <GuardView state={loaded} onToast={showToast} />
+              ) : view === 'team' ? (
+                <TeamView state={loaded} onToast={showToast} onSignIn={() => setAuthOpen(true)} />
               ) : (
-                <NotYetMigrated title={LABEL.get(view) ?? view} legacyHash={view} />
+                assertAllViewsHandled(view)
               )}
             </div>
           </div>

@@ -39,6 +39,28 @@ export class UnauthorizedError extends Error {
 }
 
 /**
+ * A non-401 API failure, carrying the Rya error CODE and not just its prose.
+ *
+ * Callers have to be able to tell a recoverable condition from an outage, and the
+ * only stable discriminator is the code: `E_AGENT_NOT_FOUND` on `/console` means a
+ * remembered agent selection has gone stale (drop it and retry), whereas anything
+ * else means the runtime is unreachable or broken. String-matching a message
+ * written for humans is not a contract.
+ */
+export class ApiError extends Error {
+  code?: string
+  status: number
+  candidates?: string[]
+  constructor(message: string, status: number, code?: string, candidates?: string[]) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.candidates = candidates
+  }
+}
+
+/**
  * Subscribers notified on any 401, so the shell can raise the auth modal from
  * wherever the failing call happened to be. A plain callback set beats threading
  * an onUnauthorized prop through every view.
@@ -65,13 +87,17 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
   }
   if (!r.ok) {
     let message = `HTTP ${r.status}`
+    let code: string | undefined
+    let candidates: string[] | undefined
     try {
       const body = await r.json()
       message = body?.detail?.message || body?.detail || message
+      code = body?.detail?.code ?? body?.code
+      candidates = body?.detail?.candidates
     } catch {
       /* a non-JSON error body is still an error; keep the status line */
     }
-    throw new Error(message)
+    throw new ApiError(message, r.status, code, candidates)
   }
   return (r.status === 204 ? null : await r.json()) as T
 }

@@ -1,7 +1,8 @@
 import { Bot, ChevronsUpDown, GitCommitVertical, LogOut } from 'lucide-react'
 import { NAV } from '../lib/nav'
 import type { CountKey, ViewId } from '../lib/nav'
-import type { ConsoleState } from '../lib/types'
+import { hasAgent } from '../lib/types'
+import type { AgentRef, ConsoleResponse } from '../lib/types'
 
 /** The Plexe mark. Inline because it is a brand asset, not an icon-set glyph. */
 function PlexeMark() {
@@ -24,6 +25,9 @@ export function Sidebar({
   view,
   onNavigate,
   state,
+  roster,
+  selected,
+  onSelectAgent,
   counts,
   open,
   onWorkspaceClick,
@@ -31,7 +35,10 @@ export function Sidebar({
 }: {
   view: ViewId
   onNavigate: (v: ViewId) => void
-  state: ConsoleState | null
+  state: ConsoleResponse | null
+  roster: AgentRef[]
+  selected: string | null
+  onSelectAgent: (name: string | null) => void
   counts: Partial<Record<CountKey, { value: number; amber?: boolean }>>
   open: boolean
   onWorkspaceClick: () => void
@@ -39,13 +46,19 @@ export function Sidebar({
 }) {
   const branding = state?.branding
   const viewer = state?.viewer
+  // Workspace chrome is agent-INDEPENDENT and must render whether or not one is
+  // selected — it is how you tell which tenant you are looking at, which matters
+  // most in exactly the case where no agent has been chosen yet.
+  const loaded = hasAgent(state) ? state : null
   const wsName =
     branding?.name ??
     (viewer?.workspace && viewer.workspace !== 'default' ? viewer.workspace : 'Default workspace')
-  const wsSub = branding?.tagline ?? (state ? `${state.agent.environment} · ${state.runtime.store}` : 'loading…')
+  const wsSub =
+    branding?.tagline ??
+    (loaded ? `${loaded.agent.environment} · ${loaded.runtime.store}` : state ? 'no agent selected' : 'loading…')
 
   const who = viewer?.user || (viewer?.mode === 'multi-tenant' ? 'workspace key' : 'operator')
-  const initials = (viewer?.user?.includes('@') ? viewer.user.slice(0, 2) : state?.agent.name?.slice(0, 2) || 'ry')
+  const initials = (viewer?.user?.includes('@') ? viewer.user.slice(0, 2) : loaded?.agent.name?.slice(0, 2) || 'ry')
     .toUpperCase()
 
   return (
@@ -63,14 +76,39 @@ export function Sidebar({
         </span>
       </button>
 
+      {/* A real <select> once the workspace serves more than one agent, plain text
+          while it serves one — a control that implies a choice nobody has is worse
+          than a label. The leading placeholder appears only while nothing is
+          selected, so the control never shows an agent the page is not showing. */}
       <div className="agent-pick">
         <span className="ai">
           <Bot aria-hidden="true" focusable="false" />
         </span>
         <div>
-          <div className="nm">{state?.agent.name ?? '—'}</div>
+          {roster.length > 1 ? (
+            <select
+              aria-label="Agent"
+              value={selected ?? ''}
+              onChange={(e) => onSelectAgent(e.target.value || null)}
+            >
+              {!selected && <option value="">Choose an agent…</option>}
+              {roster.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <div className="nm">{loaded?.agent.name ?? (state ? 'No agents yet' : '—')}</div>
+          )}
           <div className="en">
-            {state ? `v${state.agent.version} · ${state.agent.environment}` : 'loading…'}
+            {loaded
+              ? `v${loaded.agent.version} · ${loaded.agent.environment}`
+              : state
+                ? roster.length
+                  ? 'select one above'
+                  : 'nothing published'
+                : 'loading…'}
           </div>
         </div>
         <span className="dot" />

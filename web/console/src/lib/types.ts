@@ -24,7 +24,25 @@ export interface Agent {
   environment: string
   status: string
   runtime: string
-  handlers: { event?: boolean }
+  /**
+   * `null` whenever the control plane holds no loaded agent module — which since
+   * D21 is the NORMAL case for a published bundle, because the api never imports
+   * one and therefore cannot know what the code registers. Three states, not two:
+   * handler present, handler absent, and not introspected. Typing this as
+   * non-nullable is what made the Overview crash on every published agent.
+   */
+  handlers: { event?: boolean } | null
+}
+
+/** One entry of the `agents` roster — what a workspace serves, without loading it. */
+export interface AgentRef {
+  name: string
+  source?: string
+  versionId?: string
+  bundleHash?: string
+  environment?: string | null
+  declaredBy?: string
+  manifestAvailable?: boolean
 }
 
 export interface Runtime {
@@ -153,9 +171,17 @@ export interface Governance {
   violations?: { ts?: string; kind: string; runId?: string; detail?: string }[]
 }
 
-/** The aggregate served by `GET /console`. */
+/**
+ * The aggregate served by `GET /console` **when an agent is selected**.
+ *
+ * Every view requires a selected agent, so `agent` is non-nullable here on purpose
+ * and the shell narrows to this type before rendering one. The agent-less response
+ * is a different shape — see `ConsoleRoster`.
+ */
 export interface ConsoleState {
   agent: Agent
+  agents?: AgentRef[]
+  selectedAgent?: string | null
   runtime: Runtime
   stats: Stats
   tools: Tool[]
@@ -173,6 +199,36 @@ export interface ConsoleState {
   branding?: Branding | null
   viewer?: Viewer
   infra?: unknown
+}
+
+/**
+ * What `GET /console` returns when NO agent is selected — a real state the route
+ * documents in words: "a fresh workspace with nothing published yet still has a
+ * dashboard". It arrives in two situations, and the shell tells them apart:
+ *
+ *  - `agents: []`     nothing published yet
+ *  - `agents.length > 1` and nothing chosen — the server only auto-selects when a
+ *                     workspace serves exactly one agent
+ *
+ * None of the agent-scoped fields (`tools`, `stats`, `runs`, …) are present, which
+ * is why this is a separate type rather than `ConsoleState` with optional members:
+ * a view that touched them would compile and then throw.
+ */
+export interface ConsoleRoster {
+  ok?: boolean
+  agent: null
+  agents: AgentRef[]
+  selectedAgent?: string | null
+  viewer?: Viewer
+  branding?: Branding | null
+  infra?: unknown
+}
+
+export type ConsoleResponse = ConsoleState | ConsoleRoster
+
+/** Narrows the poll's payload to the shape every view needs. */
+export function hasAgent(r: ConsoleResponse | null | undefined): r is ConsoleState {
+  return !!r && r.agent !== null
 }
 
 /** `GET /v1/info` — drives which auth tabs are offered. */

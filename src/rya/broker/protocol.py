@@ -85,7 +85,9 @@ reason the service exists.
 runs. Refused not because they cross a tenant boundary — they do not — but because
 a handler has ``ctx.run`` for its own run and no legitimate need to enumerate the
 tenant's other runs, and a replay-drift bug is easier to reason about when nothing
-else can read a journal.
+else can read a journal. The paged spellings (``list_runs_page``,
+``list_sessions_page``) are withheld under the same reasoning: a window onto an
+enumeration is still an enumeration.
 """
 
 from __future__ import annotations

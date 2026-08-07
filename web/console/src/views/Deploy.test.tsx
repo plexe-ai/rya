@@ -40,6 +40,18 @@ const VERSION = {
   createdBy: 'ada@example.com',
 }
 
+/**
+ * The Retained tile's value node, found through its sub-label.
+ *
+ * Not `getByText('1')`: four tiles sit in that row and several of them legitimately
+ * show the same small integer, so a bare number would match whichever rendered
+ * first and pass for the wrong reason.
+ */
+function retainedTile(): Element {
+  const stat = screen.getByText('older versions still pinned').closest('.stat')!
+  return stat.querySelector('.v')!
+}
+
 describe('EnvironmentsView', () => {
   it('lists one row per pointer, enriched from describe_environment', async () => {
     stubRoutes([
@@ -66,8 +78,10 @@ describe('EnvironmentsView', () => {
     // second, per-row `describe_environment` request.
     expect(screen.getByText('deadbeefcafe')).toBeTruthy()
     expect(screen.getByText('gated')).toBeTruthy()
-    expect(screen.getByText('1 pinned')).toBeTruthy()
     expect(screen.getByText('ada@example.com')).toBeTruthy()
+    // Retention is NOT a row cell (§5.13, and the block of tests below); one older
+    // version is held open, and the tile is where that is said.
+    expect(retainedTile().textContent).toBe('1')
   })
 
   it('treats no environments as an ordinary fresh-install state', async () => {
@@ -151,6 +165,124 @@ describe('EnvironmentsView', () => {
     // 400s E_AGENT_AMBIGUOUS the moment the workspace serves a second agent.
     expect(calls.some((u) => u.endsWith('/agents/support-agent/environments'))).toBe(true)
     expect(calls.some((u) => /(^|\/)environments$/.test(u) && !u.includes('/agents/'))).toBe(false)
+  })
+
+  /**
+   * Retention is an AGENT fact wearing an environment's clothes — audit §5.13.
+   *
+   * `deployments.py: describe_environment` builds `pinnedRuns` from
+   * `store.version_list(agent=agent)`, and `pinned_runs` scans `store.list_runs()`
+   * with no environment filter, so every environment answers with the same
+   * agent-wide census of versions holding a live run — less, and only less, that
+   * environment's own current pointer. The three-pointer agent below is the shape
+   * that broke: the maps are passed in verbatim, asymmetric exclusion included,
+   * because the asymmetry is the whole difficulty.
+   */
+  function threeEnvironments(pinned: {
+    prod: Record<string, number>
+    dev: Record<string, number>
+    staging: Record<string, number>
+  }) {
+    const version = (id: string) => ({ ...VERSION, id, bundleHash: `${id}0123456789abcdef` })
+    return stubRoutes([
+      [
+        /\/environments\/prod$/,
+        { name: 'prod', currentVersionId: 'ver_prod', currentVersion: version('ver_prod'), pinnedRuns: pinned.prod },
+      ],
+      [
+        /\/environments\/dev$/,
+        { name: 'dev', currentVersionId: 'ver_dev', currentVersion: version('ver_dev'), pinnedRuns: pinned.dev },
+      ],
+      [
+        /\/environments\/staging$/,
+        { name: 'staging', currentVersionId: 'ver_stg', currentVersion: version('ver_stg'), pinnedRuns: pinned.staging },
+      ],
+      [
+        /\/agents\/support-agent\/environments$/,
+        {
+          environments: [
+            { name: 'prod', currentVersionId: 'ver_prod' },
+            { name: 'dev', currentVersionId: 'ver_dev' },
+            { name: 'staging', currentVersionId: 'ver_stg' },
+          ],
+        },
+      ],
+    ])
+  }
+
+  it('counts a retained version once for the agent, not once per environment', async () => {
+    // One old version draining, nobody's pointer, so no environment subtracts it:
+    // all three maps come back identical. This is the reported case.
+    const census = { ver_old: 2 }
+    threeEnvironments({ prod: census, dev: census, staging: census })
+
+    render(<EnvironmentsView state={state} onToast={() => {}} />)
+    await screen.findByText('prod')
+
+    // Summing the rows read "3" here — the pointer count, not the retention count,
+    // and it would have climbed to 4 the day someone added a fourth environment
+    // without a single extra version being held open.
+    expect(retainedTile().textContent).toBe('1')
+    expect(retainedTile().className).toContain('amber')
+  })
+
+  it("never counts a version that is still some environment's live pointer", async () => {
+    // prod serves ver_prod and it has 3 non-terminal runs. prod's map omits it (its
+    // own pointer); dev's and staging's list it, because that exclusion is made per
+    // environment. So a plain union over the maps reports two retained versions, one
+    // of which is serving production this second — which "older versions still
+    // pinned" flatly denies. Only ver_old is older, and only ver_old is retained.
+    threeEnvironments({
+      prod: { ver_old: 2 },
+      dev: { ver_prod: 3, ver_old: 2 },
+      staging: { ver_prod: 3, ver_old: 2 },
+    })
+
+    render(<EnvironmentsView state={state} onToast={() => {}} />)
+    await screen.findByText('prod')
+
+    expect(retainedTile().textContent).toBe('1')
+  })
+
+  /**
+   * A deliberate regression guard, and the one test here that also passed before the
+   * fix: summing empty maps and unioning empty maps both give zero, so it cannot
+   * catch §5.13. It catches the way the FIX can go wrong instead. The derivation now
+   * walks every environment's pointers as well as its pinned map, and an accident
+   * there — adding pointers to the set instead of subtracting them, say — turns a
+   * healthy agent amber and sends someone hunting for versions to retire that do not
+   * exist. Zero has to survive the rewrite as loudly as three-becoming-one does.
+   */
+  it('reads a fully drained agent as zero, not as something to go and look at', async () => {
+    threeEnvironments({ prod: {}, dev: {}, staging: {} })
+
+    render(<EnvironmentsView state={state} onToast={() => {}} />)
+    await screen.findByText('prod')
+
+    expect(retainedTile().textContent).toBe('0')
+    // Amber is this console's "there is work waiting here". Nothing is waiting.
+    expect(retainedTile().className).not.toContain('amber')
+  })
+
+  it('keeps the agent-wide retention count out of the per-environment rows', async () => {
+    const census = { ver_old: 2, ver_older: 1 }
+    threeEnvironments({ prod: census, dev: census, staging: census })
+
+    render(<EnvironmentsView state={state} onToast={() => {}} />)
+    await screen.findByText('prod')
+
+    // The table may not make a retention claim at all. There is no per-environment
+    // retention in this payload to make one from, and the badge that used to sit
+    // here printed the identical agent-wide number in all three rows — "2 pinned"
+    // beside `dev` reads as a fact about dev. §5.13's decision: the count belongs to
+    // the tile, which summarises the whole table, and the specifics to the
+    // environment panel's "Retained versions" list.
+    const headers = [...document.querySelectorAll('table.tbl th')].map((th) => th.textContent)
+    expect(headers).not.toContain('Retention')
+    const cells = [...document.querySelectorAll('table.tbl td')].map((td) => td.textContent ?? '')
+    expect(cells.some((t) => /pinned|drained/i.test(t))).toBe(false)
+    // Moved, not deleted — and it is the number of versions, not a constant 1.
+    expect(retainedTile().textContent).toBe('2')
   })
 })
 

@@ -130,7 +130,7 @@ def test_an_over_quota_event_is_refused_by_the_api_not_by_a_worker(offline_api):
     second = client.post("/agents/boundary-agent/events",
                          json={"type": "message.received", "payload": {"email": "b@x.com"}})
     assert second.status_code == 429
-    assert second.json()["code"] == "E_QUOTA_EXCEEDED"
+    assert second.json()["error"]["code"] == "E_QUOTA_EXCEEDED"
 
 
 # ---- approval resume ------------------------------------------------------
@@ -198,7 +198,7 @@ def test_a_second_approve_is_refused_rather_than_resuming_twice(paused):
     assert client.post(f"/approvals/{approval['id']}/approve").status_code == 200
     second = client.post(f"/approvals/{approval['id']}/approve")
     assert second.status_code == 409
-    assert second.json()["detail"]["code"] == "E_APPROVAL_NOT_PENDING"
+    assert second.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
 
 
 def test_reject_stays_synchronous_because_it_runs_no_tenant_code(paused):

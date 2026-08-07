@@ -65,8 +65,13 @@ interface VersionRecord {
 /**
  * `GET /agents/{a}/environments/{env}` (`describe_environment`).
  *
- * `pinnedRuns` maps an OLDER version id to how many runs are still pinned to it —
- * §9's drain step, and the number that answers "can I retire anything yet?".
+ * `pinnedRuns` maps a version id to how many runs are still pinned to it — §9's
+ * drain step, and the number that answers "can I retire anything yet?".
+ *
+ * Mind the scope, which is the mistake §5.13 records: the map is AGENT-wide, not
+ * environment-wide. Every environment answers with the same census of versions
+ * holding a live run, less only its own current pointer, so these maps may not be
+ * added up across rows — see `retainedVersionsAcrossAgent`.
  */
 interface EnvDescription {
   name?: string
@@ -722,9 +727,15 @@ function EnvironmentDetail({
         </>
       )}
 
+      {/* The scope is spelled out because the panel around it is one environment,
+          and this list is not: `describe_environment` subtracts only THIS
+          environment's pointer from an agent-wide census of versions with live runs
+          (see `retainedVersionsAcrossAgent`). Naming that is the whole difference
+          between this table and §5.13 — the environments list drew the same data as
+          a per-row badge and turned an agent fact into an environment claim. */}
       <SecRow
         left="Retained versions"
-        right="held open because runs are still pinned to them · §9 drain"
+        right="agent-wide · held open because runs are still pinned to them · §9 drain"
       />
       <Table
         rows={stale}
@@ -813,6 +824,50 @@ interface EnvRow {
   /** `null` when `describe_environment` failed for this one row; the table degrades. */
   desc: EnvDescription | null
   gate?: Gate
+}
+
+/**
+ * Which versions this AGENT is still retaining — the set, not a per-row count.
+ *
+ * `pinnedRuns` arrives once per environment and looks like an environment fact.
+ * It is not one. `deployments.py: describe_environment` walks
+ * `store.version_list(agent=agent)`, and `deployments.py: pinned_runs` scans
+ * `store.list_runs()` with no environment filter at all, so what comes back is a
+ * single agent-wide census of "versions with a live run", repeated in every row.
+ * The only per-environment thing about it is one subtraction: each row leaves out
+ * its OWN current pointer.
+ *
+ * Audit §5.13 is what happens when that is read row-wise. The tile summed
+ * `Object.keys(...).length` across the rows, so the same census was counted once
+ * per environment: three environments draining one old version reported "3", and
+ * the number grew when someone added a staging pointer, which changes nothing
+ * about what can be retired.
+ *
+ * Hence a union, MINUS every live pointer. The subtraction is not tidiness — it is
+ * forced by that asymmetry. prod's map omits prod's current version, but dev's map
+ * still lists it, so a plain union readmits a version that is promoted RIGHT NOW
+ * and files it under "older versions still pinned". Live pointers are read from
+ * all three places a row can carry one, because the list route and
+ * `describe_environment` are separate payloads and either may be the one that
+ * arrived.
+ *
+ * Deriving it here, once, under a name that says "across agent" out loud, is the
+ * actual fix: the readers below cannot re-invent it and cannot disagree about it.
+ */
+function retainedVersionsAcrossAgent(rows: EnvRow[]): Set<string> {
+  const live = new Set<string>()
+  for (const r of rows) {
+    for (const id of [r.env.currentVersionId, r.desc?.currentVersionId, r.desc?.currentVersion?.id]) {
+      if (id) live.add(id)
+    }
+  }
+  const retained = new Set<string>()
+  for (const r of rows) {
+    for (const id of Object.keys(r.desc?.pinnedRuns ?? {})) {
+      if (!live.has(id)) retained.add(id)
+    }
+  }
+  return retained
 }
 
 export function EnvironmentsView({
@@ -906,7 +961,11 @@ export function EnvironmentsView({
   }
 
   const promoted = rows.filter((r) => r.desc?.currentVersion).length
-  const retained = rows.reduce((n, r) => n + Object.keys(r.desc?.pinnedRuns ?? {}).length, 0)
+  // Distinct retained versions for the agent — see `retainedVersionsAcrossAgent`.
+  // The tile's own sub-label ("older versions still pinned") is the specification:
+  // a version that some environment is pointing at today is not an older version,
+  // however many other environments still list it in their pinnedRuns map.
+  const retained = retainedVersionsAcrossAgent(rows).size
   const gated = rows.filter((r) => r.gate?.enforced).length
 
   return (
@@ -977,13 +1036,23 @@ export function EnvironmentsView({
                 <span className="dim">—</span>
               ),
           },
-          {
-            header: 'Retention',
-            cell: (r) => {
-              const n = Object.keys(r.desc?.pinnedRuns ?? {}).length
-              return n ? <span className="pb appr">{n} pinned</span> : <span className="dim">drained</span>
-            },
-          },
+          // There is deliberately no "Retention" column here any more, §5.13.
+          //
+          // The cell used to render `Object.keys(desc.pinnedRuns).length` as
+          // "N pinned", which is the agent-wide census described above wearing a
+          // row's clothes: every environment printed the SAME number, so "2 pinned"
+          // sat next to `dev` and said dev was holding two versions open when dev
+          // may have been drained for a week. No header wording rescues that — a
+          // column is read as a property of its row, and labelling it "agent-wide"
+          // only asks the reader to disregard the layout they are looking at.
+          //
+          // Nothing env-scoped exists to put in its place: this payload carries no
+          // per-environment retention at all. So the count goes where an agent-wide
+          // fact belongs — the Retained tile above, which already summarises the
+          // whole table — and the specifics stay one click away, where the
+          // environment panel's "Retained versions" table lists each held version
+          // by id, bundle, state and run count. That is strictly more than a badge
+          // said, and none of it is a claim about one environment.
         ]}
       />
 

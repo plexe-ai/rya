@@ -1,0 +1,55 @@
+# What `docker build` is allowed to see.
+#
+# This file is an ALLOWLIST — `*` drops the whole tree and the `!` lines add back
+# exactly what the Dockerfile copies. Written that way for one reason:
+# `src/rya/console/dist/` is a gitignored BUILD OUTPUT that lives inside a directory
+# the image needs (`COPY src ./src`). A developer who has run `npm run build` locally
+# has a `dist/` in their working tree, and without this file that stale, unversioned
+# bundle gets baked into the image and silently overrides the one the console builder
+# stage produces. The image would then differ from machine to machine while the
+# Dockerfile stayed identical — which is exactly the failure that is hardest to
+# believe when you hit it.
+#
+# The allowlist buys three more things:
+#   - `.env` cannot leak into an image layer even if a later COPY gets careless;
+#   - `.venv/`, `.git/` and `.rya/` stop being uploaded to the daemon on every build
+#     (hundreds of MB of context for a build that reads none of it);
+#   - adding a COPY without updating this file fails loudly at build time instead of
+#     quietly shipping something unintended.
+#
+# Adding a COPY to the Dockerfile? Add its path here too.
+
+*
+
+# The Python distribution metadata. `pyproject.toml` declares
+# `license-files = ["LICENSE"]` and `readme = "README.md"`; hatchling reads both
+# during `pip install .`, so neither is optional.
+!pyproject.toml
+!README.md
+!LICENSE
+
+# The platform itself.
+!src
+
+# The console source, compiled by the `console` builder stage.
+!web/console
+
+# --- re-exclusions inside the allowed paths ------------------------------------
+
+# The whole point of this file. Built by the `console` stage, never copied from the
+# host. See docs/PACKAGING.md.
+src/rya/console/dist
+
+# 100+ MB of host-resolved dependencies, most of them platform-specific. The builder
+# stage runs its own `npm ci` from the lockfile.
+web/console/node_modules
+web/console/.vite
+web/console/vite.config.ts.timestamp-*
+
+# Byte-compiled and cached artefacts from the host's interpreter, which is not
+# necessarily the image's.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info

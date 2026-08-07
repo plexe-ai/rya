@@ -35,9 +35,27 @@ interface GuardRule {
   pattern?: string
   methods?: string[]
   note?: string
+  /**
+   * LEGACY spelling, **read only**. `guard.py: _compile_matcher` reads `pattern`,
+   * so a rule carrying `url` compiles against `""` and matches every URL. `toDraft`
+   * migrates it; `toPolicy` never emits it.
+   */
+  url?: string
 }
 
-/** The policy document, as stored and as `PUT` back. `guard.py: _normalize`. */
+/**
+ * The policy document, as stored and as `PUT` back. `guard.py: _normalize`.
+ *
+ * The index signature is load-bearing, not decoration. `_normalize` is
+ * `dict(policy or {})` plus four `setdefault`s — the document is **open-world** on
+ * the server, and `save_policy` REPLACES rather than merges. `grounding`
+ * (`guard.py:649`) and `secrecy` (`guard.py:204`) are both real top-level keys that
+ * this editor does not model, and shipped policies set them.
+ *
+ * So a closed five-key type here is not "the subset we render" — it is a promise
+ * that no other key exists, and PUTting a value built from it deletes every key
+ * that does. `toPolicy` round-trips the whole document for exactly this reason.
+ */
 interface GuardPolicyDoc {
   /** Free prose, evaluated by the LLM judge when no static rule matches. */
   policy?: string
@@ -45,6 +63,8 @@ interface GuardPolicyDoc {
   ssrf?: boolean
   default?: string
   fail?: string
+  /** Everything the editor does not model — carried through a save untouched. */
+  [key: string]: unknown
 }
 
 /** `guard.py: run_tests` — the self-test that scores the policy. */
@@ -112,6 +132,14 @@ interface Draft {
   default: Action
   fail: 'open' | 'closed'
   rules: DraftRule[]
+  /**
+   * The document this draft was loaded from, verbatim. Held so that `toPolicy` can
+   * emit the keys the editor does not model instead of dropping them — a save is a
+   * full replace on the server, so anything absent from the PUT is deleted.
+   */
+  base: GuardPolicyDoc
+  /** How many rules arrived under the legacy `url:` key. See `toDraft`. */
+  legacy: number
 }
 
 let seq = 0
@@ -119,8 +147,19 @@ const uid = () => `gr${++seq}`
 
 const KINDS = ['glob', 'prefix', 'exact']
 
+/**
+ * Document → editable draft.
+ *
+ * Reads `url:` as a fallback for `pattern:`. That spelling is not a synonym the
+ * server understands — `_compile_matcher` reads `pattern`, so a `url:` rule is
+ * currently matching *every* URL, and under `default: deny` the file reads like an
+ * allowlist while behaving as allow-everything. Rendering those rows blank (which is
+ * what `r.pattern ?? ''` did) hid that, and then handed the operator a Save button
+ * that would delete them. Show the URL, say so in a banner, and rewrite it on save.
+ */
 function toDraft(doc: GuardPolicyDoc | undefined): Draft {
   const d = doc ?? {}
+  const raw = d.rules ?? []
   return {
     prose: d.policy ?? '',
     // The server's defaults (`_normalize`): SSRF blocklist on, default deny, fail
@@ -128,53 +167,71 @@ function toDraft(doc: GuardPolicyDoc | undefined): Draft {
     ssrf: d.ssrf !== false,
     default: d.default === 'allow' ? 'allow' : 'deny',
     fail: d.fail === 'open' ? 'open' : 'closed',
-    rules: (d.rules ?? []).map((r) => ({
+    rules: raw.map((r) => ({
       key: uid(),
       action: r.action === 'deny' ? 'deny' : 'allow',
       kind: KINDS.includes(r.kind ?? '') ? (r.kind as string) : 'glob',
-      pattern: r.pattern ?? '',
+      pattern: r.pattern ?? r.url ?? '',
       methods: (r.methods ?? []).join(', '),
       note: r.note ?? '',
     })),
+    base: d,
+    legacy: raw.filter((r) => !r.pattern && r.url).length,
   }
 }
 
 /**
  * Draft → the document that gets PUT.
  *
- * The field is **`pattern`**. `guard.py: _matcher` reads `rule.get("pattern", "")`,
- * so a rule written with `url:` instead compiles to `startswith("")` — it matches
- * every URL, and under `default: deny` that one misspelling turns an allowlist into
- * "allow everything" while still reading like a locked-down policy.
- * `examples/crizac/rya.guard.yaml` has exactly that bug. This editor can only emit
- * `pattern`, which is the point of having the shape in one place.
+ * **The loaded document is spread first.** `save_policy` (`guard.py:405`) normalises
+ * with `dict(policy or {})` and writes that — a replace, not a merge — so this
+ * function's return value *is* the new policy in full. Emitting only the five keys
+ * the editor models deleted `grounding` (silently disabling the anti-hallucination
+ * gate, which is opt-in and therefore fails OPEN when absent) and `secrecy` (wiping
+ * every redaction pattern), from a button labelled "Save policy", with no error.
+ * Whatever else the document carries, it survives; the five modelled keys win.
  *
- * Patternless rows are dropped rather than saved: a rule with an empty pattern is
- * the `startswith("")` hazard again, arrived at from the other direction.
+ * The rule field is **`pattern`**, never `url` — see `GuardRule.url`.
+ *
+ * Patternless rows are emitted here rather than filtered out, so they are visible to
+ * the dirty check and to `patternless()`. They must never reach the wire: an empty
+ * pattern compiles to `startswith("")` and matches everything. `save()` refuses
+ * instead, because dropping a row the operator can see on screen is how three real
+ * allow rules disappeared under a `default: deny`.
  */
 function toPolicy(draft: Draft): GuardPolicyDoc {
   return {
+    ...draft.base,
     ssrf: draft.ssrf,
     default: draft.default,
     fail: draft.fail,
     policy: draft.prose,
-    rules: draft.rules
-      .filter((r) => r.pattern.trim())
-      .map((r) => ({
-        action: r.action,
-        kind: r.kind,
-        pattern: r.pattern.trim(),
-        methods: r.methods
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        note: r.note.trim(),
-      })),
+    rules: draft.rules.map((r) => ({
+      action: r.action,
+      kind: r.kind,
+      pattern: r.pattern.trim(),
+      methods: r.methods
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      note: r.note.trim(),
+    })),
   }
 }
 
+/** Rows that would compile to a match-everything matcher. Blocks the save. */
+const patternless = (draft: Draft) => draft.rules.filter((r) => !r.pattern.trim()).length
+
 /** Stable serialization used only to answer "is this draft dirty?". */
 const fingerprint = (draft: Draft) => JSON.stringify(toPolicy(draft))
+
+/**
+ * A baseline no `fingerprint` can equal, used when the loaded document needs
+ * rewriting (`url:` → `pattern:`). The draft genuinely differs from what is stored,
+ * so it reads dirty and Save is live — otherwise the migration banner would point at
+ * an inert button.
+ */
+const NEEDS_MIGRATION = ''
 
 export function GuardView({
   state,
@@ -203,14 +260,21 @@ export function GuardView({
     if (!data) return
     const next = toDraft(data.policy)
     setDraft(next)
-    setBaseline(fingerprint(next))
+    setBaseline(next.legacy > 0 ? NEEDS_MIGRATION : fingerprint(next))
     setTests(data.tests ?? null)
   }, [data])
 
   const dirty = !!draft && fingerprint(draft) !== baseline
+  const blank = draft ? patternless(draft) : 0
 
   async function save() {
     if (!draft) return
+    // Belt and braces: the button is disabled for this, but a save that silently
+    // drops the offending rows is the failure being fixed, so refuse loudly here too.
+    if (patternless(draft) > 0) {
+      onToast('Every rule needs a pattern — an empty one matches every URL.')
+      return
+    }
     setSaving(true)
     try {
       const policy = toPolicy(draft)
@@ -320,6 +384,19 @@ export function GuardView({
       {data?.error && (
         <Empty icon={TriangleAlert}>Policy unreadable, failing closed — {data.error}</Empty>
       )}
+      {/* A `url:` rule is not a rule with a typo — it is a rule matching everything.
+          The operator has to know that saving TIGHTENS egress, because that is the
+          one change here that can break a working agent. */}
+      {draft.legacy > 0 && (
+        <Empty icon={TriangleAlert}>
+          {draft.legacy} rule{draft.legacy === 1 ? '' : 's'} in this policy use the legacy{' '}
+          <code>url:</code> key, which the matcher does not read — {draft.legacy === 1 ? 'it is' : 'they are'}{' '}
+          currently matching <strong>every</strong> URL. Saving rewrites{' '}
+          {draft.legacy === 1 ? 'it' : 'them'} to <code>pattern:</code> so{' '}
+          {draft.legacy === 1 ? 'it matches' : 'they match'} what {draft.legacy === 1 ? 'it says' : 'they say'}.
+          Check the patterns below first.
+        </Empty>
+      )}
 
       <div className="gcard">
         <div className="gch">
@@ -371,9 +448,20 @@ export function GuardView({
         right={
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
             {/* The draft state, in words. Without this, "did my edit take?" has no
-                answer short of reloading the page. */}
-            <span className="dim">{dirty ? 'unsaved changes' : 'saved'}</span>
-            <button className="btn dark sm" onClick={() => void save()} disabled={saving || !dirty}>
+                answer short of reloading the page — and a disabled Save button with
+                no stated reason reads as a broken button. */}
+            <span className="dim">
+              {blank > 0
+                ? `${blank} rule${blank === 1 ? '' : 's'} need${blank === 1 ? 's' : ''} a pattern`
+                : dirty
+                  ? 'unsaved changes'
+                  : 'saved'}
+            </span>
+            <button
+              className="btn dark sm"
+              onClick={() => void save()}
+              disabled={saving || !dirty || blank > 0}
+            >
               <Save aria-hidden="true" focusable="false" />
               {saving ? 'Saving…' : 'Save policy'}
             </button>

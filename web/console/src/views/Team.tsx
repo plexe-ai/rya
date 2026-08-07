@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { KeyRound, LogIn, UserPlus, Users } from 'lucide-react'
-import { API, getEmail, getSession, sessionPost } from '../lib/api'
+import { API, getEmail, getSession, readErrorMessage, sessionPost } from '../lib/api'
 import { useLoad } from '../lib/usePoll'
 import type { ConsoleState } from '../lib/types'
 import { Ago, CopyId, Empty, Mono, SecRow, Table, ViewHeader } from '../components/ui'
@@ -65,8 +65,9 @@ interface Team {
 // ---- session-authenticated GET / DELETE --------------------------------------
 // lib/api.ts exports `sessionPost` but no session GET or DELETE, and this is the
 // only view that needs them, so they live here rather than growing the shared
-// module. Same header, same `{detail:{message}}` unwrapping — plus the status,
-// because 403 has to be told from a genuine failure.
+// module. Same header, and the one error envelope read through the shared
+// `readErrorMessage` — plus the status, because 403 has to be told from a genuine
+// failure.
 
 const SESSION_KEY = 'rya_session'
 
@@ -88,13 +89,18 @@ async function sessionFetch<T>(path: string, method: 'GET' | 'DELETE'): Promise<
     method,
     headers: { 'content-type': 'application/json', Authorization: `Bearer ${session}` },
   })
-  const d = await r.json().catch(() => ({}))
+  // One read: a Response body is a stream and cannot be consumed twice.
+  const d = await r.json().catch(() => null)
   // A rejected session is a stale session: drop it so the rest of the console stops
   // claiming to be signed in. The workspace API key is a different credential and is
   // deliberately left alone — losing it would sign the operator out of everything.
   if (r.status === 401) localStorage.removeItem(SESSION_KEY)
-  if (!r.ok) throw new SessionError(d?.detail?.message || `HTTP ${r.status}`, r.status)
-  return d as T
+  // The fourth and last copy of the error parse, now reading the one envelope.
+  // Team keeps its own `fetch` because it authenticates with the ACCOUNT session
+  // rather than the workspace key — but it must not keep its own idea of what a
+  // failure looks like.
+  if (!r.ok) throw new SessionError(readErrorMessage(d, r.status), r.status)
+  return (d ?? {}) as T
 }
 
 const enc = encodeURIComponent

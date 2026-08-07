@@ -74,6 +74,27 @@ export function KnowledgeView({
    */
   const [submitted, setSubmitted] = useState('')
 
+  /**
+   * The "go" signal, kept separate from the query TEXT — a monotonic counter.
+   *
+   * §5.16: `submitted` was doing both jobs at once, and the two want opposite things.
+   * A value DEDUPLICATES by design — `setSubmitted('refunds')` while `submitted` is
+   * already `'refunds'` is a no-op, React bails out, `useLoad`'s deps never change and
+   * no request goes out at all. An event must not deduplicate. So pressing Search a
+   * second time on the same term did nothing whatsoever: no fetch, no spinner, nothing
+   * on screen. The two cases where an operator does exactly that are retrying a failed
+   * search, and re-running a query after ingesting a document — which is the single
+   * most likely reason to press it twice.
+   *
+   * A counter in the dependency list is the console's existing idiom for "this
+   * happened again": it is the shape of the shell's refresh signal (`lib/refresh.ts`),
+   * which `useLoad` already folds into these same deps. Bumping it keeps ONE code path
+   * for "run a search" — a new query and a repeat are the same submit — rather than a
+   * separate escape hatch (`reload()`) for the repeat, which would be a second way to
+   * start a search for the next change to forget about.
+   */
+  const [searchTick, setSearchTick] = useState(0)
+
   const { data, error, loading } = useLoad<SearchResponse | null>(
     () =>
       submitted
@@ -83,23 +104,50 @@ export function KnowledgeView({
             body: JSON.stringify({ query: submitted, limit: LIMIT }),
           })
         : Promise.resolve(null),
+    // `searchTick` is what makes a REPEAT search actually re-run. `submitted` stays
+    // beside it because it is what the request is made OF, and a dependency list that
+    // omits a value the fetcher reads is a trap for whoever edits this next.
     // The agent too: a query result belongs to one agent's knowledge base, and
     // switching agents must not leave the previous one's hits on screen.
-    [submitted, state.agent.name],
+    [submitted, searchTick, state.agent.name],
   )
 
-  // A failed search is worth a toast, but it must not replace the document list: the
-  // view is still telling the truth about what is ingested. In an effect rather than
-  // inline, because toasting is the parent's state and firing it during render is how
-  // a render loop starts. `onToast` is deliberately not a dependency — a parent that
-  // re-creates the callback would otherwise re-announce a stale failure.
+  /**
+   * A failed search is worth a toast, but it must not replace the document list: the
+   * view is still telling the truth about what is ingested. In an effect rather than
+   * inline, because toasting is the parent's state and firing it during render is how
+   * a render loop starts.
+   *
+   * **The dependency list is the whole subtlety here, and it is the second half of
+   * §5.16.** It was `[error, submitted]`, which fails in both directions:
+   *
+   *  - A retry that fails AGAIN with the same message on the same query changes
+   *    neither dep, so the second failure was swallowed in silence — the console
+   *    reading as "nothing happened", which is the very complaint §5.16 is about.
+   *  - Anything that changes at SUBMIT time — `submitted`, and `searchTick` if it were
+   *    listed here — re-runs this effect while `error` still holds the PREVIOUS
+   *    attempt's message. `useLoad` clears `error` only on SUCCESS (`reload` opens with
+   *    `setLoading(true)` and leaves the standing failure alone until the new one
+   *    settles), so submitting a new query after a failure announced the OLD failure
+   *    instantly, for a request that had not been made yet.
+   *
+   * The only honest trigger is therefore the SETTLE, and the only signal for it is
+   * `loading` falling back to false — hence the guard. Do not add `searchTick` or
+   * `submitted` to these deps to "make it fire more"; that reintroduces the stale
+   * toast above. `onToast` is deliberately not a dependency either — a parent that
+   * re-creates the callback would otherwise re-announce a failure on its own.
+   */
   useEffect(() => {
+    if (loading) return
     if (error && submitted) onToast(`Search failed — ${error}`)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [error, submitted])
+  }, [loading, error])
 
   function submit() {
     setSubmitted(query.trim())
+    // Unconditional, and that is the fix: an event that only fires when the value
+    // changed is not an event.
+    setSearchTick((n) => n + 1)
   }
 
   return (

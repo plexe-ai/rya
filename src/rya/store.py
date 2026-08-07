@@ -260,6 +260,44 @@ def apply_worker_liveness(docs: List[dict], status: Optional[str] = None,
     return out
 
 
+def run_matches(run: dict, status: Optional[str] = None, query: Optional[str] = None) -> bool:
+    """Does this run belong in a filtered runs listing?
+
+    Defined here, once, because three surfaces have to agree on it: the file
+    backend applies it in Python, the Postgres backend pushes the same predicate
+    into SQL, and the console's filter pills report counts alongside it. When the
+    definition lived in only one of them, the console filtered inside a 30-row
+    dashboard preview and told the operator "No runs match" about runs it had
+    simply never been sent (audit §5.1).
+
+    A faithful port of the client-side filter it replaces (the deleted
+    ``filterRuns`` in ``web/console/src/lib/runs.ts``), because operators have
+    habits: status is an EQUALITY match, and the query is a case-insensitive
+    SUBSTRING of the run id or the trigger. Anything looser or stricter would
+    quietly change what a bookmarked filter means.
+    """
+    if status and run.get("status") != status:
+        return False
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    return q in str(run.get("id") or "").lower() or q in str(run.get("trigger") or "").lower()
+
+
+def _page(rows: List[dict], limit: Optional[int], offset: int) -> List[dict]:
+    """One window onto an already-ordered list. ``limit=None`` means everything.
+
+    Bounds-checking a page is the caller's job at the edge (the api clamps to a
+    ceiling so ``?limit=10000000`` cannot be used to make the process
+    materialise a whole workspace); this only has to be total, so a nonsense
+    offset yields an empty page rather than raising at an operator.
+    """
+    start = max(0, int(offset or 0))
+    if limit is None:
+        return rows[start:]
+    return rows[start:start + max(0, int(limit))]
+
+
 class FileStore:
     """File-backed store (zero-config local / OSS dev). Default backend."""
 
@@ -351,6 +389,28 @@ class FileStore:
                 runs.append(data)
         runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
         return runs
+
+    def list_runs_page(self, agent: Optional[str] = None, *, status: Optional[str] = None,
+                       query: Optional[str] = None, limit: Optional[int] = None,
+                       offset: int = 0) -> Dict[str, Any]:
+        """One window onto the runs list, plus the size of the whole filtered set.
+
+        Exists for the same reason ``run_counts`` does: a caller that only needs
+        50 rows should not have to receive every run to get them, and a caller
+        that needs "rows 51-100 of the 412 failed runs matching 'refund'" cannot
+        assemble that from a fixed-size preview at all.
+
+        ``count`` is the size of the FILTERED set, never of the page. That is the
+        N in the console's "showing 50 of 412", and it is deliberately not
+        derivable from the page: a client that tries ends up doing what audit
+        §5.1 describes.
+
+        A file backend has no index, so this still reads every run document —
+        the win is on Postgres, where the identical call becomes a COUNT plus a
+        LIMIT and never materialises the tail.
+        """
+        rows = [r for r in self.list_runs(agent) if run_matches(r, status, query)]
+        return {"runs": _page(rows, limit, offset), "count": len(rows)}
 
     def run_counts(self, since: Optional[str] = None) -> Dict[str, int]:
         """Runs per status, optionally only those created at/after ``since``.
@@ -679,6 +739,20 @@ class FileStore:
                 out.append({k: v for k, v in doc.items() if k != "messages"})
         out.sort(key=lambda s: s.get("lastMessageAt", ""), reverse=True)
         return out
+
+    def list_sessions_page(self, agent: Optional[str] = None, *, limit: Optional[int] = None,
+                           offset: int = 0) -> Dict[str, Any]:
+        """One window onto the sessions list, plus the total for this agent.
+
+        The sibling of ``list_runs_page`` and the same contract: ``count`` is the
+        total, not the page length, so "showing 50 of 137" is answerable. No
+        status/query filter here because no surface asks for one yet — sessions
+        are already summaries (``list_sessions`` strips ``messages``), so the
+        payload problem paging solves for runs does not exist, only the
+        reachability one (audit §5.2: conversation 51 could not be opened at all).
+        """
+        rows = self.list_sessions(agent)
+        return {"sessions": _page(rows, limit, offset), "count": len(rows)}
 
     def find_session(self, agent: str, channel: str, external_id: str) -> Optional[dict]:
         for p in self.sessions_dir.glob("ses_*.json"):

@@ -64,7 +64,11 @@ s3 = ["boto3>=1.34"]          # Object storage: file bytes (files_s3.py) and bun
                               # necessarily using Bedrock as their model provider.
 deepeval = ["deepeval>=1.0"]  # LLM-output-quality eval metrics (`deepeval` scorer); needs a
                               # judge key (OPENAI_API_KEY, or ANTHROPIC_API_KEY + the `anthropic` pkg via rya[llm])
-dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27", "ruff>=0.16"]
+dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27", "ruff>=0.16",
+       "pypdf>=4.0"]  # `documents.py` imports pypdf lazily and raises E_VALIDATION with an
+                      # install hint when it is absent, so it is deliberately not a runtime
+                      # dependency — but tests/test_documents.py builds real PDFs to exercise
+                      # the page-cap split, and without this the suite fails on a clean CI box.
 
 # The platform keeps the full CLI under `rya` — an operator's muscle memory and
 # every docs/compose invocation (`rya serve`, `rya worker`) is unchanged — and

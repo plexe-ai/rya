@@ -1,0 +1,137 @@
+# Release: build the two published wheels from a tag, prove they are shippable, and
+# attach them to the GitHub Release.
+#
+# The ordering here is the whole point. `scripts/build_console.sh` has always been
+# correct and, until this file, nothing called it — so the console got built by
+# whoever remembered, and a wheel built by someone who did not remember is
+# indistinguishable from a good one until an operator opens `/` and gets a 503. The
+# console is built FIRST, and the wheel is asserted to contain it before anything is
+# published.
+#
+# See docs/PACKAGING.md for why there are two wheels, why `rya` and `rya-server` are
+# mutually exclusive, and why the repo root is never built.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Lets a maintainer rehearse the whole path — build, assert, upload artifacts —
+  # without cutting a tag. The GitHub Release step is skipped on this path.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build and verify the wheels
+    runs-on: ubuntu-latest
+    permissions:
+      # Only to attach the built wheels to the Release this tag created.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/console/package-lock.json
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The tag is the version claim. A `v0.2.0` tag cut from a tree that still says
+      # `version = "0.1.0"` publishes 0.1.0 over an existing release or fails deep
+      # inside the upload — either way the diagnosis happens after the mistake.
+      # PACKAGING.md requires the root and packaging/server versions to agree; this
+      # checks the tag against both.
+      - name: The tag matches the declared version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          import sys, tomllib
+          tag = sys.argv[1]
+          for path in ('pyproject.toml', 'packaging/server/pyproject.toml', 'packaging/sdk/pyproject.toml'):
+              with open(path, 'rb') as fh:
+                  v = tomllib.load(fh)['project']['version']
+              if v != tag:
+                  sys.exit(f'tag is v{tag} but {path} declares {v}')
+          print(f'version ok — every pyproject declares {tag}')
+          PY
+
+      # `npm ci && npm run test && npm run build`, into src/rya/console/dist. Node is a
+      # release-time dependency only; this is the step that makes that true.
+      - name: Build the console
+        run: scripts/build_console.sh
+
+      # Wheels only. `python -m build` without --wheel builds an sdist first and then a
+      # wheel FROM that sdist, which cannot work here — the sdist would carry the
+      # sources at `rya/...` while the pyproject inside it still points at
+      # `../../src/rya/...`. And never the repo root: `uv build --wheel .` produces a
+      # file named exactly like the thin SDK containing the entire platform.
+      - run: uv build --wheel packaging/sdk    -o dist/sdk
+      - run: uv build --wheel packaging/server -o dist/server
+
+      # The assertion this whole file is ordered around. Verified locally that a server
+      # wheel built with no `dist/` present builds CLEANLY and only fails here.
+      - name: The server wheel actually contains the console
+        run: |
+          python3 - dist/server/rya_server-*.whl <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          assets = [n for n in names if n.startswith('rya/console/dist/')]
+          if not assets:
+              sys.exit('console NOT bundled — run scripts/build_console.sh')
+          if 'rya/console/dist/index.html' not in assets:
+              sys.exit(f'console/dist present but has no index.html: {assets[:10]}')
+          print(f'console ok — {len(assets)} files')
+          PY
+
+      - name: The SDK wheel is the SDK and not the platform
+        run: |
+          python3 - dist/sdk/rya-*.whl <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          for leaked in ('rya/worker.py', 'rya/api/app.py'):
+              if leaked in names:
+                  sys.exit(f'this is the PLATFORM, not the SDK — found {leaked}')
+          if any(n.startswith('rya/console/dist/') for n in names):
+              sys.exit('the SDK wheel is carrying the console bundle')
+          print(f'sdk ok — {len(names)} entries')
+          PY
+
+      # Both wheels declare the `rya` import package and are mutually exclusive, so
+      # they are installed into separate throwaway environments. Importing is a weak
+      # check on its own; what it really proves is that the console the previous step
+      # found in the archive is reachable from the INSTALLED package.
+      - name: Each wheel installs and imports
+        run: |
+          uv venv /tmp/v-server && VIRTUAL_ENV=/tmp/v-server uv pip install dist/server/rya_server-*.whl
+          /tmp/v-server/bin/python -c "import pathlib, rya, sys; \
+          p = pathlib.Path(rya.__file__).parent / 'console' / 'dist' / 'index.html'; \
+          sys.exit(0 if p.is_file() else 'console missing from the installed server wheel')"
+          uv venv /tmp/v-sdk && VIRTUAL_ENV=/tmp/v-sdk uv pip install dist/sdk/rya-*.whl
+          /tmp/v-sdk/bin/python -c "import rya; print('sdk imports')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+          if-no-files-found: error
+
+      # Publishing to PyPI is deliberately NOT here. It needs a trusted-publishing
+      # relationship configured on both projects plus an `id-token: write` permission,
+      # and a release workflow that half-publishes is worse than one that does not.
+      # Attach the artifacts, download and `twine upload` them by hand for now, and
+      # turn this into a `pypa/gh-action-pypi-publish` step once the PyPI side exists.
+      - name: Attach the wheels to the Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/sdk/*.whl dist/server/*.whl --clobber

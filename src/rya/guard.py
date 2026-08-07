@@ -391,6 +391,35 @@ def resolve_policy(source: PolicySource = None, *, key: str = POLICY_KEY) -> Gua
     return _from_file(_legacy_ambient_path())
 
 
+def effective_policy(store: Any, agent: str | None = None, *,
+                     guard_file: str | Path | None = None) -> GuardPolicy:
+    """The policy ``agent`` is ACTUALLY governed by — the read-only half of
+    ``api.app._guard_source``.
+
+    Store row first (that is what ``PUT /guard`` writes and what the egress
+    checker resolves), then the project file for a single-agent tree that has
+    never written one. The two resolvers must agree on that precedence, because
+    when they disagree a dashboard describes a policy the runtime is not using:
+    audit §4.5, where `snapshot._governance` read `rya.guard.yaml` unconditionally
+    and so reported the file's allowlist — or "not configured", on a published
+    bundle that ships no file — while the store's policy did the enforcing.
+
+    ``_guard_source`` stays separate rather than calling this: it answers the
+    harder WRITE question, of which file a write is permitted to touch at all.
+    """
+    if hasattr(store, "policy_get"):
+        key = store_key_for(store, agent)
+        try:
+            if store.policy_get(key) is not None:
+                return resolve_policy(store, key=key)
+        except Exception as e:
+            # A read failure is a governance failure. Fail closed rather than
+            # describing the file as though it were the thing in force.
+            return _closed(f"policy store read failed: {type(e).__name__}: {e}",
+                           SOURCE_STORE)
+    return _from_file(Path(guard_file)) if guard_file is not None else NO_POLICY
+
+
 def load_policy(path: str | None = None, source: PolicySource = None) -> dict | None:
     """The raw policy dict, or ``None`` when no policy exists anywhere (no-op guard).
 

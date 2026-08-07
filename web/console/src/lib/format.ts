@@ -14,6 +14,24 @@ export function ago(ts?: string | null): string {
   return `${Math.floor(s / 86400)}d ago`
 }
 
+/**
+ * "12s" / "4m" / "3h" — a bare DURATION from an epoch-ms instant to now.
+ *
+ * Distinct from `ago()`, which parses a server timestamp string and rounds
+ * anything under a minute to "just now". The staleness readouts added for §5.9
+ * need the opposite: the first seconds are the interesting ones — a poll that has
+ * missed two ticks is 12s old, and "just now" would be a lie of precisely the kind
+ * that finding is about — and the caller supplies the noun ("4m old", "from 4m
+ * ago"), so this returns no suffix of its own.
+ */
+export function since(at: number, now: number = Date.now()): string {
+  const s = Math.max(0, (now - at) / 1000)
+  if (s < 60) return `${Math.floor(s)}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
+
 /** Absolute timestamp for the `title` tooltip beside a relative one. */
 export function absolute(ts?: string | null): string {
   if (!ts) return ''

@@ -39,6 +39,29 @@ def _multitenant() -> bool:
     return os.environ.get("RYA_MULTITENANT") == "1" and has_pg
 
 
+def run_summary(run: dict) -> dict:
+    """The one run ROW every list surface sends.
+
+    A run document carries its whole trace, so no list may ship documents: the
+    console's runs table, the WebSocket's ``run`` message and the paged
+    ``GET /agents/{id}/runs?summary=1`` all want the same compact header, and the
+    trace has its own endpoint for when someone opens one.
+
+    Defined here — and imported by ``api/app.py``, which is the direction the
+    dependency already runs — because there were three near-identical copies of
+    this projection, differing by a field each (this one grew ``createdAt``, the
+    console's aggregate omitted ``costUsd`` and ``traceLength``). Three copies of
+    a row shape is three chances for a table and its own totals to disagree.
+    """
+    from .observability.usage import run_usage
+    u = run_usage(run)
+    return {"id": run["id"], "status": run["status"], "trigger": run.get("trigger"),
+            "createdAt": run.get("createdAt"),
+            "pendingApproval": run.get("pendingApproval"), "error": run.get("error"),
+            "traceLength": len(run.get("trace", [])),
+            "tokens": u["inputTokens"] + u["outputTokens"], "costUsd": u.get("costUsd")}
+
+
 def build_snapshot(manifest, store, agent=None, recent_limit: int = 5, project_root=None) -> dict:
     treg, mreg = _tools(), _models()
     runs = store.list_runs(manifest.name)
@@ -116,45 +139,140 @@ def build_snapshot(manifest, store, agent=None, recent_limit: int = 5, project_r
 _VIOLATION_CODES = {"E_EGRESS_BLOCKED", "E_GROUNDING_BLOCKED", "E_TOOL_PERMISSION_DENIED",
                     "E_APPROVER_IDENTITY_REQUIRED", "E_BUDGET_EXCEEDED"}
 
+# How far back the derived kill-switch history reaches. Each policy record can
+# yield several rows (one per tool it changed), so this bounds reads, not rows.
+_SWITCH_LOG_LIMIT = 20
+
+
+def _switch_history(store, manifest, limit: int = _SWITCH_LOG_LIMIT) -> list:
+    """Per-tool kill-switch transitions, DERIVED from the policy log.
+
+    The console wants "who moved which tool from what to what, when". The log
+    stores document snapshots: each record is the whole `{"tool:<id>": …}` map
+    plus the whole map as it was before. So the per-tool transitions are not
+    read, they are diffed out — the log never records which tool an operator
+    touched, only the before and after of the map.
+
+    That is why this exists rather than the view simply calling
+    `policy_history`: the shapes do not line up, and the old code read a
+    hand-maintained `history` collection in the legacy memory scope that nothing
+    has written since §11.2 (audit §4.5).
+
+    `actor` comes along, because `store.py` cites §12 risk 7 — "who reviewed this
+    allowlist change is a feature" — and the field was being written on every
+    record and shown on no screen.
+    """
+    from .sdk.context import POLICY_KILLSWITCHES
+
+    reader = getattr(store, "policy_history", None)
+    if reader is None:
+        return []
+    declared = {t.id: t.permission.value for t in manifest.tools}
+    rows = []
+    for rec in reader(POLICY_KILLSWITCHES, limit):   # newest first
+        after = rec.get("value") or {}
+        before = rec.get("previous") or {}
+        common = {"ts": rec.get("changedAt"), "actor": rec.get("actor"),
+                  "version": rec.get("version")}
+        for k in sorted(set(after) | set(before)):
+            if not k.startswith("tool:"):
+                continue
+            new, old = after.get(k), before.get(k)
+            if (new or {}).get("permission") == (old or {}).get("permission"):
+                continue  # the record changed some OTHER tool
+            tool = k.split(":", 1)[1]
+            prev = (old or {}).get("permission")
+            if new is None:
+                # Cleared: the override is gone and the manifest governs again.
+                rows.append({**common, "tool": tool, "cleared": True,
+                             "permission": declared.get(tool), "previous": prev})
+            else:
+                rows.append({**common, "tool": tool, "cleared": False,
+                             "permission": new.get("permission"), "previous": prev,
+                             "reason": new.get("reason")})
+    return rows
+
 
 def _governance(manifest, store, runs, project_root) -> dict:
     """The control-plane governance surface: what is enforced, under which
     policy version, what has been overridden, and what got blocked. Everything
-    here reflects REAL enforcement state - nothing is aspirational."""
+    here reflects REAL enforcement state - nothing is aspirational.
+
+    That last sentence was not true and is the point of this function's shape.
+    Audit §4.5: both governed sources had moved and neither read moved with them.
+    Kill switches came from `load_memory("_runtime_config")`, the pre-§11.2 scope
+    that nothing writes any more — so an operator who killed a tool during an
+    incident saw "No overrides." on the one screen they opened to confirm it. And
+    egress came from `rya.guard.yaml` on disk while the Guard editor writes the
+    store, so on a published bundle (no file) this reported "off · 0 rules" over
+    a deny-default policy that was actively refusing requests.
+
+    Three rules follow, and every value below obeys them:
+
+      * **Read what enforces.** `read_killswitches` and `effective_policy` are
+        the readers the runtime itself uses. Not a copy of them.
+      * **Report the EFFECTIVE state.** Tool counts are manifest ∘ kill switches,
+        because "Denied: 0" while a tool is killed is the same lie in a tile.
+      * **A source that cannot be read says so.** `switchesError`/`egressError`
+        exist so an unreachable policy store renders as "could not read" and
+        never as the empty table that means "nothing is overridden".
+    """
     import hashlib
     import json as _json
 
-    env = os.environ
-    guard_path = Path(project_root) / "rya.guard.yaml"
-    guard_txt = guard_path.read_text() if guard_path.exists() else ""
-    try:
-        import yaml as _yaml
-        gy = _yaml.safe_load(guard_txt) or {}
-    except Exception:
-        gy = {}
-    grounding_on = bool((gy.get("grounding") or {}).get("enabled"))
     from .auth import jwt_configured
+    from .guard import GUARD_FILE, effective_policy
+    from .sdk.context import read_killswitches
     from .seal import available as seal_available
 
+    env = os.environ
+
+    # ---- egress + grounding: the policy actually in force -------------------
+    gp = effective_policy(store, manifest.name,
+                          guard_file=Path(project_root) / GUARD_FILE if project_root else None)
+    gy = gp.policy if gp.enforced else {}
+    grounding_on = bool((gy.get("grounding") or {}).get("enabled"))
+
+    # ---- tool permissions: manifest, as overridden --------------------------
+    try:
+        switches, switches_error = read_killswitches(store), None
+    except Exception as e:
+        # Fail LOUD, not empty. `_effective_tool_permission` fails closed on the
+        # same error; a dashboard's job is to say the reading is unavailable.
+        switches, switches_error = {}, f"{type(e).__name__}: {e}"
+
+    def _effective(t) -> str:
+        return (switches.get(f"tool:{t.id}") or {}).get("permission") or t.permission.value
+
+    effective = {t.id: _effective(t) for t in manifest.tools}
     pinned = sum(1 for t in manifest.tools if getattr(t, "pin", None))
-    gated = sum(1 for t in manifest.tools if t.permission.value == "approval_required")
-    denied = sum(1 for t in manifest.tools if t.permission.value == "disabled")
+    gated = sum(1 for v in effective.values() if v == "approval_required")
+    denied = sum(1 for v in effective.values() if v == "disabled")
+    overridden = sum(1 for t in manifest.tools if effective[t.id] != t.permission.value)
 
     # The policy document is everything that constrains the agent. Its hash is
-    # the version an auditor can pin a run to.
+    # the version an auditor can pin a run to — so it has to cover what is in
+    # force, not what was declared. It hashes the guard's ETAG (a content hash of
+    # the normalised live policy, whatever source it came from) rather than file
+    # bytes, and effective permissions rather than manifest ones. Before this the
+    # hash moved for NEITHER a kill switch nor a store-backed allowlist change,
+    # which made it an auditable pin to a document nobody was enforcing.
     policy_material = _json.dumps({
-        "tools": [{"id": t.id, "permission": t.permission.value,
+        "tools": [{"id": t.id, "permission": effective[t.id],
                    "pin": sorted(getattr(t, "pin", {}) or {})} for t in manifest.tools],
-        "guard": guard_txt,
+        "guard": gp.etag,
         "approverIdentityRequired": env.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1",
         "multiTenant": _multitenant(),
     }, sort_keys=True)
     policy_hash = hashlib.sha256(policy_material.encode()).hexdigest()[:16]
 
-    rc = store.load_memory("_runtime_config")
-    overrides = [dict(v, tool=k.split(":", 1)[1]) for k, v in (rc.get("kv") or {}).items()
+    overrides = [dict(v, tool=k.split(":", 1)[1]) for k, v in switches.items()
                  if k.startswith("tool:")]
-    history = ((rc.get("collections") or {}).get("history") or [])[-10:]
+    overrides.sort(key=lambda o: o["tool"])
+    try:
+        history = _switch_history(store, manifest)
+    except Exception as e:
+        history, switches_error = [], switches_error or f"{type(e).__name__}: {e}"
 
     violations = []
     for r in runs:
@@ -170,18 +288,40 @@ def _governance(manifest, store, runs, project_root) -> dict:
     violations = sorted(violations, key=lambda v: v.get("ts") or "", reverse=True)[:25]
 
     return {
-        "policy": {"hash": policy_hash, "toolsGated": gated, "toolsDenied": denied,
-                   "pinnedArgTools": pinned, "egressRules": len(gy.get("rules") or []),
-                   "egressDefault": gy.get("default", "deny") if guard_txt else None},
+        "policy": {
+            "hash": policy_hash,
+            "toolsGated": gated, "toolsDenied": denied, "pinnedArgTools": pinned,
+            # How many of those counts are an operator override rather than the
+            # manifest, so the tiles can distinguish "the agent declares this" from
+            # "someone killed it at 03:00".
+            "toolsOverridden": overridden,
+            "egressRules": len(gy.get("rules") or []),
+            "egressDefault": gy.get("default") if gp.enforced else None,
+            # Provenance: `store` / `file:…` / `none`, plus the guard's own version
+            # — the same string `PUT /guard` returns, so the two screens can be
+            # matched — and any read failure, which is a deny-everything state.
+            "egressSource": gp.source,
+            "egressVersion": gp.version if gp.enforced else None,
+            "egressError": gp.error,
+        },
         "enforcement": {
-            "egressGuard": bool(guard_txt),
+            "egressGuard": gp.enforced,
             "groundingGate": grounding_on,
             "approverIdentity": env.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1",
             "perUserIdentity": jwt_configured(),
             "multiTenantRls": _multitenant(),
             "secretsSealed": seal_available(),
         },
-        "switches": {"active": overrides, "history": list(reversed(history))},
+        "switches": {
+            "active": overrides,
+            "history": history,
+            # The policy log versions the whole switches MAP, so there is no
+            # per-tool version to show; this is the document's. The console used
+            # to render `v{o.version}` off the per-override dicts, which never
+            # carried one.
+            "version": history[0]["version"] if history else None,
+            "error": switches_error,
+        },
         "violations": violations,
     }
 
@@ -253,6 +393,21 @@ def build_console(manifest, store, agent, project_root) -> dict:
                 model_calls[ev.get("label")] = model_calls.get(ev.get("label"), 0) + 1
 
     pending = store.list_approvals("pending")
+
+    # Which agent each pending approval belongs to. `list_approvals` has no agent axis
+    # in storage, so it is resolved through the run — the same way `app.py`'s
+    # `_approvals_of` does it. `runs` is already loaded for THIS agent, so the common
+    # case (every approval is the selected agent's) costs no extra reads and only a
+    # foreign approval pays for one.
+    _run_agent = {r["id"]: r.get("agent") for r in runs}
+
+    def _agent_of(a: dict):
+        rid = a.get("runId") or ""
+        if rid in _run_agent:
+            return _run_agent[rid]
+        run = store.get_run(rid)
+        return run.get("agent") if run else None
+
     mem = store.load_memory("agent")
     kmem = store.load_memory("knowledge")
     sessions = store.list_sessions(manifest.name) if hasattr(store, "list_sessions") else []
@@ -313,16 +468,29 @@ def build_console(manifest, store, agent, project_root) -> dict:
         "knowledge": {"documents": kmem.get("documents", []),
                       "chunks": len(kmem.get("collections", {}).get("chunks", []))},
         "triggers": [t.model_dump() for t in manifest.triggers],
+        # `pending` is `list_approvals("pending")` — deliberately WORKSPACE-wide, the
+        # same inbox `GET /approvals` serves ("everything awaiting a human here" is a
+        # real question, `app.py: list_approvals`). Every other key in this snapshot is
+        # scoped to one agent, so each row carries `agent` and the console says which
+        # ones are not the selected one. Narrowing here instead would be worse: an
+        # approval is the only irreversible human gate in the product, and hiding one
+        # because a different agent happens to be selected is how a run waits forever.
         "approvals": [{"id": a["id"], "title": a["title"], "body": a.get("body"),
-                       "action": a.get("action"), "runId": a["runId"]} for a in pending],
-        "runs": [{"id": r["id"], "trigger": r["trigger"], "status": r["status"],
-                  "createdAt": r["createdAt"], "pendingApproval": r.get("pendingApproval"),
-                  "tokens": run_usage(r)["inputTokens"] + run_usage(r)["outputTokens"]}
-                 for r in runs[:30]],
+                       "action": a.get("action"), "runId": a["runId"],
+                       "agent": _agent_of(a)} for a in pending],
+        # A PREVIEW, and named one now that it is not a view's dataset: the
+        # console's Runs table pages `GET /agents/{id}/runs` instead of filtering
+        # inside this cap, which is what made a search for run 31 answer "No runs
+        # match" (audit §5.1). `stats.runs` and `stats.byStatus` above are the
+        # authoritative totals and are computed over every run, not over the cap.
+        "runs": [run_summary(r) for r in runs[:30]],
         "connections": [{"id": c["id"], "provider": c.get("provider"), "scopes": c.get("scopes", []),
                          "owner": c.get("owner"), "status": c.get("status"),
                          "secretSet": c.get("secretSet"), "encrypted": c.get("encrypted"),
                          "label": c.get("label")} for c in connections],
+        # Also a preview — see the note on `runs`. The Conversations view pages
+        # `GET /agents/{id}/sessions`, because conversation 51 was unreachable
+        # from the console at all (audit §5.2); `stats.sessions` is the total.
         "sessions": [{"id": s["id"], "title": s.get("title"), "channel": s.get("channel"),
                       "externalId": s.get("externalId"), "status": s.get("status"),
                       "messageCount": s.get("messageCount", 0),

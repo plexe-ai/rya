@@ -166,7 +166,7 @@ describe('EvalsView', () => {
       c.method === 'POST'
         ? {
             status: 409,
-            body: { detail: { code: 'E_NO_INLINE_WORKER', message: "This api process cannot execute 'acme'." } },
+            body: { ok: false, error: { code: 'E_NO_INLINE_WORKER', message: "This api process cannot execute 'acme'." } },
           }
         : { body: CASES },
     )

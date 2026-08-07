@@ -1,4 +1,5 @@
 import { Bot, Menu, RefreshCw, Zap } from 'lucide-react'
+import { since } from '../lib/format'
 import { hasAgent } from '../lib/types'
 import type { ConsoleResponse } from '../lib/types'
 
@@ -6,6 +7,8 @@ export function TopBar({
   state,
   live,
   loading,
+  lastSuccessAt,
+  now,
   onRefresh,
   onSendEvent,
   onToggleNav,
@@ -13,6 +16,10 @@ export function TopBar({
   state: ConsoleResponse | null
   live: boolean
   loading: boolean
+  /** Epoch ms of the last good poll, or null if there has never been one. */
+  lastSuccessAt: number | null
+  /** The shell's shared clock, so this and the stale banner quote one instant. */
+  now: number
   onRefresh: () => void
   onSendEvent: () => void
   onToggleNav: () => void
@@ -64,9 +71,20 @@ export function TopBar({
         </div>
       </div>
       <div className="actions">
+        {/* The word is in its own element and the age is in another, deliberately:
+            "offline" is the state, the age is a qualifier on it, and gluing them
+            into one text node would make the pill unreadable to anything looking
+            for the state — including the tests that pin it.
+
+            The age is the §5.9 half. `offline` on its own is true of a runtime that
+            blinked two seconds ago and of one that died before this tab was opened,
+            and the operator's next move is different for each. */}
         <span className={`live${live ? '' : ' off'}`} role="status" aria-live="polite">
           <span className="d" />
-          {loading ? 'connecting…' : live ? 'live' : 'offline'}
+          <span>{loading ? 'connecting…' : live ? 'live' : 'offline'}</span>
+          {!live && !loading && lastSuccessAt != null && (
+            <span className="dim">· {since(lastSuccessAt, now)} old</span>
+          )}
         </span>
         <button className="btn sm" onClick={onRefresh}>
           <RefreshCw aria-hidden="true" focusable="false" />

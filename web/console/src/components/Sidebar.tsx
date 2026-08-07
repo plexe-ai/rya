@@ -1,6 +1,6 @@
 import { Bot, ChevronsUpDown, GitCommitVertical, LogOut } from 'lucide-react'
 import { NAV } from '../lib/nav'
-import type { CountKey, ViewId } from '../lib/nav'
+import type { NavCounts, ViewId } from '../lib/nav'
 import { hasAgent } from '../lib/types'
 import type { AgentRef, ConsoleResponse } from '../lib/types'
 
@@ -27,6 +27,8 @@ export function Sidebar({
   state,
   roster,
   selected,
+  showing,
+  switchFailed,
   onSelectAgent,
   counts,
   open,
@@ -37,9 +39,22 @@ export function Sidebar({
   onNavigate: (v: ViewId) => void
   state: ConsoleResponse | null
   roster: AgentRef[]
+  /**
+   * The operator's CHOICE — the agent every request in this console is addressed to.
+   * This is what drives the `<select>`, and it has to: a control bound to anything
+   * else fights the person using it (§5.14).
+   */
   selected: string | null
+  /**
+   * The server's ECHO — the agent whose data is on the page right now. Differs from
+   * `selected` for exactly as long as a switch is unresolved: one round trip when
+   * things go well, and indefinitely when they do not.
+   */
+  showing: string | null
+  /** Is the runtime failing? Separates "switching" from "stuck on the old agent". */
+  switchFailed: boolean
   onSelectAgent: (name: string | null) => void
-  counts: Partial<Record<CountKey, { value: number; amber?: boolean }>>
+  counts: NavCounts
   open: boolean
   onWorkspaceClick: () => void
   onSignOut: () => void
@@ -50,6 +65,12 @@ export function Sidebar({
   // selected — it is how you tell which tenant you are looking at, which matters
   // most in exactly the case where no agent has been chosen yet.
   const loaded = hasAgent(state) ? state : null
+
+  // The choice and the echo disagree — the page is not showing the agent the console
+  // is addressed to. Both must be present for this to mean anything: a `selected` with
+  // no `showing` yet is a first load, not a disagreement.
+  const mismatch = selected != null && showing != null && selected !== showing
+
   const wsName =
     branding?.name ??
     (viewer?.workspace && viewer.workspace !== 'default' ? viewer.workspace : 'Default workspace')
@@ -78,8 +99,13 @@ export function Sidebar({
 
       {/* A real <select> once the workspace serves more than one agent, plain text
           while it serves one — a control that implies a choice nobody has is worse
-          than a label. The leading placeholder appears only while nothing is
-          selected, so the control never shows an agent the page is not showing. */}
+          than a label. The leading placeholder appears only while nothing is selected.
+
+          `value` is the operator's choice, never the server's echo. It used to be the
+          echo, which made this control lag the click by a round trip and stick on the
+          wrong name if that request failed (§5.14); the `.en` line below is where the
+          gap between choice and data is now stated, instead of being hidden by
+          reverting the control. */}
       <div className="agent-pick">
         <span className="ai">
           <Bot aria-hidden="true" focusable="false" />
@@ -101,14 +127,33 @@ export function Sidebar({
           ) : (
             <div className="nm">{loaded?.agent.name ?? (state ? 'No agents yet' : '—')}</div>
           )}
-          <div className="en">
-            {loaded
-              ? `v${loaded.agent.version} · ${loaded.agent.environment}`
-              : state
-                ? roster.length
-                  ? 'select one above'
-                  : 'nothing published'
-                : 'loading…'}
+          {/* This line describes the DATA, so when the data belongs to a different
+              agent than the one named above it, describing the data is the wrong
+              thing to do — `v3 · prod` under the name `billing-agent` is a sentence
+              about `support-agent` with the wrong subject.
+
+              Two ways for that to happen and they want different words. A switch in
+              flight is ordinary and resolves itself in a round trip. A switch that
+              cannot complete is the §5.14 failure: the console keeps serving the old
+              agent's runs, approvals and secrets while the selector, `ag()` and
+              localStorage have all moved on, and previously the only clue was that
+              the selector had silently snapped back. */}
+          <div className="en" title={mismatch ? `The console is still showing ${showing}.` : undefined}>
+            {mismatch ? (
+              <span style={switchFailed ? { color: 'var(--amber)' } : undefined}>
+                {switchFailed ? `still showing ${showing}` : `loading ${selected}…`}
+              </span>
+            ) : loaded ? (
+              `v${loaded.agent.version} · ${loaded.agent.environment}`
+            ) : state ? (
+              roster.length ? (
+                'select one above'
+              ) : (
+                'nothing published'
+              )
+            ) : (
+              'loading…'
+            )}
           </div>
         </div>
         <span className="dot" />
@@ -130,9 +175,19 @@ export function Sidebar({
                 >
                   <Icon aria-hidden="true" focusable="false" />
                   {item.label}
-                  {c != null && (
-                    <span className={`ct${c.amber ? ' amber' : ''}`}>{c.value || ''}</span>
-                  )}
+                  {/* Three renderings for three states — see `NavCount` (§5.10).
+                      This was `{c.value || ''}`, which drew a real zero and a count
+                      that could not be read identically, as nothing at all. Amber
+                      is never applied to `—`: highlighting a number we do not have
+                      is the same lie in a louder colour. */}
+                  {c != null &&
+                    (c.value == null ? (
+                      <span className="ct unk" title="Not available — this count could not be read.">
+                        —
+                      </span>
+                    ) : (
+                      <span className={`ct${c.amber ? ' amber' : ''}`}>{c.value}</span>
+                    ))}
                 </button>
               )
             })}

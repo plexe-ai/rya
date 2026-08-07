@@ -2297,9 +2297,10 @@ def posture(verify: bool = typer.Option(
             json: bool = typer.Option(False, "--json")):
     """The launch gate: does this deployment meet the untrusted-tenant posture?
 
-    Reports all three conditions at once — a sandbox that contains a kernel escape
-    (D23), a tenant process holding no credentials (D18), and egress enforced by the
-    network (D24) — because any one of them missing makes the other two insufficient.
+    Reports every condition at once — a sandbox that contains a kernel escape (D23), a
+    tenant process holding no credentials (D18), egress enforced by the network (D24)
+    and a broker topology that can actually be launched (D32) — because any one of them
+    missing makes the others insufficient.
 
     `--verify` asks the substrate what kernel it is actually running rather than
     trusting the flag that was passed. That check is the residual MULTITENANT §9 risk 8
@@ -2316,8 +2317,8 @@ def posture(verify: bool = typer.Option(
                    "credentials": inventory.describe()}
 
         def render():
-            # A trusted deployment with none of the three met is CORRECT, and marking
-            # it with a red cross would train an operator to ignore the mark on the one
+            # A trusted deployment with none of them met is CORRECT, and marking it
+            # with a red cross would train an operator to ignore the mark on the one
             # deployment where it means something.
             satisfied = report.ok or not report.untrusted
             mark = "[green]✓[/green]" if satisfied else "[red]✗[/red]"
@@ -2325,14 +2326,14 @@ def posture(verify: bool = typer.Option(
                      else "trusted tenancy (untrusted not declared)")
             console.print(f"{mark} {state} · driver [bold]{driver.name}[/bold] "
                           f"({driver.isolation})")
-            for name, ok, detail in (("isolation (D23)", report.isolation_ok,
-                                      report.isolation_detail),
-                                     ("mediation (D18)", report.broker_ok,
-                                      report.broker_detail),
-                                     ("egress (D24)", report.egress_ok,
-                                      report.egress_detail)):
-                tick = "[green]✓[/green]" if ok else "[yellow]○[/yellow]"
-                console.print(f"  {tick} {name}: {detail}")
+            # Iterated from `report.conditions` rather than listed here, because the
+            # list that used to live here was written when the gate had three and
+            # silently kept printing three when D32 was added — the same drift audit
+            # §5.7 found in the console. The gate owns its conditions; this renders
+            # them.
+            for cond in report.conditions:
+                tick = "[green]✓[/green]" if cond["ok"] else "[yellow]○[/yellow]"
+                console.print(f"  {tick} {cond['prose']}: {cond['detail']}")
             console.print(
                 f"  {'[green]✓[/green]' if inventory.clean else '[yellow]○[/yellow]'} "
                 f"this process holds "

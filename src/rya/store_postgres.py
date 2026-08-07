@@ -30,6 +30,16 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 
+def _like_escape(value: str) -> str:
+    r"""Neutralise LIKE metacharacters in operator-supplied search text.
+
+    Parameter binding stops SQL injection but says nothing about `%` and `_`,
+    which are wildcards to LIKE and literal characters to the person typing them.
+    Paired with ``ESCAPE '\'`` at every call site.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rya_runs (
     id TEXT PRIMARY KEY,
@@ -420,6 +430,54 @@ class PostgresStore:
                             (self._ws, agent))
             return [r[0] for r in cur.fetchall()]
 
+    def list_runs_page(self, agent: Optional[str] = None, *, status: Optional[str] = None,
+                       query: Optional[str] = None, limit: Optional[int] = None,
+                       offset: int = 0) -> Dict[str, Any]:
+        """``FileStore.list_runs_page``, with the filter and the window pushed down.
+
+        The predicate here must stay equivalent to ``store.run_matches``, which is
+        where that filter is written down: status is equality, the query is a
+        case-insensitive substring of the run id or the trigger. Two backends
+        answering the same filter differently would make the console's row count
+        disagree with its own pills depending on which store a workspace is on.
+
+        Counted and paged in the database precisely because the alternative is what
+        ``list_runs`` does — return every run document, traces and all — to fill a
+        table that shows fifty rows.
+        """
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if agent is not None:
+            clauses.append("agent=%s")
+            params.append(agent)
+        if status:
+            # Status lives in the JSONB blob rather than a column — the same D10
+            # residual `run_counts` below documents.
+            clauses.append("data->>'status' = %s")
+            params.append(status)
+        if (query or "").strip():
+            # This came out of a search box, so `%` and `_` are literal characters
+            # and not wildcards. Escaping them is what stops a query like `run_9`
+            # from matching every run id.
+            like = f"%{_like_escape(query.strip())}%"
+            clauses.append(r"(id ILIKE %s ESCAPE '\' OR data->>'trigger' ILIKE %s ESCAPE '\')")
+            params.extend([like, like])
+        where = " AND ".join(clauses)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM rya_runs WHERE {where}", tuple(params))
+            row = cur.fetchone()
+            count = int(row[0]) if row else 0
+            sql = f"SELECT data FROM rya_runs WHERE {where} ORDER BY created_at DESC"
+            page: List[Any] = list(params)
+            if limit is not None:
+                sql += " LIMIT %s"
+                page.append(max(0, int(limit)))
+            if offset:
+                sql += " OFFSET %s"
+                page.append(max(0, int(offset)))
+            cur.execute(sql, tuple(page))
+            return {"runs": [r[0] for r in cur.fetchall()], "count": count}
+
     def run_counts(self, since: Optional[str] = None) -> Dict[str, int]:
         """Runs per status, counted in the database rather than in Python.
 
@@ -734,6 +792,34 @@ class PostgresStore:
                 cur.execute("SELECT data FROM rya_sessions WHERE workspace_id=%s AND agent=%s ORDER BY last_message_at DESC",
                             (self._ws, agent))
             return [r[0] for r in cur.fetchall()]
+
+    def list_sessions_page(self, agent: Optional[str] = None, *, limit: Optional[int] = None,
+                           offset: int = 0) -> Dict[str, Any]:
+        """``FileStore.list_sessions_page`` — counted and windowed in the database.
+
+        `idx_sessions_ws` is already ordered `(workspace_id, last_message_at DESC)`,
+        so the window is an index scan rather than a sort of the whole workspace.
+        """
+        clauses = ["workspace_id=%s"]
+        params: List[Any] = [self._ws]
+        if agent is not None:
+            clauses.append("agent=%s")
+            params.append(agent)
+        where = " AND ".join(clauses)
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM rya_sessions WHERE {where}", tuple(params))
+            row = cur.fetchone()
+            count = int(row[0]) if row else 0
+            sql = f"SELECT data FROM rya_sessions WHERE {where} ORDER BY last_message_at DESC"
+            page: List[Any] = list(params)
+            if limit is not None:
+                sql += " LIMIT %s"
+                page.append(max(0, int(limit)))
+            if offset:
+                sql += " OFFSET %s"
+                page.append(max(0, int(offset)))
+            cur.execute(sql, tuple(page))
+            return {"sessions": [r[0] for r in cur.fetchall()], "count": count}
 
     def find_session(self, agent: str, channel: str, external_id: str) -> Optional[dict]:
         with self._conn.cursor() as cur:

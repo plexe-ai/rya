@@ -27,6 +27,7 @@ describe('ConnectionsView', () => {
     expect(screen.getByText('github')).toBeTruthy()
     expect(screen.getByText('repo:read')).toBeTruthy()
     expect(screen.getByText('active')).toBeTruthy()
+    expect(screen.getByText('active').className).toBe('stbadge ok')
     expect(screen.getByText('encrypted')).toBeTruthy()
   })
 
@@ -57,6 +58,68 @@ describe('ConnectionsView', () => {
     render(<ConnectionsView state={stateWith([conn({ status: 'revoked' })])} onToast={() => {}} />)
     expect(screen.getByText('revoked')).toBeTruthy()
     expect(screen.queryByText('active')).toBeNull()
+    // Red for the one status that really does mean revoked. This tone assertion holds
+    // against the pre-§5.17 code too — it is here to stop the local status map losing
+    // an entry, not to demonstrate the bug.
+    expect(screen.getByText('revoked').className).toBe('stbadge fail')
+  })
+
+  /**
+   * §5.17. `status` is optional on this view's `Connection` for the same reason every
+   * field past `{id, provider, scopes}` is: the rows come straight off the store
+   * record and `_public_connection` passes through whatever it finds. The old cell was
+   * a two-arm ternary on `=== 'active'`, so an absent status landed in the else arm
+   * and a connection whose secret is still set, that nobody has revoked, was reported
+   * as revoked in red — sending an operator to re-issue a credential that is fine.
+   */
+  it('does not report a connection with no status as revoked', () => {
+    render(<ConnectionsView state={stateWith([conn({ status: undefined })])} onToast={() => {}} />)
+    expect(screen.queryByText('revoked')).toBeNull()
+    expect(screen.queryByText('active')).toBeNull()
+    // Amber, not green: `get_connection` resolves a credential only
+    // `WHERE status = 'active'`, so this one will not be injected into a tool call at
+    // runtime. Something is wrong; the console just does not know what.
+    expect(screen.getByText('unknown').className).toBe('stbadge wait')
+    // And it says WHY, which is this console's standing rule for an unknown (§5.4,
+    // §5.10). The consequence is the useful half: an operator who knows the credential
+    // will not be injected has something to act on, where a bare "unknown" only tells
+    // them the page has stopped answering.
+    expect(screen.getByText('unknown').getAttribute('title')).toMatch(/not be resolved into tool calls/i)
+  })
+
+  it('treats an explicit null status the same as an absent one', () => {
+    render(<ConnectionsView state={stateWith([conn({ status: null })])} onToast={() => {}} />)
+    expect(screen.getByText('unknown')).toBeTruthy()
+    expect(screen.queryByText('revoked')).toBeNull()
+  })
+
+  /**
+   * The other half of §5.17: every value that was not the literal `'active'` came out
+   * as the specific word "revoked", so the console both invented a claim the server
+   * never made and threw away the word the server did send.
+   */
+  it('prints a status it does not recognise verbatim, and leaves it neutral', () => {
+    render(<ConnectionsView state={stateWith([conn({ status: 'expired' })])} onToast={() => {}} />)
+    expect(screen.getByText('expired')).toBeTruthy()
+    expect(screen.queryByText('revoked')).toBeNull()
+    // Neutral grey — `StatusBadge`'s rule for an open vocabulary (`statusClass`
+    // returns '' for anything it has not been taught). A tone here would be a verdict
+    // on a word whose meaning this console does not know.
+    expect(screen.getByText('expired').className).toBe('stbadge')
+    // Neutral is not the same as unexplained: the tooltip quotes the word back and
+    // names the consequence, so a status this console has never been taught still
+    // tells an operator whether the credential is live.
+    const t = screen.getByText('expired').getAttribute('title') ?? ''
+    expect(t).toMatch(/'expired'/)
+    expect(t).toMatch(/does not recognise/i)
+  })
+
+  it('does not clutter a status it does understand with a tooltip', () => {
+    // The corollary, and the reason the `title` is conditional: `active` and `revoked`
+    // mean what they say, and a hover explaining a word the operator already read is
+    // noise that trains people to ignore the ones that matter.
+    render(<ConnectionsView state={stateWith([conn({ status: 'active' })])} onToast={() => {}} />)
+    expect(screen.getByText('active').getAttribute('title')).toBeNull()
   })
 
   it('shows an em dash for a connection that narrows no scopes', () => {

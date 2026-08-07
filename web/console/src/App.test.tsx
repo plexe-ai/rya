@@ -54,6 +54,11 @@ function mockFetch() {
     if (url.includes('/console')) return json(STATE)
     if (url.includes('/queue/stats')) return json({ counts: { pending: 0, running: 0, failed: 0 } })
     if (url.includes('/v1/info')) return json({ multiTenant: false })
+    // The runs table owns a paged request of its own since §5.1 — the aggregate's
+    // `runs` key is a 30-row preview, so filtering and counting it was a claim about
+    // a page. The shell test only needs the shape; `views/Runs.test.tsx` is where the
+    // paging, the pill counts and the search are pinned.
+    if (url.includes('/runs?')) return json({ runs: STATE.runs, count: STATE.runs.length, limit: 50, offset: 0 })
     return json({})
   })
 }
@@ -181,7 +186,7 @@ describe('App shell — no agent selected', () => {
         if (m?.[1]) {
           const want = decodeURIComponent(m[1])
           if (!agents.some((a) => a.name === want))
-            return json({ detail: { code: 'E_AGENT_NOT_FOUND', message: `No agent named '${want}' is served here.` } }, 404)
+            return json({ ok: false, error: { code: 'E_AGENT_NOT_FOUND', message: `No agent named '${want}' is served here.` } }, 404)
           return json({ ...STATE, agent: { ...STATE.agent, name: want }, agents, selectedAgent: want })
         }
         // The server only auto-selects when the workspace serves exactly one agent.

@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle, Check, CheckCircle2, Circle, FileText, Flag, Inbox, ListOrdered, LoaderCircle,
   Play, Plug, Send, ShieldAlert, Sparkles, XCircle,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { API, api, getToken } from '../lib/api'
+import { API, api, getToken, getUserToken, unauthorizedError } from '../lib/api'
 import { ag } from '../lib/agent'
-import { useLoad } from '../lib/usePoll'
+import { usePoll } from '../lib/usePoll'
 import { num } from '../lib/format'
 import type { ConsoleState, QueueCounts } from '../lib/types'
 import { CopyId, Empty, Mono, SecRow, StatusBadge, Table, Tile, ViewHeader } from '../components/ui'
@@ -28,12 +28,29 @@ export interface QueueJob {
   deadLetter?: boolean
 }
 
-export interface QueueStats {
-  counts?: QueueCounts
-}
-
 export interface QueueJobs {
   jobs?: QueueJob[]
+}
+
+/**
+ * The shell's polled `/queue/stats` result, handed down rather than re-fetched.
+ *
+ * One poll, two readers: the sidebar badge and the tiles below. This view used to
+ * load `/queue/stats` itself — on entry and never again — so the badge, which polls
+ * every 6s, and the tiles a few pixels away showed different numbers, the tiles
+ * being the stale one (audit §5.5). Passing the shell's result down does not narrow
+ * that disagreement, it makes it unrepresentable.
+ *
+ * `counts: null` means NOT KNOWN: before the first answer, or when the endpoint has
+ * never answered at all. Deliberately not `{}`, because `{}` renders as zeroes and
+ * "Dead-letter 0" during an outage is the most dangerous thing this view can say
+ * (audit §5.4). `error` alongside non-null counts means what is on screen was true
+ * at the last successful refresh and is now unverified.
+ */
+export interface QueueStatsFeed {
+  counts: QueueCounts | null
+  error: string | null
+  loading: boolean
 }
 
 /** The kinds `_tail_turn` appends to a turn's durable buffer (`turns.py`). */
@@ -219,11 +236,20 @@ function TurnStream({
       // Omitted on the first connect so the server applies its own `after=-1`.
       const url = `${API}${path}${cursor >= 0 ? `?after=${cursor}` : ''}`
       const token = getToken()
-      const r = await fetch(url, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        signal,
-      })
-      if (r.status === 401) throw new Error('unauthorized')
+      // The user token rides along here too. This route goes through `get_plane`, so
+      // it is what decides per-user RLS visibility: without it a turn owned by a
+      // signed-in user is simply not selected, and the tail would render an empty
+      // stream rather than that user's turn.
+      const headers: Record<string, string> = {}
+      if (token) headers.Authorization = `Bearer ${token}`
+      const userToken = getUserToken()
+      if (userToken) headers['X-Rya-User-Token'] = userToken
+      const r = await fetch(url, { headers, signal })
+      // Classified the same way `api()` does it, rather than assumed: a credential
+      // failure keeps the `'unauthorized'` sentinel the catch below matches on, and
+      // any other 401 arrives carrying the server's message instead of being
+      // reported as a token this operator has no reason to doubt.
+      if (r.status === 401) throw unauthorizedError(await r.json().catch(() => null))
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       if (!r.body) return { terminal: false, idle: false }
 
@@ -492,30 +518,48 @@ function StreamBlock({ block }: { block: Block }) {
 // ---- the view ---------------------------------------------------------------
 
 /**
+ * How often the durable job table re-reads itself.
+ *
+ * Matched to the shell's poll on purpose — the tiles above the table come from
+ * that poll (see `QueueStatsFeed`), and a table refreshing on a different clock
+ * from the numbers summarising it is the same defect one level down.
+ */
+const JOBS_POLL_MS = 6000
+
+/**
  * Queue & turns — the durable job table plus the turn-stream inspector.
  *
- * Loads on ENTRY rather than from the shell's 6s poll (console/AGENTS.md): two
- * requests for a table an operator opens deliberately, and re-fetching it every
- * six seconds would also fight the open stream below for the connection budget.
- * `reload()` runs after a retry/cancel, because those are the moments the table
- * actually changed.
+ * **This view used to load once on entry and never refresh** (audit §5.5), with a
+ * comment arguing that a 6s re-read would fight the open turn stream for the
+ * connection budget. That reasoning is revised here, deliberately:
+ *
+ *  - The tiles no longer cost a request at all. They read the shell's existing 6s
+ *    `/queue/stats` poll, which runs on every view because the sidebar badge needs
+ *    it — so the old "load on entry" was not saving that request, it was making a
+ *    SECOND one and then letting it go stale next to the live badge.
+ *  - What is left is one small `/queue/jobs` GET per 6s while this page is open —
+ *    fewer requests on entry than before, and one connection alongside the stream's
+ *    rather than in competition with it.
+ *  - A queue table that freezes the moment you open a turn is how a job silently
+ *    reaching the dead-letter queue gets missed. This is the view where staleness is
+ *    least affordable, which is the opposite of the case the old comment made.
+ *
+ * `refresh()` still runs immediately after a retry/cancel rather than waiting for
+ * the next tick, because those are the moments the operator is watching for.
  */
 export function QueueView({
   state,
   onToast,
+  stats,
 }: {
   state: ConsoleState
   onToast: (m: string) => void
+  stats: QueueStatsFeed
 }) {
-  const { data, error, loading, reload } = useLoad(async () => {
-    // Both workspace-scoped: the queue is a per-workspace resource and the server
-    // serves no agent-prefixed spelling of `/queue/*`.
-    const [stats, jobs] = await Promise.all([
-      api<QueueStats>('/queue/stats'),
-      api<QueueJobs>('/queue/jobs'),
-    ])
-    return { counts: stats.counts ?? {}, jobs: jobs.jobs ?? [] }
-  })
+  // Workspace-scoped: the queue is a per-workspace resource and the server serves
+  // no agent-prefixed spelling of `/queue/*`.
+  const loadJobs = useCallback(() => api<QueueJobs>('/queue/jobs'), [])
+  const { data, error, loading, refresh: reload } = usePoll<QueueJobs>(loadJobs, JOBS_POLL_MS)
 
   // Per-job, not one flag: cancelling one job must not disable every other row.
   const [busy, setBusy] = useState<Record<string, boolean>>({})
@@ -543,8 +587,18 @@ export function QueueView({
     }
   }
 
-  const counts: QueueCounts = data?.counts ?? {}
   const jobs = data?.jobs ?? []
+
+  // `null` while the depth is unknown — see `QueueStatsFeed`. Every tile below
+  // renders '—' in that case rather than a number, because `num(undefined)` is
+  // `'0'` and a fabricated zero here is indistinguishable from a drained queue.
+  // That is the §5.4 bug exactly: "Dead-letter 0" while `/queue/stats` is failing.
+  const counts: QueueCounts | null = stats.counts
+  const depth = (n?: number) => (counts ? num(n) : '—')
+  // Amber is an alarm, so it must never fire on a guess: `(undefined ?? 0) > 0` is
+  // false, which is the safe direction, but it is stated rather than relied upon.
+  const over = (n?: number) => !!counts && (n ?? 0) > 0
+  const sub = (known: string) => (counts ? known : stats.loading ? 'reading…' : 'not available')
 
   return (
     <>
@@ -557,28 +611,66 @@ export function QueueView({
         <Tile
           icon={Inbox}
           label="Pending"
-          value={num(counts.pending)}
-          sub="awaiting a worker"
-          amber={(counts.pending ?? 0) > 0}
+          value={depth(counts?.pending)}
+          sub={sub('awaiting a worker')}
+          amber={over(counts?.pending)}
         />
-        <Tile icon={LoaderCircle} label="Running" value={num(counts.running)} sub="leased to workers" />
-        <Tile icon={CheckCircle2} label="Completed" value={num(counts.completed)} sub="done" />
+        <Tile
+          icon={LoaderCircle}
+          label="Running"
+          value={depth(counts?.running)}
+          sub={sub('leased to workers')}
+        />
+        <Tile
+          icon={CheckCircle2}
+          label="Completed"
+          value={depth(counts?.completed)}
+          sub={sub('done')}
+        />
         <Tile
           icon={AlertTriangle}
           label="Dead-letter"
-          value={num(counts.failed)}
-          sub="attempts exhausted"
-          amber={(counts.failed ?? 0) > 0}
+          value={depth(counts?.failed)}
+          sub={sub('attempts exhausted')}
+          amber={over(counts?.failed)}
         />
       </div>
 
-      {error ? (
+      {/* Two different failures, said differently. With no counts at all the tiles
+          are already showing '—', so this names why; with counts on screen the
+          numbers are real but no longer being confirmed, and silently continuing to
+          display them is how an operator ends up trusting a frozen dashboard. */}
+      {stats.error && (
+        <SecRow
+          left={
+            counts
+              ? 'Queue depth is stale — the last refresh failed'
+              : stats.error === 'unauthorized'
+                ? 'Connect to read queue depth'
+                : 'Queue depth unavailable'
+          }
+          right={<span className="mono dim">{stats.error}</span>}
+        />
+      )}
+
+      {error && !data ? (
         // An unauthenticated console is not an outage; say which one this is.
         <Empty icon={ListOrdered}>
           {error === 'unauthorized' ? 'Connect to load the queue.' : `Queue unavailable — ${error}`}
         </Empty>
       ) : (
-        <Table
+        <>
+          {/* Now that the table polls, a single failed tick must not blank rows the
+              operator is reading (console/AGENTS.md: don't clobber a live view). The
+              error only takes the screen when there is nothing to show; with rows up
+              it becomes a note and the rows stay, marked as unconfirmed. */}
+          {error && (
+            <SecRow
+              left="Job list is stale — the last refresh failed"
+              right={<span className="mono dim">{error}</span>}
+            />
+          )}
+          <Table
           rows={jobs}
           rowKey={(j) => j.id}
           emptyIcon={ListOrdered}
@@ -650,7 +742,8 @@ export function QueueView({
               ),
             },
           ]}
-        />
+          />
+        </>
       )}
 
       {turnId && (

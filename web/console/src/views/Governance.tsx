@@ -49,8 +49,12 @@ const GATES: readonly {
     of: (e) => e.approverIdentity,
   },
   {
+    // `snapshot.py` derives this from `jwt_configured()` — RYA_JWT_SECRET or
+    // RYA_JWKS_URL being set. That is "the mechanism is configured", NOT "every run
+    // carries an identity": a caller that presents no user token still produces an
+    // anonymous, workspace-shared run. The old tip claimed the stronger thing.
     name: 'Per-user identity',
-    tip: 'verified JWT bound to every run',
+    tip: 'JWT verification configured — runs that present one are bound to a user',
     of: (e) => e.perUserIdentity,
   },
   {
@@ -65,12 +69,34 @@ const GATES: readonly {
   },
 ]
 
+/** Where the guard in force came from, in one word. `snapshot.py` sends `store`,
+ *  `file:<path>` or `none`; the path is noise on a dashboard, the distinction is not. */
+function origin(source?: string): string {
+  if (!source || source === 'none') return ''
+  return source.startsWith('file:') ? 'project file' : source
+}
+
+/** The Egress rules tile's caption — four genuinely different states, and only one
+ *  of them is "default deny". `not configured` used to cover all four. */
+function egressSub(p: Governance['policy']): string {
+  if (p.egressError) return 'unreadable — denying everything'
+  if (p.egressSource === 'none') return 'no policy — not enforced'
+  if (!p.egressDefault) return 'not configured'
+  const from = origin(p.egressSource)
+  return `default ${p.egressDefault}${from ? ` · from ${from}` : ''}`
+}
+
 /**
  * Governance.
  *
  * Enforced in the runtime: blocks, not warnings. Every panel degrades calmly — no kill
  * switches and no violations are the ordinary state of a healthy deployment, not a gap
  * in the data.
+ *
+ * The corollary, and the reason for the `.anote` bands below: a panel that CANNOT read
+ * its source must not degrade calmly, because "no overrides" and "we could not ask" are
+ * the same picture and opposite facts. This view reported the first while meaning the
+ * second for both of its data sources — see `snapshot._governance` and audit §4.5.
  */
 export function GovernanceView({
   state,
@@ -97,6 +123,7 @@ export function GovernanceView({
   const policy = g.policy
   const switches = g.switches ?? { active: [], history: [] }
   const violations = g.violations ?? []
+  const overridden = policy.toolsOverridden ?? 0
 
   return (
     <>
@@ -109,7 +136,23 @@ export function GovernanceView({
         ))}
       </div>
 
-      <SecRow left="Policy" right={<Mono>{policy.hash}</Mono>} />
+      <SecRow
+        left="Policy"
+        right={
+          <>
+            {/* Only shown when true, and it is worth showing: it tells the reader the
+                counts beside it are the EFFECTIVE permissions, not the manifest's. */}
+            {overridden > 0 && `${overridden} override${overridden === 1 ? '' : 's'} · `}
+            <Mono>{policy.hash}</Mono>
+          </>
+        }
+      />
+      {policy.egressError && (
+        <div className="anote" role="status">
+          The egress policy could not be read — <Mono>{policy.egressError}</Mono>. The guard
+          fails closed, so every outbound request is being denied.
+        </div>
+      )}
       <div className="stats" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(130px,1fr))' }}>
         <Tile icon={UserCheck} label="Gated" value={policy.toolsGated} sub="approval required" />
         <Tile icon={Ban} label="Denied" value={policy.toolsDenied} sub="blocked" />
@@ -118,42 +161,67 @@ export function GovernanceView({
           icon={ShieldHalf}
           label="Egress rules"
           value={policy.egressRules}
-          sub={policy.egressDefault ? `default ${policy.egressDefault}` : 'not configured'}
+          sub={egressSub(policy)}
+          amber={!!policy.egressError}
         />
       </div>
 
-      <SecRow left="Kill switches" right="immediate · no redeploy" />
-      <Table
-        rows={switches.active}
-        // One override per tool, so the tool id is the natural key.
-        rowKey={(o) => o.tool}
-        emptyMessage="No overrides."
-        columns={[
-          { header: 'Tool', cell: (o) => <Mono>{o.tool}</Mono> },
-          {
-            header: 'Now',
-            cell: (o) => <span className={`pb ${PERM_CLASS[o.permission] ?? ''}`}>{o.permission}</span>,
-          },
-          { header: 'Since', cell: (o) => stamp(o.ts) },
-          { header: 'v', cell: (o) => `v${o.version}` },
-        ]}
+      <SecRow
+        left="Kill switches"
+        right={`${switches.version ? `v${switches.version} · ` : ''}immediate · no redeploy`}
       />
+      {switches.error ? (
+        // NOT an empty table. "No overrides." here would be the §4.5 failure again,
+        // one layer up: an unreadable policy store reported as a governed state.
+        <div className="anote" role="status">
+          The policy store could not be read — <Mono>{switches.error}</Mono>. Overrides and
+          their history are unknown, not absent.
+        </div>
+      ) : (
+        <Table
+          rows={switches.active}
+          // One override per tool, so the tool id is the natural key.
+          rowKey={(o) => o.tool}
+          emptyMessage="No overrides."
+          columns={[
+            { header: 'Tool', cell: (o) => <Mono>{o.tool}</Mono> },
+            {
+              header: 'Now',
+              cell: (o) => (
+                <span className={`pb ${PERM_CLASS[o.permission] ?? ''}`}>{o.permission}</span>
+              ),
+            },
+            { header: 'Since', cell: (o) => stamp(o.ts) },
+            // Was `v{o.version}`, which rendered `vundefined`: the policy log versions
+            // the whole switches map, so there is no per-tool version and never was.
+            // The document version is in the header; the reason is what this row can
+            // actually answer.
+            { header: 'Reason', cell: (o) => o.reason || '' },
+          ]}
+        />
+      )}
 
       {switches.history.length > 0 && (
         <>
           <SecRow left="History" right="append-only" />
           <Table
             rows={switches.history}
-            // The log is append-only, so an entry is identified by when it was written
-            // and to which tool, plus the transition it recorded.
-            rowKey={(h) => `${h.ts ?? ''}·${h.tool}·${h.previous ?? ''}>${h.permission}`}
+            // Derived from document snapshots, so one policy version can yield several
+            // rows — the version alone is not unique. Tool plus transition is.
+            rowKey={(h) => `${h.version ?? h.ts ?? ''}·${h.tool}·${h.previous ?? ''}>${h.permission ?? ''}`}
             columns={[
               { header: 'When', cell: (h) => stamp(h.ts) },
               { header: 'Tool', cell: (h) => <Mono>{h.tool}</Mono> },
               {
                 header: 'Change',
-                cell: (h) => (h.cleared ? `restored ${h.permission}` : `${h.previous} -> ${h.permission}`),
+                cell: (h) =>
+                  h.cleared
+                    ? `cleared${h.permission ? ` — back to ${h.permission}` : ''}`
+                    : `${h.previous ?? 'declared'} -> ${h.permission}`,
               },
+              // §12 risk 7, quoted in store.py: "who reviewed this allowlist change" is
+              // the feature. `actor` was written on every record and shown on no screen.
+              { header: 'Who', cell: (h) => h.actor || '—' },
               { header: 'Reason', cell: (h) => h.reason || '' },
             ]}
           />

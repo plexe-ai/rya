@@ -141,31 +141,130 @@ describe('GuardView', () => {
     expect(calls.filter((c) => c.method === 'GET').length).toBe(2)
   })
 
-  it('drops a rule with no pattern instead of saving a match-everything rule', async () => {
-    const calls = stubFetch((c) => (c.method === 'PUT' ? { body: { ok: true, tests: TESTS } } : { body: loaded() }))
+  /**
+   * A save is a REPLACE: `save_policy` (`guard.py:405`) writes `dict(policy or {})`
+   * and never merges with the previous version. So anything the editor omits from
+   * the PUT is deleted — and `grounding` (`guard.py:649`) and `secrecy`
+   * (`guard.py:204`) are real top-level keys this editor does not model. Dropping
+   * them silently disables the anti-hallucination gate (it is opt-in, so absence
+   * fails OPEN) and wipes every redaction pattern, from a button labelled "Save".
+   */
+  it('round-trips top-level keys it does not model through a save', async () => {
+    const UNMODELLED = {
+      grounding: { enabled: true },
+      secrecy: { enabled: true, patterns: [{ id: 'crm', pattern: 'CRM-\\d+', replacement: '(id)' }] },
+      // Not a key the product defines — the point is that the editor is not the
+      // authority on what the document may contain.
+      futureKey: { anything: [1, 2, 3] },
+    }
+    const calls = stubFetch((c) =>
+      c.method === 'PUT'
+        ? { body: { ok: true, tests: TESTS } }
+        : { body: loaded({ policy: { ...POLICY, ...UNMODELLED } }) },
+    )
     render(<GuardView state={state} onToast={() => {}} />)
+
+    fireEvent.change(await screen.findByLabelText('allow rule 1 pattern'), {
+      target: { value: 'https://api.crm.com/v2/' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save policy/i }))
+
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true))
+    const sent = (calls.find((c) => c.method === 'PUT')!.body as { policy: Record<string, unknown> }).policy
+    expect(sent.grounding).toEqual(UNMODELLED.grounding)
+    expect(sent.secrecy).toEqual(UNMODELLED.secrecy)
+    expect(sent.futureKey).toEqual(UNMODELLED.futureKey)
+    // ...and the modelled keys still win over the loaded copy.
+    expect((sent.rules as { pattern: string }[])[0]!.pattern).toBe('https://api.crm.com/v2/')
+  })
+
+  it('refuses to save a patternless rule rather than dropping it', async () => {
+    const calls = stubFetch((c) => (c.method === 'PUT' ? { body: { ok: true, tests: TESTS } } : { body: loaded() }))
+    const toast = vi.fn()
+    render(<GuardView state={state} onToast={toast} />)
     await screen.findByLabelText('allow rule 1 pattern')
 
     fireEvent.click(screen.getByRole('button', { name: /add allow/i }))
-    // A new, still-empty row exists in the draft...
+    const save = screen.getByRole('button', { name: /save policy/i }) as HTMLButtonElement
+    // The empty row is real state now — it blocks the save and says why, rather than
+    // being quietly filtered out of the document on the way to the wire.
     expect(screen.getByLabelText('allow rule 3 pattern')).toBeTruthy()
-    // ...but it cannot be saved on its own, because it would change nothing.
-    expect((screen.getByRole('button', { name: /save policy/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect(save.disabled).toBe(true)
+    expect(screen.getByText('1 rule needs a pattern')).toBeTruthy()
 
+    // Blanking an EXISTING rule is the dangerous case: under `default: deny`,
+    // silently dropping it removes an allow rule the operator can still see.
     fireEvent.change(screen.getByLabelText('allow rule 3 pattern'), { target: { value: 'https://ok.dev/' } })
     fireEvent.change(screen.getByLabelText('allow rule 1 pattern'), { target: { value: '   ' } })
+    expect(screen.getByText('1 rule needs a pattern')).toBeTruthy()
+    expect((screen.getByRole('button', { name: /save policy/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect(calls.some((c) => c.method === 'PUT')).toBe(false)
+
+    // Fixed, and the save goes through with every row intact.
+    fireEvent.change(screen.getByLabelText('allow rule 1 pattern'), { target: { value: 'https://api.crm.com/' } })
+    expect(screen.getByText('unsaved changes')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /save policy/i }))
 
     await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true))
     const rules = (calls.find((c) => c.method === 'PUT')!.body as { policy: { rules: { pattern: string }[] } })
       .policy.rules
-    // The blank-patterned rule is gone; a new rule appends to the document (the
-    // groups are a display concern — the server splits allow from deny itself).
     expect(rules.map((r) => r.pattern)).toEqual([
+      'https://api.crm.com/',
       'https://cdn.crm.com/*',
       'https://webhook.site/*',
       'https://ok.dev/',
     ])
+    expect(toast).not.toHaveBeenCalledWith(expect.stringMatching(/needs a pattern/))
+  })
+
+  /**
+   * `examples/crizac/rya.guard.yaml` writes `url:` where `_compile_matcher` reads
+   * `pattern`. Those rules match every URL today. Reading them as blank rendered
+   * three empty rows and then deleted all three on save, leaving `default: deny`
+   * with an empty allowlist — total egress lockout, no error.
+   */
+  it('migrates the legacy url: spelling instead of blanking and deleting the rules', async () => {
+    const LEGACY = {
+      default: 'deny',
+      ssrf: true,
+      fail: 'closed',
+      rules: [
+        { kind: 'prefix', action: 'allow', url: 'https://api.crizac.com/' },
+        { kind: 'prefix', action: 'allow', url: 'https://cams.crizac.internal/' },
+        { kind: 'glob', action: 'allow', url: 'https://bedrock-runtime.*.amazonaws.com/*' },
+      ],
+      grounding: { enabled: true },
+    }
+    const calls = stubFetch((c) =>
+      c.method === 'PUT' ? { body: { ok: true, tests: TESTS } } : { body: loaded({ policy: LEGACY }) },
+    )
+    render(<GuardView state={state} onToast={() => {}} />)
+
+    // The URL is shown, not an empty box.
+    expect(await screen.findByDisplayValue('https://api.crizac.com/')).toBeTruthy()
+    // And the operator is told these rules are not currently matching what they say.
+    expect(screen.getByText(/currently matching/)).toBeTruthy()
+    expect(screen.getByText(/3 rules in this policy use the legacy/)).toBeTruthy()
+
+    // A pending rewrite is a real difference from what is stored, so Save is live
+    // without the operator having to touch a field first.
+    const save = screen.getByRole('button', { name: /save policy/i }) as HTMLButtonElement
+    expect(save.disabled).toBe(false)
+    fireEvent.click(save)
+
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true))
+    const policy = (calls.find((c) => c.method === 'PUT')!.body as { policy: Record<string, unknown> }).policy
+    const rules = policy.rules as Record<string, unknown>[]
+    expect(rules).toHaveLength(3)
+    expect(rules.map((r) => r.pattern)).toEqual([
+      'https://api.crizac.com/',
+      'https://cams.crizac.internal/',
+      'https://bedrock-runtime.*.amazonaws.com/*',
+    ])
+    // Rewritten, not duplicated: `url` would keep shadowing nothing and confuse the
+    // next reader, and the grounding gate survives the same save.
+    expect(rules.every((r) => !('url' in r))).toBe(true)
+    expect(policy.grounding).toEqual({ enabled: true })
   })
 
   /**
@@ -239,7 +338,7 @@ describe('GuardView', () => {
   it('surfaces a failed save and keeps the draft', async () => {
     stubFetch((c) =>
       c.method === 'PUT'
-        ? { status: 403, body: { detail: { message: 'read-only key' } } }
+        ? { status: 403, body: { ok: false, error: { message: 'read-only key' } } }
         : { body: loaded() },
     )
     const toast = vi.fn()

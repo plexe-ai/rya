@@ -652,7 +652,7 @@ of truth needs a reconciliation check. That check already exists once, at
 | **2. Address explicitly** | `/tools`(3), `/models`, `/evals`(2), `/knowledge`(2), `/channels`, `/guard`(4), `/gate`(3), `GET /sessions`, `GET /approvals`, `/inbound`, `/slack/events`, `POST /files` | Move under the **existing** `/agents/{agent_id}/…` prefix. These mean "for *the* agent" and have nothing to derive from |
 | **3. Workspace-level** | `/workers`, `/usage`, `/quotas`, `/connections`, `GET /files`, `/files/presign` | Stay unprefixed, become workspace-scoped. Not agent concerns |
 | **4. Worker-facing** | `/queue/*` (11) | Stay unprefixed. D14 deliberately keeps this SDK-free for foreign consumers. `agent` arrives as a **filter** (D22), not a path segment — the queue is the platform's dispatch surface, not a per-agent API |
-| **5. Unchanged** | `/`, `/console`, `/console.html`, `/v2`, `/favicon.ico`, `/lucide.min.js`, `/healthz`, `/v1/*` (14) | Static, health, and the tenancy/identity surface, which is already workspace-addressed |
+| **5. Unchanged** | `/`, `/assets/*`, `/console`, `/v2` (redirect), `/favicon.ico`, `/healthz`, `/v1/*` | Static, health, and the tenancy/identity surface, which is already workspace-addressed. (`/console.html` and `/lucide.min.js` went with the legacy single-file console once the React port reached parity.) |
 
 **Rule 6 — a time-boxed single-agent fallback.** During Phase 2, an unprefixed
 Rule-2 route on a deployment serving exactly one agent resolves to that agent and

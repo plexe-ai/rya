@@ -118,32 +118,17 @@ def _run_summary(run: dict) -> dict:
             "tokens": u["inputTokens"] + u["outputTokens"], "costUsd": u.get("costUsd")}
 
 
-def _load_console_asset(name: str) -> str:
-    import importlib.resources as ir
-    return ir.files("rya").joinpath(f"console/{name}").read_text(encoding="utf-8")
-
-
-def _load_console_html() -> str:
-    try:
-        return _load_console_asset("index.html")
-    except Exception:  # pragma: no cover - fallback if asset missing
-        return "<!doctype html><title>Rya</title><h1>Rya runtime</h1><p>Console asset not bundled.</p>"
-
-
-def _load_lucide() -> str:
-    try:
-        return _load_console_asset("lucide.min.js")
-    except Exception:  # pragma: no cover
-        return "window.lucide={createIcons:function(){}};"  # graceful no-op
-
-
 def _console_dist_dir():
     """Directory of the built React console, or None if it was never built.
 
     Absent is an ORDINARY state, not an error: `dist/` is gitignored build output
     (source lives in `web/console/`), so a fresh clone that has not run
-    `npm run build` has no bundle. `/v2` then serves a short explainer instead of
-    404ing, and the legacy console at `/` is untouched either way.
+    `npm run build` has no bundle. `/` then serves a short explainer naming the
+    build command instead of 404ing.
+
+    This used to be the *second* console. The legacy single-file SPA that held `/`
+    is gone — every one of its 23 views now has a React component, so keeping a
+    120KB inline-JS copy around would mean maintaining two consoles that drift.
     """
     import importlib.resources as ir
     try:
@@ -153,16 +138,29 @@ def _console_dist_dir():
         return None
 
 
-_CONSOLE_HTML = _load_console_html()
-_LUCIDE_JS = _load_lucide()
+def _console_index() -> Optional[str]:
+    if _CONSOLE_DIST is None:
+        return None
+    try:
+        return _CONSOLE_DIST.joinpath("index.html").read_text(encoding="utf-8")
+    except Exception:  # pragma: no cover - unreadable asset behaves as unbuilt
+        return None
+
+
 _CONSOLE_DIST = _console_dist_dir()
 
-# Content-Security-Policy for the console. Scripts/styles are 'self' + 'unsafe-inline'
-# (the SPA is a single inline-script file); the icon library is now self-hosted so
-# no third-party script origin is allowed. Fonts stay on Google's CDN (non-exec).
+# Content-Security-Policy for the console.
+#
+# `script-src` is now plain 'self' with NO 'unsafe-inline', which is the one security
+# win the build step buys outright: the legacy console was a single file with its whole
+# application inline, so it could not have this. Now that the React bundle is the only
+# console, the allowance is gone rather than merely unused.
+#
+# Styles keep 'unsafe-inline' because the components still use a few inline `style=`
+# attributes. Fonts stay on Google's CDN, which is non-executable.
 _CONSOLE_CSP = (
     "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline'; "
+    "script-src 'self'; "
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com data:; "
     "img-src 'self' data:; "
@@ -175,12 +173,6 @@ _CONSOLE_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
 }
-
-# The React console ships as external files, so it needs NO 'unsafe-inline' for
-# scripts — dropping it is the one security win the build step buys us outright.
-# Styles keep it: the components still use a few inline `style=` attributes.
-_CONSOLE_V2_CSP = _CONSOLE_CSP.replace("script-src 'self' 'unsafe-inline'; ", "script-src 'self'; ")
-_CONSOLE_V2_HEADERS = {**_CONSOLE_HEADERS, "Content-Security-Policy": _CONSOLE_V2_CSP}
 from ..manifest import load_manifest
 from ..store import open_store
 
@@ -660,10 +652,19 @@ def build_app(root: Path) -> FastAPI:
         from fastapi.staticfiles import StaticFiles
         api.mount("/app", StaticFiles(directory=str(_webdir), html=True), name="app")
 
-    # The React console (source: web/console/), served at /v2 while the legacy
-    # single-file SPA keeps `/`. Both are live at once during the migration - the
-    # Prefect `ui` / `ui-v2` pattern - so a view lands here without taking the
-    # working console away from anyone. Views not yet ported link back to `/`.
+    # The React console (source: web/console/) is now THE console, served at `/`.
+    #
+    # It used to live at /v2 beside the legacy single-file SPA - the Prefect
+    # `ui`/`ui-v2` pattern - so views could land one at a time without taking a
+    # working console away from anyone. That migration is finished: all 23 views have
+    # React components, so the legacy file is deleted rather than left to drift.
+    #
+    # Assets are mounted at a NARROW prefix on purpose. A `StaticFiles` mount at "/"
+    # would be a route that matches every path, and Starlette matches in registration
+    # order - so it would shadow every API route declared after it, which is most of
+    # them. Serving index.html from an explicit route and mounting only `/assets`
+    # keeps the ordering hazard out of the design instead of relying on this block
+    # staying last in the function.
     if _CONSOLE_DIST is not None:
         from fastapi.staticfiles import StaticFiles
 
@@ -676,44 +677,45 @@ def build_app(root: Path) -> FastAPI:
 
             async def get_response(self, path, scope):
                 resp = await super().get_response(path, scope)
-                for k, v in _CONSOLE_V2_HEADERS.items():
+                for k, v in _CONSOLE_HEADERS.items():
                     resp.headers.setdefault(k, v)
                 return resp
 
-        # html=True serves index.html for `/v2/`. The SPA routes on the URL hash,
-        # so there are no server-side paths to rewrite.
-        api.mount("/v2", _ConsoleStatic(directory=str(_CONSOLE_DIST), html=True), name="console_v2")
-    else:
-        @api.get("/v2", response_class=HTMLResponse)
-        @api.get("/v2/", response_class=HTMLResponse)
-        def console_v2_missing():
-            # A source checkout that has not built the frontend. Say so plainly
-            # instead of 404ing, and point at the one command that fixes it.
-            return HTMLResponse(
-                "<!doctype html><title>Rya</title>"
-                "<h1>Console bundle not built</h1>"
-                "<p>Build it with <code>cd web/console &amp;&amp; npm install &amp;&amp; npm run build</code>, "
-                "then restart <code>rya serve</code>.</p>"
-                "<p>The current console is at <a href='/'>/</a>.</p>",
-                status_code=503,
-                headers=_CONSOLE_HEADERS,
-            )
+        _assets = _CONSOLE_DIST.joinpath("assets")
+        if _assets.is_dir():
+            api.mount("/assets", _ConsoleStatic(directory=str(_assets)), name="console_assets")
 
     @api.get("/", response_class=HTMLResponse)
-    @api.get("/console.html", response_class=HTMLResponse)
     def console_page():
         # The console page itself is public (it loads, then authenticates its own
         # data calls). `rya serve` ships the dashboard at its own origin.
-        return HTMLResponse(_CONSOLE_HTML, headers=_CONSOLE_HEADERS)
+        #
+        # An unbuilt bundle is an ordinary state for a source checkout, and it must
+        # never be a 404 or an import-time crash: say what is missing and name the one
+        # command that fixes it. This matters more now than it did at /v2, because
+        # there is no longer a second console to fall back to.
+        html = _console_index()
+        if html is None:
+            return HTMLResponse(
+                "<!doctype html><title>Rya</title>"
+                "<h1>Console bundle not built</h1>"
+                "<p>Build it with <code>cd web/console &amp;&amp; npm install &amp;&amp; npm run build</code> "
+                "(or <code>scripts/build_console.sh</code> from the repo root), "
+                "then restart <code>rya serve</code>.</p>"
+                "<p>The API is unaffected: only this page needs the bundle.</p>",
+                status_code=503,
+                headers=_CONSOLE_HEADERS,
+            )
+        return HTMLResponse(html, headers=_CONSOLE_HEADERS)
 
-    @api.get("/lucide.min.js")
-    def lucide_asset():
-        # Self-hosted icon library — no third-party CDN dependency (works
-        # air-gapped, and lets the CSP keep script-src to 'self').
-        from fastapi.responses import Response
-        return Response(_LUCIDE_JS, media_type="application/javascript",
-                        headers={"Cache-Control": "public, max-age=86400",
-                                 "X-Content-Type-Options": "nosniff"})
+    @api.get("/v2")
+    @api.get("/v2/")
+    def console_v2_moved():
+        # Kept as a redirect rather than deleted: /v2 was the console's address for the
+        # whole migration, so it is in bookmarks and in docs. A 308 preserves the
+        # method and tells caches the move is permanent.
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/", status_code=308)
 
     @api.get("/favicon.ico")
     def favicon():

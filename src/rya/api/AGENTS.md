@@ -52,8 +52,15 @@
 - `POST /agents/:id/versions` must never import the uploaded bundle (D13) — it
   verifies bytes, records, promotes. That is why it files no readiness attestation
   and says so in its response (`"attested": false`).
-- The console HTML is read once at process start (`_CONSOLE_HTML`) - restart
-  `rya serve` to pick up console edits.
+- The console is the built React bundle in `rya/console/dist`, served at `/` with
+  its assets mounted at `/assets`; `/v2` (its address during the migration)
+  308-redirects there. Edits go to `web/console/src` and need a rebuild
+  (`scripts/build_console.sh`), not just a server restart. An absent bundle is an
+  ordinary state and `GET /` returns a 503 naming the build command - never a 404,
+  and never an import-time failure.
+- The asset mount is `/assets`, deliberately not `/`. A `StaticFiles` mount at "/"
+  matches every path and Starlette matches in registration order, so it would
+  shadow every route declared after it.
 - Streaming endpoints run the engine on a worker thread and marshal callback
   frames onto the event loop; SSE tails end only on a terminal-status `run` or
   `error` (a `waiting_approval` run frame is a pause marker, not the end).

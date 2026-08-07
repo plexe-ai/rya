@@ -36,12 +36,27 @@ def test_build_console_shape(tmp_path):
 
 
 def test_console_page_is_served(tmp_path, monkeypatch):
+    """`/` serves the React bundle's index.html — the one console there is.
+
+    The legacy single-file SPA that used to answer here (and at `/console.html`) is
+    deleted: every view it had is a React component now. `/console.html` was only ever
+    an alias for it and is gone with it; `/console` (the JSON aggregate) is unrelated
+    and still very much alive.
+    """
+    from rya.api import app as app_mod
+
     c, _ = _client(tmp_path, monkeypatch)
     r = c.get("/")
-    assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
-    assert "Rya" in r.text and "rya context" in r.text
-    assert c.get("/console.html").status_code == 200
+    if app_mod._CONSOLE_DIST is None:
+        # A checkout that never ran `npm run build`: an ordinary state, and it must
+        # name the fix rather than 404.
+        assert r.status_code == 503
+        assert "npm run build" in r.text
+    else:
+        assert r.status_code == 200
+        assert '<div id="root">' in r.text
+    assert c.get("/console.html").status_code == 404
 
 
 def test_console_json_is_live(tmp_path, monkeypatch):
@@ -275,9 +290,10 @@ def test_console_security_headers_and_assets(tmp_path, monkeypatch):
     assert page.status_code == 200
     assert "frame-ancestors 'none'" in page.headers.get("content-security-policy", "")
     assert page.headers.get("x-frame-options") == "DENY"
-    # the icon library is served locally (no CDN dependency) and the favicon resolves
-    assert c.get("/lucide.min.js").status_code == 200
-    assert "javascript" in c.get("/lucide.min.js").headers.get("content-type", "")
+    # The self-hosted icon library is gone with the legacy console: icons are now
+    # `lucide-react` imports compiled into the bundle, so there is no separate asset
+    # to serve and no CDN dependency either way.
+    assert c.get("/lucide.min.js").status_code == 404
     assert c.get("/favicon.ico").status_code == 200
 
 
@@ -359,58 +375,66 @@ def test_no_branding_by_default(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The React console at /v2 (source: web/console/, built to src/rya/console/dist).
+# The React console at `/` (source: web/console/, built to src/rya/console/dist).
 #
-# `dist/` is gitignored build output, so these tests must pass BOTH on a machine
-# that has run `npm run build` and on one that never installed Node. Each test
-# below states which arm it covers rather than skipping silently.
+# It served /v2 while the legacy single-file SPA held `/`; that migration is done and
+# the legacy file is deleted, so this is now the only console and `/v2` is a redirect.
+#
+# `dist/` is gitignored build output, so these tests must pass BOTH on a machine that
+# has run `npm run build` and on one that never installed Node. Each test below states
+# which arm it covers rather than skipping silently.
 # ---------------------------------------------------------------------------
 
-def test_v2_serves_bundle_or_explains_itself(tmp_path, monkeypatch):
-    """/v2 is never a 404: it is the bundle, or a 503 that names the build command."""
+def test_console_is_never_a_404(tmp_path, monkeypatch):
+    """`/` is the bundle, or a 503 that names the build command — never a 404.
+
+    This matters more than it did at /v2: there is no second console to fall back to,
+    so an unbuilt frontend has to explain itself.
+    """
     from rya.api import app as app_mod
 
     c, _ = _client(tmp_path, monkeypatch)
-    r = c.get("/v2/")
+    r = c.get("/")
     if app_mod._CONSOLE_DIST is None:
         assert r.status_code == 503
         assert "npm run build" in r.text
-        assert 'href=\'/\'' in r.text  # points back at the working console
+        assert "API is unaffected" in r.text
     else:
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
         assert '<div id="root">' in r.text
 
 
-def test_v2_never_takes_away_the_legacy_console(tmp_path, monkeypatch):
-    """Both consoles are live during the migration (the Prefect ui/ui-v2 pattern)."""
+def test_v2_redirects_to_the_root(tmp_path, monkeypatch):
+    """/v2 was the console's address for the whole migration, so it is in bookmarks
+    and in docs. It redirects rather than 404s, permanently and without changing the
+    method."""
     c, _ = _client(tmp_path, monkeypatch)
-    assert c.get("/").status_code == 200
-    assert "rya context" in c.get("/").text  # the legacy single-file SPA, unchanged
+    for path in ("/v2", "/v2/"):
+        r = c.get(path, follow_redirects=False)
+        assert r.status_code == 308, path
+        assert r.headers["location"] == "/", path
 
 
-def test_v2_drops_unsafe_inline_for_scripts(tmp_path, monkeypatch):
-    """The build step's security win: the React bundle needs no inline script.
+def test_the_console_needs_no_inline_script(tmp_path, monkeypatch):
+    """The build step's security win, now unconditional.
 
-    The legacy console is one big inline <script>, so `/` must keep
-    'unsafe-inline'. /v2 loads external modules and must not.
+    The legacy console was one big inline <script>, so `/` had to allow
+    'unsafe-inline' for scripts. The React bundle loads external modules, so with the
+    legacy file deleted the allowance is GONE from the policy rather than merely
+    unused by one of two consoles.
     """
-    from rya.api import app as app_mod
-
-    if app_mod._CONSOLE_DIST is None:
-        pytest.skip("frontend not built (run `cd web/console && npm run build`)")
-
     c, _ = _client(tmp_path, monkeypatch)
 
     def script_src(resp):
         csp = resp.headers["content-security-policy"]
         return next(d for d in csp.split(";") if d.strip().startswith("script-src"))
 
-    assert "'unsafe-inline'" not in script_src(c.get("/v2/"))
-    assert "'unsafe-inline'" in script_src(c.get("/"))  # legacy still needs it
+    # True on both arms: the header is a constant, not a function of the bundle.
+    assert "'unsafe-inline'" not in script_src(c.get("/"))
 
 
-def test_v2_assets_carry_security_headers(tmp_path, monkeypatch):
+def test_console_assets_carry_security_headers(tmp_path, monkeypatch):
     """A mount bypasses route-level headers, so the StaticFiles subclass must add them."""
     import re
 
@@ -420,7 +444,8 @@ def test_v2_assets_carry_security_headers(tmp_path, monkeypatch):
         pytest.skip("frontend not built (run `cd web/console && npm run build`)")
 
     c, _ = _client(tmp_path, monkeypatch)
-    refs = [a for a in re.findall(r'(?:src|href)="([^"]+)"', c.get("/v2/").text) if a.startswith("/v2/")]
+    refs = [a for a in re.findall(r'(?:src|href)="([^"]+)"', c.get("/").text)
+            if a.startswith("/assets/")]
     assert refs, "the built index.html should reference at least one hashed asset"
     for ref in refs:
         r = c.get(ref)

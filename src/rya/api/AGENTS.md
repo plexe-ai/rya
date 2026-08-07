@@ -13,7 +13,21 @@
 - **Multi-tenant** (`RYA_MULTITENANT=1` + Postgres): per-request engine scoped to
   the caller's workspace via a per-workspace API key (`rya_sk_...`), on the
   non-superuser `rya_app` role so Postgres RLS enforces isolation. An optional
-  per-user JWT (`X-Rya-User-Token`) turns on per-user RLS within a workspace.
+  per-user JWT (`X-Rya-User-Token`) identifies the USER within that workspace.
+
+`X-Rya-User-Token` has **three** consumers, and a client that omits it loses all
+three — it is not only about RLS:
+
+| consumer | effect |
+|---|---|
+| `get_plane` | sets the `app.user_id` GUC → per-user RLS on runs, sessions, connections |
+| `_actor_from` | `resolvedBy` on approvals; `RYA_REQUIRE_APPROVER_IDENTITY=1` **requires** it |
+| `_identity_from` | the run's `Identity` → per-user connections and scope intersection |
+
+`_verified_user` is the only place the header is verified. Mint one with
+`POST /v1/token` from an account session; it lasts 12 hours. Note the RLS rule is
+`owner IS NULL OR owner = app.user_id`, so a caller that sends no user token sees only
+workspace-shared rows — it does not see a filtered *error*, it sees a shorter list.
 
 ## Endpoint groups
 
@@ -30,8 +44,8 @@
   `POST /versions/:id/retire`, `GET /agents/:id/environments[/:env[/history]]`,
   `POST .../environments/:env/{promote,rollback}`, `GET/PUT /gate`,
   `GET /gate/check`, `GET /workers`.
-- Tools/kill switches: `GET /tools`, `PUT /tools/:id/permission`.
-- Guard/evals: `GET/PUT /guard`, `GET /evals`, `POST /evals/run`.
+- Tools/kill switches: `GET /tools`, `PUT /tools/:id/permission`, `GET /tools/log`.
+- Guard/evals: `GET/PUT /guard`, `GET /guard/log`, `GET /evals`, `POST /evals/run`.
 - Console + inspection: `GET /console` (aggregate), `GET /` (SPA), knowledge, sessions, connections, secrets, channels, models, healthz, `/v1/info`.
 - Accounts/teams (multi-tenant): `/v1/signup`, `/v1/login`, `/v1/me`,
   `/v1/workspaces[...]` (create, members/invites, keys), `/v1/password`.
@@ -49,6 +63,14 @@
   one path where the api still executes handlers: resuming an approval replays the
   journal, and mismatched code is caught as `E_JOURNAL_DRIFT` rather than silently
   replayed. Restart on the promoted bundle to clear it.
+- **Governance has exactly one reader per source, and reporting surfaces must use
+  them.** Kill switches: `sdk.context.read_killswitches` (`_killswitches` here is a
+  thin delegate). Guard policy: `guard.effective_policy` for reads, `_guard_source`
+  for writes — same store-then-file precedence, and the write side is separate only
+  because it must also decide which file a write may touch. There were three
+  killswitch readers; the odd one out was `snapshot._governance`, which read the
+  pre-§11.2 memory scope and so reported "No overrides." while a killed tool was
+  being refused (audit §4.5). Add a reader and it will drift.
 - `POST /agents/:id/versions` must never import the uploaded bundle (D13) — it
   verifies bytes, records, promotes. That is why it files no readiness attestation
   and says so in its response (`"attested": false`).

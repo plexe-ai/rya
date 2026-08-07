@@ -36,7 +36,7 @@ function stubFetch(routes: Record<string, { status?: number; body?: unknown }>) 
       calls.push({ url: String(url), method, body: init.body as string, auth: headers.Authorization })
       const r = routes[`${method} ${String(url)}`] ?? {
         status: 404,
-        body: { detail: { message: `unrouted ${method} ${url}` } },
+        body: { ok: false, error: { message: `unrouted ${method} ${url}` } },
       }
       const status = r.status ?? 200
       return Promise.resolve({
@@ -135,7 +135,7 @@ describe('TeamView', () => {
       'GET /v1/workspaces/ws_1/members': MEMBERS,
       'GET /v1/workspaces/ws_1/keys': {
         status: 403,
-        body: { detail: { code: 'E_UNAUTHORIZED', message: 'You are not the owner of this workspace.' } },
+        body: { ok: false, error: { code: 'E_UNAUTHORIZED', message: 'You are not the owner of this workspace.' } },
       },
     })
 

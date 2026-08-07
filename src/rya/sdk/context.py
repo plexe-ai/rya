@@ -128,6 +128,35 @@ POLICY_GUARD = "guard"                 # the egress/grounding/secrecy policy
 RESERVED_MEMORY_PREFIX = "_"
 
 
+def read_killswitches(store) -> dict:
+    """The operator tool overrides the runtime will actually honour, as
+    ``{"tool:<id>": {"permission": …, "ts": …, "reason": …}}``.
+
+    ONE definition, because there were three: this, `api.app._killswitches` and
+    `snapshot._governance`. The first two agreed; the third still read only the
+    legacy scope, so the governance dashboard reported "No overrides." while a
+    killed tool was being refused (audit §4.5). A reader that can drift from the
+    enforcer is a reader that will.
+
+    §11.2 moved these out of the `_runtime_config` *memory* scope — an ordinary
+    scope a bundle can write through `ctx.memory.set`, and governance a client
+    can edit is not governance — into privileged policy state. The old scope is
+    still READ so a switch set before the move keeps working; nothing writes it,
+    and `ctx.memory` now refuses to address it at all.
+
+    Raises rather than returning ``{}`` on a store failure, so callers can fail
+    CLOSED: an unreadable policy must refuse tools, not run one an operator may
+    have just killed.
+    """
+    getter = getattr(store, "policy_get", None)
+    if getter is not None:
+        switches = getter(POLICY_KILLSWITCHES)
+        if switches is not None:
+            return switches
+    legacy = store.load_memory("_runtime_config")
+    return (legacy.get("kv") or {}) if legacy else {}
+
+
 def _canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, default=str, separators=(",", ":"))
 
@@ -577,16 +606,7 @@ class RuntimeContext:
         Raises so callers can fail CLOSED: an unreadable policy must refuse tools
         rather than run one an operator may have just killed.
         """
-        getter = getattr(self.store, "policy_get", None)
-        if getter is not None:
-            switches = getter(POLICY_KILLSWITCHES)
-            if switches is not None:
-                return switches
-        # Read-through to the legacy location so deployments that set a kill
-        # switch before this landed keep it until an operator writes a new one.
-        # Write-through is deliberately absent: the old scope is now read-only.
-        legacy = self.store.load_memory("_runtime_config")
-        return (legacy.get("kv") or {}) if legacy else {}
+        return read_killswitches(self.store)
 
     def _effective_tool_permission(self, tool_id: str) -> Optional[Permission]:
         """Manifest permission, unless a runtime kill switch overrides it.

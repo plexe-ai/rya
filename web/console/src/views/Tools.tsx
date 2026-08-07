@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { Plug, Power, PowerOff } from 'lucide-react'
 import { api } from '../lib/api'
 import { ag } from '../lib/agent'
@@ -6,6 +6,7 @@ import { useLoad } from '../lib/usePoll'
 import { PERM_CLASS } from '../lib/format'
 import type { ConsoleState, Permission, Tool } from '../lib/types'
 import { SecRow, Table, ViewHeader } from '../components/ui'
+import { ConfirmDialog } from '../components/ConfirmDialog'
 
 /**
  * The extra per-tool fields `GET /console` carries that `lib/types.ts: Tool` does
@@ -73,6 +74,19 @@ const PERM_MEANING: Record<string, string> = {
   disabled: 'The call is REFUSED by the runtime. The tool is not hidden from the model.',
 }
 
+/**
+ * Every tier the server will accept, in escalating order of restriction.
+ *
+ * One list, read by both the legend at the foot of this view and the picker in the
+ * override dialog, because §5.15 was precisely the gap between them: the legend
+ * documented four tiers and the column offered a hardcoded `disabled` and a clear, so
+ * "put this tool behind approval until we've looked at it" — the tier that suspends a
+ * run instead of failing it, and the one an operator actually wants during an incident
+ * — was explained at length and then unreachable. Reading them off the same constant
+ * is what keeps a tier from being documented and unoffered again.
+ */
+const PERM_TIERS: Permission[] = ['allowed', 'read_only', 'approval_required', 'disabled']
+
 function PermPill({ permission }: { permission: Permission }) {
   return (
     <span className={`pb ${PERM_CLASS[permission] ?? ''}`} title={PERM_MEANING[permission]}>
@@ -117,6 +131,10 @@ export function ToolsView({
   // Per-tool, not one flag: disabling `email.send` must not freeze every other row.
   const [pending, setPending] = useState<Record<string, boolean>>({})
 
+  // Which row's switch is being confirmed, if any. Null is the normal state, so no
+  // path through this view writes policy without passing through the dialog below.
+  const [confirming, setConfirming] = useState<{ id: string; mode: 'set' | 'clear' } | null>(null)
+
   const eff: Record<string, ToolSwitch> = {}
   for (const t of data?.tools ?? []) eff[t.id] = t
 
@@ -126,18 +144,39 @@ export function ToolsView({
   // renderer encoded by caching `TOOL_EFF` across renders.
   const enriched = data !== null
 
+  const confirmingTool = confirming ? tools.find((t) => t.id === confirming.id) : undefined
+
   /**
-   * Flip a runtime kill switch. `mode: 'disabled'` writes the override,
-   * `mode: 'clear'` drops it so the manifest permission takes over again.
+   * Flip a runtime kill switch, once an operator has confirmed the decision.
    *
    * PUT, and agent-prefixed. The agent is addressed so the server can check the tool
    * against a real declaration (404 `E_TOOL_NOT_FOUND` otherwise) — the switch it
    * writes is workspace-wide privileged policy state, versioned and attributed, which
    * is also why the bundle whose tool is being killed cannot write it back.
+   *
+   * The `reason` comes from the operator and nowhere else. It used to be the constant
+   * `'console kill switch'` (§5.15), which is worth being precise about: the server
+   * stores it verbatim in an append-only policy record beside a real actor and a real
+   * timestamp, and `GET /tools/log` exists to answer "who changed which kill switch,
+   * when, and what it was before". A hardcoded string does not merely add nothing to
+   * that record — it fills the only field capable of answering *why* with a sentence
+   * describing the button that was pressed, permanently, under someone's name. Six
+   * months later the log says the same thing for the tool killed during an outage and
+   * the one killed by a mis-click.
+   *
+   * Returns whether the write landed, so the dialog can stay open on failure rather
+   * than discarding a reason the operator has just typed.
    */
-  async function toolSwitch(id: string, mode: 'disabled' | 'clear') {
+  async function toolSwitch(id: string, decision: Decision): Promise<boolean> {
     setPending((p) => ({ ...p, [id]: true }))
-    const payload = mode === 'clear' ? { clear: true } : { permission: mode, reason: 'console kill switch' }
+    // `reason` is deliberately absent from the clear payload, not empty: the server
+    // ignores it on a clear (it removes the record rather than annotating one), and
+    // sending a field that is dropped on the floor invites the next reader to think
+    // the log will carry it.
+    const payload =
+      decision.mode === 'clear'
+        ? { clear: true }
+        : { permission: decision.permission, reason: decision.reason }
     try {
       const r = await api<SwitchResult>(
         ag(state.agent.name, `/tools/${encodeURIComponent(id)}/permission`),
@@ -147,14 +186,21 @@ export function ToolsView({
           body: JSON.stringify(payload),
         },
       )
-      const verb = mode === 'clear' ? 'Restored' : 'Disabled'
+      const what =
+        decision.mode === 'clear'
+          ? `Restored ${id}`
+          : decision.permission === 'disabled'
+            ? `Disabled ${id}`
+            : `${id} → ${decision.permission}`
       const version = r.version != null ? ` · v${r.version}` : ''
-      onToast(`${verb} ${id}${version} — effective immediately`)
+      onToast(`${what}${version} — effective immediately`)
       // Refresh-after-write: the response says what the switch became, but the table
       // renders the server's view of every tool, so re-read rather than patch.
       await reload()
+      return true
     } catch (e) {
       onToast(`Error — ${e instanceof Error ? e.message : String(e)}`)
+      return false
     } finally {
       // Both paths: on success the row re-renders from fresh data, on failure the
       // operator needs the button back.
@@ -232,25 +278,29 @@ export function ToolsView({
               cell: (t) => {
                 const ep = eff[t.id]?.effectivePermission ?? t.permission
                 const busy = !!pending[t.id]
+                // Both labels end in an ellipsis on purpose: it is the conventional
+                // signal that the control opens a dialog rather than acting, and this
+                // column sits in a table a 6s poll keeps repainting, where the cost of
+                // a mis-click used to be a live tool refusing every call (§5.15).
                 return ep !== 'disabled' ? (
                   <button
                     className="btn sm"
-                    onClick={() => void toolSwitch(t.id, 'disabled')}
+                    onClick={() => setConfirming({ id: t.id, mode: 'set' })}
                     disabled={busy}
-                    title="Refuse every call to this tool from now on, without a redeploy."
+                    title="Override this tool's permission at runtime, without a redeploy."
                   >
                     <PowerOff aria-hidden="true" focusable="false" />
-                    Disable
+                    Disable…
                   </button>
                 ) : (
                   <button
                     className="btn sm"
-                    onClick={() => void toolSwitch(t.id, 'clear')}
+                    onClick={() => setConfirming({ id: t.id, mode: 'clear' })}
                     disabled={busy}
                     title="Drop the override and fall back to the manifest permission."
                   >
                     <Power aria-hidden="true" focusable="false" />
-                    Restore
+                    Restore…
                   </button>
                 )
               },
@@ -298,14 +348,144 @@ export function ToolsView({
 
       <SecRow left="What a tier does" right="enforced by the runtime, not the prompt" />
       <Table
-        rows={['allowed', 'read_only', 'approval_required', 'disabled'] as Permission[]}
+        rows={PERM_TIERS}
         rowKey={(p) => p}
         columns={[
           { header: 'Tier', cell: (p) => <PermPill permission={p} /> },
           { header: 'At call time', cell: (p) => PERM_MEANING[p] },
         ]}
       />
+
+      {/* Mounted only while a decision is open, and keyed on the row it belongs to, so
+          the tier and the reason inside it start empty for every tool. A reason typed
+          for `email.send` that survived into the dialog for `billing.refund` would be
+          worse than no reason at all: it would be a plausible, wrong sentence in an
+          append-only audit record. If a poll retires the tool underneath an open
+          dialog it unmounts, which is the honest outcome — there is no longer anything
+          to override. */}
+      {confirmingTool && confirming && (
+        <ToolPermissionDialog
+          key={`${confirming.id}:${confirming.mode}`}
+          toolId={confirming.id}
+          mode={confirming.mode}
+          manifest={confirmingTool.permission}
+          effective={eff[confirming.id]?.effectivePermission ?? confirmingTool.permission}
+          busy={!!pending[confirming.id]}
+          onCancel={() => setConfirming(null)}
+          onConfirm={async (decision) => {
+            if (await toolSwitch(confirming.id, decision)) setConfirming(null)
+          }}
+        />
+      )}
     </>
+  )
+}
+
+/** What a confirmed decision carries to the wire. */
+type Decision = { mode: 'set'; permission: Permission; reason: string } | { mode: 'clear' }
+
+/**
+ * The kill switch's confirmation step.
+ *
+ * A `ConfirmDialog` plus the two fields this particular decision needs, rather than a
+ * second general dialog: the tier picker and the reason box are specific to writing a
+ * tool permission, and the shared component stays a shared component by not learning
+ * about them. It owns its own field state, so mounting it is what clears the form.
+ *
+ * The two modes are asymmetric on purpose. Writing an override demands a reason,
+ * because that string is the entire content of the audit record — a required field is
+ * the only reason `GET /tools/log` will be worth reading in six months. Clearing one
+ * does not: the server drops the record rather than annotating it, so a reason typed
+ * here would go nowhere. **It is still confirmed**, because restoring is not a neutral
+ * undo — it re-enables a tool that somebody deliberately killed, quite possibly during
+ * an incident that is still running, and "I clicked the wrong row of a table that
+ * repaints every six seconds" should not be able to turn refunds back on.
+ */
+function ToolPermissionDialog({
+  toolId,
+  mode,
+  manifest,
+  effective,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  toolId: string
+  mode: 'set' | 'clear'
+  manifest: Permission
+  effective: Permission
+  busy: boolean
+  onCancel: () => void
+  onConfirm: (decision: Decision) => void
+}) {
+  // `disabled` is the default because this column is the kill switch and killing the
+  // tool is what an operator reaching for it usually means. The other three are one
+  // keystroke away rather than unreachable, which is the whole of §5.15.
+  const [permission, setPermission] = useState<Permission>('disabled')
+  const [reason, setReason] = useState('')
+  const uid = useId()
+
+  if (mode === 'clear') {
+    return (
+      <ConfirmDialog
+        title={`Restore ${toolId}?`}
+        body={`Drops the runtime override and falls back to what the manifest declares: ${manifest}. The tool becomes callable again immediately, on every run in this workspace.`}
+        confirmLabel="Drop override"
+        busy={busy}
+        onCancel={onCancel}
+        onConfirm={() => onConfirm({ mode: 'clear' })}
+      />
+    )
+  }
+
+  const trimmed = reason.trim()
+  return (
+    <ConfirmDialog
+      title={`Override ${toolId}?`}
+      body={`Manifest says ${manifest}; in force right now is ${effective}. This writes a versioned, attributed policy record that takes effect on the next call — no redeploy, and no way to un-write the record.`}
+      confirmLabel="Write override"
+      // Red only when the choice actually refuses calls. Moving a tool to
+      // approval_required is consequential, not destructive, and colouring the two the
+      // same would make the warning mean nothing.
+      danger={permission === 'disabled'}
+      busy={busy}
+      // The gate on the reason lives here rather than in a submit handler so the
+      // operator can see that the field is what is holding the action back.
+      confirmDisabled={!trimmed}
+      onCancel={onCancel}
+      onConfirm={() => onConfirm({ mode: 'set', permission, reason: trimmed })}
+    >
+      <label className="fl" htmlFor={`${uid}-perm`}>
+        New permission
+      </label>
+      <select
+        id={`${uid}-perm`}
+        value={permission}
+        onChange={(e) => setPermission(e.currentTarget.value as Permission)}
+      >
+        {PERM_TIERS.map((p) => (
+          <option key={p} value={p}>
+            {p}
+          </option>
+        ))}
+      </select>
+      {/* The same sentence the legend gives that tier, next to the control that
+          selects it — a picker whose options are four snake_case identifiers asks the
+          operator to already know what they mean. */}
+      <div className="dim" style={{ fontSize: 12, margin: '-7px 0 13px' }}>
+        {PERM_MEANING[permission]}
+      </div>
+
+      <label className="fl" htmlFor={`${uid}-reason`}>
+        Reason — recorded against your identity in the tool policy log
+      </label>
+      <textarea
+        id={`${uid}-reason`}
+        value={reason}
+        onChange={(e) => setReason(e.currentTarget.value)}
+        placeholder="e.g. vendor incident INC-4412 — refunds paused until the postmortem"
+      />
+    </ConfirmDialog>
   )
 }
 

@@ -100,11 +100,15 @@ class RemoteClient:
 
         Collapsing the api's error bodies into ``E_REMOTE`` would end the stable
         error-code contract (docs/devex.md) at the network boundary: a caller
-        could not tell a content-hash mismatch from an unreachable bucket. Three
-        shapes are accepted because the api emits three — the RyaError handler
-        sends ``to_dict()["error"]`` flat, ``HTTPException(detail={...})`` nests
-        under ``detail``, and a hand-built body may nest under ``error``.
-        Anything else (a proxy's HTML 413, say) keeps the old behaviour.
+        could not tell a content-hash mismatch from an unreachable bucket.
+
+        Rya's api now emits ONE shape — ``{"ok": false, "error": {...}}``, read by
+        the ``body.get("error")`` arm below (docs/devex.md, One error envelope). The
+        other two arms are kept deliberately, because this client talks to a REMOTE
+        control plane whose version it does not control: a flat ``to_dict()["error"]``
+        and a ``detail``-nested ``HTTPException`` are what older servers send, and
+        dropping them would break `rya publish` against them. Anything else (a proxy's
+        HTML 413, say) keeps the old behaviour.
         """
         try:
             body = json.loads(detail)

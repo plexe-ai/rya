@@ -1458,24 +1458,57 @@ class PostureReport:
     topology_detail: str = ""
 
     @property
+    def conditions(self) -> List[dict]:
+        """The gate's conditions, in the order it states them. **The one definition.**
+
+        Everything that enumerates the conditions reads this: :attr:`unmet`, :meth:`ok`,
+        :meth:`describe`, `rya posture` and the console's posture table. Audit §5.7 is
+        what a second enumeration costs — the console carried its own three-entry list,
+        so when D32 arrived here the tile went INCOMPLETE while every row it could show
+        said "in force", and nothing on the page named the fourth. A set the server owns
+        has to be *sent* by the server, not mirrored by each reader.
+
+        Two names per condition, and the pair is deliberate. ``label`` is a heading
+        ("Isolation (D23)"); ``prose`` is the fragment that reads as a sentence after
+        "this deployment is missing" — lowercase, because :attr:`unmet` is quoted into a
+        refusal message and into `rya posture` output that operators and tests both
+        match on, and a capitalised "Isolation (D23): ..." there would be a silent break
+        in a string that error handling depends on.
+        """
+        return [
+            {"key": "isolation", "label": "Isolation (D23)",
+             "prose": "isolation (D23)",
+             "ok": self.isolation_ok, "detail": self.isolation_detail},
+            {"key": "broker", "label": "Credential mediation (D18)",
+             "prose": "credential mediation (D18)",
+             "ok": self.broker_ok, "detail": self.broker_detail},
+            {"key": "egress", "label": "Network egress (D24)",
+             "prose": "network egress (D24)",
+             "ok": self.egress_ok, "detail": self.egress_detail},
+            {"key": "topology", "label": "Broker topology (D32)",
+             "prose": "broker topology (D32)",
+             "ok": self.topology_ok, "detail": self.topology_detail},
+        ]
+
+    @property
     def unmet(self) -> List[str]:
-        out = []
-        if not self.isolation_ok:
-            out.append(f"isolation (D23): {self.isolation_detail}")
-        if not self.broker_ok:
-            out.append(f"credential mediation (D18): {self.broker_detail}")
-        if not self.egress_ok:
-            out.append(f"network egress (D24): {self.egress_detail}")
-        if not self.topology_ok:
-            out.append(f"broker topology (D32): {self.topology_detail}")
-        return out
+        return [f"{c['prose']}: {c['detail']}"
+                for c in self.conditions if not c["ok"]]
 
     @property
     def ok(self) -> bool:
         return not self.unmet
 
     def describe(self) -> dict:
+        # The flat per-condition keys stay exactly as they were: `rya posture --json`,
+        # the tests and any deployed reader index them by name, and this addition is
+        # not worth a breaking rename. `conditions` is the same facts in the gate's
+        # order, for a reader that must not have to know the names in advance (§5.7).
+        # `prose` is dropped on the way out — it exists to build `unmet`, and a payload
+        # carrying two spellings of every label invites a client to pick the wrong one.
         return {"untrusted": self.untrusted, "ok": self.ok, "unmet": self.unmet,
+                "conditions": [{k: v for k, v in c.items() if k != "prose"}
+                               for c in self.conditions],
                 "isolation": {"ok": self.isolation_ok, "detail": self.isolation_detail},
                 "broker": {"ok": self.broker_ok, "detail": self.broker_detail},
                 "egress": {"ok": self.egress_ok, "detail": self.egress_detail},
@@ -1523,7 +1556,7 @@ def check_untrusted_posture(driver: ExecutionDriver, *,
                             untrusted: Optional[bool] = None,
                             env: Optional[Mapping[str, str]] = None,
                             verify: bool = False) -> PostureReport:
-    """Evaluate all three conditions. Never raises; :func:`require_untrusted_posture` does.
+    """Evaluate every condition. Never raises; :func:`require_untrusted_posture` does.
 
     ``verify=False`` by default because probing costs a container start, and the
     supervisor evaluates this on a path where that would be paid per tick. The

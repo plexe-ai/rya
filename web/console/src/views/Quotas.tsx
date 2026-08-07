@@ -88,14 +88,31 @@ interface PostureCondition {
   detail?: string
 }
 
+/**
+ * The same condition as `PostureReport.conditions` sends it, carrying its own identity
+ * so this page never has to know the set in advance — a `key` this console has never
+ * heard of is still a row, labelled by the server.
+ */
+interface PostureConditionRow extends PostureCondition {
+  key?: string
+  label?: string
+}
+
 /** `GET /posture` — configuration only. Credential *kinds*, never values. */
 interface PostureResponse {
   untrusted?: boolean
   ok?: boolean
   unmet?: string[]
+  /** Every condition the gate evaluates, in the order the gate states them. */
+  conditions?: PostureConditionRow[]
+  // The flat per-condition keys are still sent and are still the contract for readers
+  // that want ONE of them. They are declared in full — `topology` included — because a
+  // response shape that omits a key the server sends is how this page came to believe
+  // the gate had three conditions in the first place.
   isolation?: PostureCondition
   broker?: PostureCondition
   egress?: PostureCondition
+  topology?: PostureCondition
   probe?: { verified?: boolean | null; detail?: string } | null
   driver?: { driver?: string; isolation?: string }
   credentials?: { clean?: boolean; violations?: { group?: string; name?: string }[] }
@@ -200,12 +217,14 @@ function OrgBudget({ org }: { org?: OrgVerdict }) {
   )
 }
 
-/** The three launch-gate conditions, in the order the gate states them. */
-const CONDITIONS: { key: string; label: string; of: (p: PostureResponse) => PostureCondition | undefined }[] = [
-  { key: 'isolation', label: 'Isolation (D23)', of: (p) => p.isolation },
-  { key: 'broker', label: 'Credential mediation (D18)', of: (p) => p.broker },
-  { key: 'egress', label: 'Network egress (D24)', of: (p) => p.egress },
-]
+// There is no `CONDITIONS` list here any more, and that is the fix for audit §5.7.
+// This file used to declare the launch gate's conditions itself — three of them, with
+// their labels. The gate is the server's (`PostureReport`), and when it grew a fourth
+// (D32, broker topology) nothing here failed: the page went on rendering three rows
+// that all said "in force" under a tile reading INCOMPLETE, because `ok` and `unmet`
+// DID count the fourth. A mirrored set drifts silently by construction; the rows below
+// come from `posture.conditions`, so a condition this console has never heard of still
+// renders, labelled by the side that owns it.
 
 /**
  * The launch gate, on the page that already answers "what is this deployment allowed
@@ -218,8 +237,8 @@ function TenantPosture({ posture }: { posture: PostureResponse }) {
   const driver = p.driver ?? {}
   const creds = p.credentials ?? {}
   const verified = p.probe?.verified
-  // A trusted deployment with none of the three conditions met is CORRECT. Marking it
-  // red would train an operator to ignore the mark on the one deployment where it means
+  // A trusted deployment with none of the conditions met is CORRECT. Marking it red
+  // would train an operator to ignore the mark on the one deployment where it means
   // something, so the badge follows `untrusted` and not `ok`.
   const satisfied = p.ok || !p.untrusted
 
@@ -262,25 +281,51 @@ function TenantPosture({ posture }: { posture: PostureResponse }) {
         />
       </div>
       <Table
-        rows={CONDITIONS}
-        rowKey={(c) => c.key}
+        rows={p.conditions ?? []}
+        // The server names the condition; the index is the fallback for a payload that
+        // does not, which beats a row React cannot keep across a re-render.
+        rowKey={(c) => c.key || c.label || String((p.conditions ?? []).indexOf(c))}
+        emptyIcon={ShieldAlert}
+        // An empty table means this server predates `conditions` — an honest blank is
+        // better than the three hardcoded rows that used to stand in for it, which is
+        // the whole of §5.7.
+        emptyMessage="This server did not name its launch-gate conditions."
         columns={[
-          { header: 'Condition', cell: (c) => c.label },
-          { header: 'State', cell: (c) => c.of(p)?.detail || '—' },
+          { header: 'Condition', cell: (c) => c.label || c.key || '—' },
+          { header: 'State', cell: (c) => c.detail || '—' },
           {
             header: 'Status',
-            cell: (c) =>
-              c.of(p)?.ok ? <Verdict tone="ok">in force</Verdict> : <Verdict tone="wait">not in force</Verdict>,
+            cell: (c) => (c.ok ? <Verdict tone="ok">in force</Verdict> : <Verdict tone="wait">not in force</Verdict>),
           },
         ]}
       />
+      {p.untrusted && !p.ok && (
+        // The other half of §5.7: the tile says INCOMPLETE and, before this, nothing on
+        // the page said why — `unmet` was fetched and thrown away. These are the exact
+        // sentences the platform refuses to start with, written server-side for an
+        // operator, so an operator who reads them here has already read the error they
+        // will hit on deploy. Untrusted only: an unmet condition on a TRUSTED
+        // deployment is the designed state and gets the calm note below instead.
+        <div className="keynote">
+          The posture is incomplete for these reasons, in the platform's own words — it refuses
+          to start work for an untrusted tenant until every one of them is met:
+          {/* A real list, for a screen reader's count of "how many things are wrong",
+              with the spacing inline: `.keynote` has no rule for `ul` and this is not
+              a restyle. */}
+          <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {(p.unmet ?? []).map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {!p.untrusted && (
         // `.note` in the legacy markup has no rule in styles.css; `.keynote` is the
         // closest existing class and this is not a restyle.
         <div className="keynote">
           None of the above is enforced: the trusted posture is supported and is what every
           self-host runs. Declare <span className="mono">RYA_UNTRUSTED_TENANTS=1</span> only with
-          all three in force — the platform refuses to start otherwise.
+          every condition above in force — the platform refuses to start otherwise.
         </div>
       )}
     </>
@@ -292,7 +337,7 @@ function TenantPosture({ posture }: { posture: PostureResponse }) {
  *
  * The page answers three questions, not one, and the order is deliberate: **this
  * workspace's** limits, then **its organization's** budget (D29), then the **launch
- * gate** (D18/D23/D24). Each comes from a different boundary, and an operator debugging
+ * gate** (D18/D23/D24/D32). Each comes from a different boundary, and an operator debugging
  * a refusal has to know which one refused.
  *
  * Loads on entry rather than from the shell's 6s poll: ceilings and a deployment's

@@ -100,8 +100,16 @@ export interface Approval {
   id: string
   title: string
   runId: string
+  /** The human-readable case for the action. Shipped since day one, never rendered. */
   body?: string
+  /** The tool call that runs on approve — `input` is what the operator is consenting to. */
   action?: { tool?: string; input?: Record<string, unknown> } | null
+  /**
+   * The agent whose run is paused. Present because `state.approvals` is the
+   * WORKSPACE inbox while the rest of the snapshot is one agent — see `snapshot.py`.
+   * Null when the run behind the approval can no longer be read.
+   */
+  agent?: string | null
 }
 
 export interface TraceEvent {
@@ -151,22 +159,43 @@ export interface Governance {
   }
   policy: {
     hash: string
+    /** Counts are EFFECTIVE — manifest permissions as overridden by kill switches. */
     toolsGated: number
     toolsDenied: number
     pinnedArgTools: number
+    /** How many of the above differ from the manifest because an operator overrode them. */
+    toolsOverridden?: number
     egressRules: number
     egressDefault?: string | null
+    /** Where the guard in force came from: `store`, `file:<path>`, or `none`. */
+    egressSource?: string
+    /** The guard document's own version — the string `PUT /guard` returns. */
+    egressVersion?: string | null
+    /** Set ⇒ the policy source broke ⇒ the guard is denying everything. */
+    egressError?: string | null
   }
   switches?: {
-    active: { tool: string; permission: Permission; ts?: string; version: number }[]
+    active: { tool: string; permission: Permission; ts?: string; reason?: string }[]
+    /**
+     * Per-tool transitions derived from the policy log, newest first. The log
+     * versions the whole switches map, so `version` is the document's, not the
+     * tool's — and `permission` is absent on a `cleared` row for a tool the
+     * manifest no longer declares.
+     */
     history: {
       ts?: string
       tool: string
-      permission: Permission
-      previous?: Permission
+      permission?: Permission | null
+      previous?: Permission | null
       cleared?: boolean
       reason?: string
+      actor?: string | null
+      version?: number
     }[]
+    /** Current version of the kill-switch document. */
+    version?: number | null
+    /** Set ⇒ the policy store could not be read; the tables below are unknown, not empty. */
+    error?: string | null
   }
   violations?: { ts?: string; kind: string; runId?: string; detail?: string }[]
 }
@@ -226,16 +255,43 @@ export interface ConsoleRoster {
 
 export type ConsoleResponse = ConsoleState | ConsoleRoster
 
-/** Narrows the poll's payload to the shape every view needs. */
+/**
+ * Narrows the poll's payload to the shape every view needs.
+ *
+ * Checks the field consumers actually dereference, not just `agent !== null`. The
+ * two shapes are told apart by a value the server controls, so this predicate is
+ * the only thing standing between a malformed `/console` body and a `loaded.agent
+ * .name` in the top bar, the sidebar, the document title and every view. `!== null`
+ * passed `undefined`, a missing key, and `agent: {}` — all three of which then threw
+ * during render, which before the ErrorBoundary meant a blank page.
+ *
+ * `name` is the right probe because it is what the shell reads first and what every
+ * agent-scoped request is built from: an agent without one is not addressable, so
+ * falling back to the picker is a better answer than rendering half a page.
+ */
 export function hasAgent(r: ConsoleResponse | null | undefined): r is ConsoleState {
-  return !!r && r.agent !== null
+  return !!r && typeof (r as ConsoleState).agent?.name === 'string'
 }
 
-/** `GET /v1/info` — drives which auth tabs are offered. */
+/** `GET /v1/info` — drives which auth tabs are offered, and whether to ask at all. */
 export interface RuntimeInfo {
   multiTenant?: boolean
   agent?: string
   version?: string
+  /**
+   * Does this runtime want a credential? `api/app.py: auth_enabled()` — true when
+   * `RYA_TOKEN` is set or the deployment is multi-tenant.
+   *
+   * The server has always answered this and the console has always ignored it,
+   * gating instead on "is there a token in this browser?" — a question about the
+   * BROWSER, asked in place of a question about the RUNTIME. On a default
+   * `rya serve` the two disagree, and the console blocked on a dialog demanding a
+   * credential the server neither wants nor checks (§5.12).
+   *
+   * Optional, because a runtime that cannot be ASKED must not be assumed open —
+   * see `runtimeInfo()` in lib/api.ts for the direction that ambiguity resolves in.
+   */
+  authRequired?: boolean
 }
 
 export interface Workspace {

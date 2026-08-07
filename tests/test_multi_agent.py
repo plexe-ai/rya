@@ -96,7 +96,7 @@ def test_a_bundle_still_cannot_be_filed_under_a_name_it_does_not_declare(deploym
                     content=archive.read_bytes(),
                     headers={"content-type": "application/gzip"})
     assert r.status_code == 400
-    msg = r.json()["detail"]["message"]
+    msg = r.json()["error"]["message"]
     assert "billing" in msg and "support" in msg
 
 
@@ -190,7 +190,7 @@ def test_an_unknown_agent_is_a_404(deployment, tmp_path):
     _publish(client, tmp_path, "billing")
     r = client.get("/agents/nope")
     assert r.status_code == 404
-    assert r.json()["code"] == "E_AGENT_NOT_FOUND"
+    assert r.json()["error"]["code"] == "E_AGENT_NOT_FOUND"
 
 
 def test_an_unprefixed_route_resolves_the_sole_agent_and_says_it_is_deprecated(deployment, tmp_path):
@@ -212,8 +212,11 @@ def test_an_unprefixed_route_refuses_once_a_second_agent_exists(deployment, tmp_
     r = client.get("/tools")
     assert r.status_code == 400
     body = r.json()
-    assert body["code"] == "E_AGENT_AMBIGUOUS"
-    assert "billing" in body["hint"] and "support" in body["hint"]
+    assert body["ok"] is False
+    assert body["error"]["code"] == "E_AGENT_AMBIGUOUS"
+    # The hint names both candidates, which is the entire value of this error. It
+    # reached the console as the string "HTTP 400" until the envelope was unified.
+    assert "billing" in body["error"]["hint"] and "support" in body["error"]["hint"]
 
 
 def test_the_prefixed_route_carries_no_deprecation_header(deployment, tmp_path):

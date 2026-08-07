@@ -40,7 +40,11 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
+# Starlette's, not FastAPI's: FastAPI's HTTPException subclasses it, so handling
+# the base catches both ours and the router's own 404/405 in one place.
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import __version__ as RYA_VERSION
 from .. import agents
@@ -109,13 +113,29 @@ def build_infra(store, manifest=None) -> dict:
 
 
 def _run_summary(run: dict) -> dict:
-    """Compact run view sent over the WebSocket (full trace is streamed separately)."""
-    from ..observability.usage import run_usage
-    u = run_usage(run)
-    return {"id": run["id"], "status": run["status"], "trigger": run.get("trigger"),
-            "pendingApproval": run.get("pendingApproval"), "error": run.get("error"),
-            "traceLength": len(run.get("trace", [])),
-            "tokens": u["inputTokens"] + u["outputTokens"], "costUsd": u.get("costUsd")}
+    """Compact run view sent over the WebSocket (full trace is streamed separately).
+
+    A delegate, not a definition: the row shape lives in ``snapshot.run_summary``
+    so the socket, the paged runs list and the console aggregate cannot drift
+    apart the way they had (each carried its own copy, differing by a field).
+    """
+    from ..snapshot import run_summary
+    return run_summary(run)
+
+
+def _page_limit(limit: Optional[int], cap: int = 500) -> Optional[int]:
+    """Clamp a client-supplied page size; ``None`` still means "everything".
+
+    Same bounds as ``/versions/{id}/runs``. The ceiling is not decoration: these
+    listings project every row server-side, so an unclamped ``?limit=1000000``
+    is a way to ask one request to materialise a whole workspace. ``None`` is
+    preserved rather than defaulted because the unparameterised call is an
+    existing contract (`rya runs list`, the TypeScript SDK) that must keep
+    returning the whole list.
+    """
+    if limit is None:
+        return None
+    return max(1, min(int(limit), cap))
 
 
 def _console_dist_dir():
@@ -158,13 +178,22 @@ _CONSOLE_DIST = _console_dist_dir()
 #
 # Styles keep 'unsafe-inline' because the components still use a few inline `style=`
 # attributes. Fonts stay on Google's CDN, which is non-executable.
+#
+# `connect-src` used to read `'self' ws: wss:`. Those are SCHEME sources, not host
+# sources: they permit a socket to any host on the internet, which is a general
+# exfiltration channel sitting in the one directive whose whole job is to keep the
+# console talking to its own origin. Nothing wanted them — the console opens no
+# WebSocket and no EventSource (the Queue's turn-stream inspector is a plain `fetch`
+# + `getReader()` over SSE, which is an ordinary `connect-src 'self'` request). The
+# `/ws` route on this app has no console client at all, and if one is ever written it
+# still needs no change here: CSP3 matches a same-origin ws:// against 'self'.
 _CONSOLE_CSP = (
     "default-src 'self'; "
     "script-src 'self'; "
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com data:; "
     "img-src 'self' data:; "
-    "connect-src 'self' ws: wss:; "
+    "connect-src 'self'; "
     "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 )
 _CONSOLE_HEADERS = {
@@ -173,6 +202,44 @@ _CONSOLE_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
 }
+
+# Cache policy. The security headers above are identical for every console response;
+# the cache policy is the OPPOSITE for the index and for the assets, and one shared
+# dict is exactly why it used to be wrong in both directions at once.
+#
+# What was shipped: the index carried no `Cache-Control`, no `ETag` and no
+# `Last-Modified`, so an intermediary was free to invent a heuristic TTL and pin it;
+# the assets carried a validator but no `Cache-Control`, so every page load paid a
+# conditional request for a file that can never change. Backwards on both counts, and
+# the index half is a real outage: `index.html` names the current asset hashes, so a
+# CDN holding yesterday's index serves hashes that 404 after a deploy — blank page,
+# no error in any log.
+#
+# `immutable` is honest here because `/assets` is mounted on exactly Vite's hashed
+# output directory: every name in it carries a content hash, so a changed file is a
+# changed URL. Unhashed files (anything from `web/console/public/`) land in `dist/`
+# root, which this routing does not serve.
+_CONSOLE_ASSET_HEADERS = {
+    **_CONSOLE_HEADERS,
+    "Cache-Control": "public, max-age=31536000, immutable",
+}
+# `no-cache` means "store it if you like, but revalidate before every reuse" — the
+# standard SPA-index recipe, and the directive that makes a stale index impossible
+# rather than merely unlikely.
+#
+# `no-store` would also be correct and is not used, because the two differ the moment
+# this route grows a validator. Right now it has none — `HTMLResponse` sets no ETag and
+# no Last-Modified, so a revalidation is a full re-fetch of about a kilobyte, and the
+# distinction is academic. Add an ETag over `html` plus If-None-Match handling here and
+# `no-cache` starts paying for itself as a 304 with no code change; `no-store` would
+# have to be walked back first. Deliberately not done as part of §5.19: a conditional
+# -request path is new behaviour on a request that costs a kilobyte, and the finding
+# was that the response had no policy at all.
+_CONSOLE_INDEX_HEADERS = {**_CONSOLE_HEADERS, "Cache-Control": "no-cache"}
+# The "bundle not built" explainer is the one response with no value to store at all,
+# and a cached copy of it outliving the build that fixes it is the same failure as a
+# pinned index — a correct deployment reporting itself broken. So: never stored.
+_CONSOLE_UNBUILT_HEADERS = {**_CONSOLE_HEADERS, "Cache-Control": "no-store"}
 from ..manifest import load_manifest
 from ..store import open_store
 
@@ -327,9 +394,58 @@ def build_app(root: Path) -> FastAPI:
 
     from ..auth import jwt_configured, verify_jwt
 
-    def _identity_from(authorization, x_rya_token, required: bool):
-        """Resolve a verified user Identity from a JWT (single-tenant), or None."""
-        if mt or not jwt_configured():
+    def _verified_user(x_rya_user_token):
+        """The Identity in ``X-Rya-User-Token``, or None when the header is absent.
+
+        The single place that header is verified. A present-but-invalid token is a
+        401, never a silent None: "no identity was offered" and "the identity offered
+        does not verify" must not collapse, or an expired token would quietly
+        downgrade a request to anonymous instead of asking for a fresh one.
+        """
+        if not x_rya_user_token or not jwt_configured():
+            return None
+        try:
+            return verify_jwt(x_rya_user_token)
+        except RyaError as e:
+            raise HTTPException(status_code=401, detail=e.to_dict()["error"])
+
+    def _identity_from(authorization, x_rya_token, required: bool, x_rya_user_token=None):
+        """Resolve the verified user Identity for this request, or None.
+
+        Two shapes, because the two deployment modes authenticate differently:
+
+        - **single-tenant**: the bearer token IS the user's JWT, so the identity and
+          the authentication are the same credential.
+        - **multi-tenant**: the bearer is a workspace API key, which says nothing
+          about *who* is calling. The user is vouched for separately, by the
+          short-lived JWT that ``POST /v1/token`` mints from an account session and
+          the caller sends as ``X-Rya-User-Token``.
+
+        The MT arm used to be missing entirely — this function opened with
+        ``if mt: return None``, so every ``identity=`` in this module was None under
+        multi-tenancy no matter what headers arrived. ``X-Rya-User-Token`` still
+        reached ``get_plane`` (per-user RLS) and ``_actor_from`` (approval
+        attribution), which is why the gap was not obvious: two of the three
+        consumers worked. The third is the run's ``Identity``, and without it
+        ``SDK context._authorize_connection`` cannot resolve a per-user connection —
+        so every ``require_user`` tool raised ``E_NO_IDENTITY`` in MT, for every
+        client, with a hint telling the caller to send a header that was being read
+        and discarded.
+        """
+        if not jwt_configured():
+            return None
+        # An explicit user token wins in EITHER mode. It is the caller saying who this
+        # request is *for*, which is a different statement from how they authenticated
+        # — and preserving that precedence in single-tenant keeps `_actor_from`'s old
+        # behaviour, where a bearer JWT plus an explicit header used the header.
+        ident = _verified_user(x_rya_user_token)
+        if ident is not None:
+            return ident
+        if mt:
+            if required:
+                raise HTTPException(status_code=401, detail={
+                    "code": "E_UNAUTHORIZED", "message": "User identity required.",
+                    "hint": "POST /v1/token with your session, then send X-Rya-User-Token."})
             return None
         tok = _bearer(authorization, x_rya_token)
         if not tok:
@@ -351,18 +467,9 @@ def build_app(root: Path) -> FastAPI:
         the bearer JWT itself is the user. RYA_REQUIRE_APPROVER_IDENTITY=1 turns
         anonymous approval resolution into a 401 (bank mode: every approval must
         record who approved)."""
-        actor = None
-        if jwt_configured():
-            try:
-                if x_rya_user_token:
-                    ident = verify_jwt(x_rya_user_token)
-                    actor = {"sub": ident.sub, "email": ident.email}
-                elif not mt:
-                    ident = _identity_from(authorization, x_rya_token, required=False)
-                    if ident:
-                        actor = {"sub": ident.sub, "email": ident.email}
-            except RyaError as e:
-                raise HTTPException(status_code=401, detail=e.to_dict()["error"])
+        ident = _identity_from(authorization, x_rya_token, required=False,
+                              x_rya_user_token=x_rya_user_token)
+        actor = {"sub": ident.sub, "email": ident.email} if ident else None
         if actor is None and os.environ.get("RYA_REQUIRE_APPROVER_IDENTITY") == "1":
             raise HTTPException(status_code=401, detail={
                 "code": "E_APPROVER_IDENTITY_REQUIRED",
@@ -378,13 +485,8 @@ def build_app(root: Path) -> FastAPI:
             # Optional per-user identity: the API key authenticates the WORKSPACE;
             # an additional verified user JWT (X-Rya-User-Token) authenticates the
             # USER and turns on per-user RLS for this request.
-            user_id = None
-            if x_rya_user_token and jwt_configured():
-                try:
-                    user_id = verify_jwt(x_rya_user_token).sub
-                except RyaError as e:
-                    raise HTTPException(status_code=401, detail=e.to_dict()["error"])
-            return _plane_for(store_for(ws, user_id))
+            ident = _verified_user(x_rya_user_token)
+            return _plane_for(store_for(ws, ident.sub if ident else None))
         if jwt_configured():
             _identity_from(authorization, x_rya_token, required=True)  # enforce JWT
         else:
@@ -607,21 +709,136 @@ def build_app(root: Path) -> FastAPI:
         "E_BUNDLE_STORE": 503,        # the operator's bucket, not the caller's request
     }
 
+    # ---- the one error envelope ------------------------------------------------
+    #
+    # EVERY failure from this app serialises as:
+    #
+    #     {"ok": false, "error": {"code": "E_*", "message", "hint", "exit_code"}}
+    #
+    # which is byte-identical to `RyaError.to_dict()`, to `rya <cmd> --json` on
+    # failure (docs/devex.md), to an MCP tool reply and to a broker reply. One
+    # envelope for the whole product: a caller learns it once.
+    #
+    # It did not used to be. `HTTPException(detail={...})` serialised as
+    # `{"detail": {...}}` while this handler emitted the error object bare at the
+    # top level, and FastAPI's own validation failures were a third shape again. A
+    # client cannot read three envelopes with one expression, so the console read
+    # one of them and rendered the other two as `HTTP 400` — losing `message` and
+    # `hint` for the entire quota, governance, versioning and agent-addressing
+    # vocabulary. The fix is not a smarter parser; it is one shape.
+    #
+    # The three handlers below are the ONLY places a shape is decided. Route code
+    # keeps raising exactly what it raised before — `HTTPException(detail={code,
+    # message, hint})` and `RyaError` both still work, unchanged — because the
+    # normalisation happens here rather than at 69 raise sites.
+
+    def _code_for_status(status: int) -> str:
+        """A code for a failure that never had one — a bare Starlette 404, a proxy
+        502. Mirrors `inferCode` in clients/typescript/src/errors.ts on purpose, so
+        the server and the SDK never disagree about what a bare status means.
+
+        404 stays the generic noun: it could be a run, job, version or session, and
+        guessing `E_RUN_NOT_FOUND` sends a caller hunting in the wrong place."""
+        if status in (401, 403):
+            return "E_UNAUTHORIZED"
+        if status == 404:
+            return "E_NOT_FOUND"
+        if status in (400, 413, 422):
+            return "E_VALIDATION"
+        if status in (408, 504):
+            return "E_TIMEOUT"
+        return "E_RUNTIME"
+
+    def _envelope(code: str, message: str, hint=None, exit_code=None) -> dict:
+        from ..errors import EXIT_GENERIC, _CODE_EXIT
+        return {"ok": False, "error": {
+            "code": code, "message": message, "hint": hint,
+            "exit_code": exit_code if exit_code is not None
+            else _CODE_EXIT.get(code, EXIT_GENERIC)}}
+
     @api.exception_handler(RyaError)
     async def _rya_error_handler(request: Request, exc: RyaError):
         from fastapi.responses import JSONResponse
+        # `to_dict()` IS the envelope — that is the point of choosing this shape.
         return JSONResponse(status_code=_ERROR_STATUS.get(exc.code, 400),
-                            content=exc.to_dict()["error"])
+                            content=exc.to_dict())
+
+    @api.exception_handler(StarletteHTTPException)
+    async def _http_error_handler(request: Request, exc: StarletteHTTPException):
+        """Rewraps every `HTTPException`, ours and Starlette's own.
+
+        Almost all of ours already carry `detail={code, message, hint}` (or
+        `detail=e.to_dict()["error"]`), so the dict arm is a re-wrap and nothing is
+        lost. The string arm is what catches Starlette's built-in `"Not Found"` and
+        `"Method Not Allowed"`, which previously reached a client as prose with no
+        code at all — including the CORS `DELETE` 405 in the console audit."""
+        from fastapi.responses import JSONResponse
+        d = exc.detail
+        if isinstance(d, dict):
+            body = _envelope(
+                str(d.get("code") or _code_for_status(exc.status_code)),
+                str(d.get("message") or d.get("detail") or ""),
+                d.get("hint"), d.get("exit_code"))
+            # Anything a raise site added beyond the four envelope fields rides
+            # along inside `error` rather than being dropped on the floor.
+            for k, v in d.items():
+                body["error"].setdefault(k, v)
+        else:
+            body = _envelope(_code_for_status(exc.status_code), str(d))
+        # `headers` matters: a 401 may carry WWW-Authenticate, and Starlette's own
+        # 405 carries the Allow header. Dropping them would break the response.
+        return JSONResponse(status_code=exc.status_code, content=body,
+                            headers=getattr(exc, "headers", None))
+
+    @api.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        """FastAPI's `{"detail": [{loc, msg, type}, …]}` flattened into the envelope.
+
+        Left alone, that array reached the console's `body.detail.message ||
+        body.detail` and rendered as the literal string `[object Object]`."""
+        from fastapi.responses import JSONResponse
+        parts = []
+        for e in exc.errors():
+            loc = ".".join(str(x) for x in (e.get("loc") or ()) if x != "body")
+            parts.append(f"{loc}: {e.get('msg')}" if loc else str(e.get("msg")))
+        return JSONResponse(status_code=422, content=_envelope(
+            "E_VALIDATION", "; ".join(parts) or "Request validation failed.",
+            "Check the request's query parameters and body against GET /openapi.json."))
 
     # CORS: the console is served SAME-ORIGIN by `rya serve`, so no CORS is needed
     # by default. Cross-origin callers (a dev console on another port) must be
     # explicitly allow-listed via RYA_CORS_ORIGINS (comma-separated). Never the
     # wildcard on a control plane that can approve actions and edit the guard.
+    #
+    # `allow_methods` is hand-written and derived from nothing, which is how it came
+    # to omit DELETE: the two `@api.delete` routes (revoke an API key, remove a
+    # member) failed at the PREFLIGHT for every cross-origin caller, and invisibly —
+    # `rya serve` is same-origin and the Vite dev server proxies, so both of the ways
+    # anyone actually runs the console hide it. The next verb added would drift out
+    # of this list exactly as quietly.
+    #
+    # Deriving the list from `api.routes` was considered and rejected, for two
+    # reasons that both matter. Most routes are not registered at this point in the
+    # function, so the derivation would have to move to the end — and `add_middleware`
+    # PREPENDS, so the last one registered is the OUTERMOST. Today that is
+    # `_security_headers` (verified: `app.user_middleware` is `[BaseHTTPMiddleware,
+    # CORSMiddleware]`, outermost first), which is why a cross-origin preflight to
+    # `/mcp` on a token-protected runtime is answered `401` by the token guard with no
+    # CORS headers on it at all. Moving this call would put CORS outside that guard
+    # and change that answer to a `200`. That may well be the better behaviour — a
+    # preflight carries no credentials, so refusing it for want of one means an
+    # allow-listed browser origin can never reach `/mcp` — but it is a separate
+    # question from a missing verb and does not belong in this fix.
+    #
+    # So the list stays explicit and reviewable, and
+    # `test_cors_allowlist_covers_every_method_the_router_exposes` makes drift loud
+    # instead: it walks the finished router and preflights every verb it finds.
+    # PATCH is deliberately absent: no route uses it, and this is an allow-list.
     _cors = [o.strip() for o in os.environ.get("RYA_CORS_ORIGINS", "").split(",") if o.strip()]
     if _cors:
         from fastapi.middleware.cors import CORSMiddleware
         api.add_middleware(CORSMiddleware, allow_origins=_cors,
-                           allow_methods=["GET", "POST", "PUT"],
+                           allow_methods=["GET", "POST", "PUT", "DELETE"],
                            allow_headers=["Authorization", "Content-Type", "X-Rya-Token"],
                            allow_credentials=False, max_age=600)
 
@@ -637,9 +854,13 @@ def build_app(root: Path) -> FastAPI:
                 tok = authz[7:] if authz.lower().startswith("bearer ") else request.headers.get("x-rya-token")
                 if not tok or not hmac.compare_digest(tok, need):
                     from starlette.responses import JSONResponse
-                    return JSONResponse(status_code=401, content={"error": {
-                        "code": "E_UNAUTHORIZED",
-                        "message": "Remote MCP requires the operator token (Authorization: Bearer $RYA_TOKEN)."}})
+                    # Hand-built rather than raised: middleware runs outside the
+                    # exception handlers, so this is the one body that has to spell
+                    # the envelope itself. Keep it identical to `_envelope`.
+                    return JSONResponse(status_code=401, content=_envelope(
+                        "E_UNAUTHORIZED",
+                        "Remote MCP requires the operator token (Authorization: Bearer $RYA_TOKEN).",
+                        "Send 'Authorization: Bearer $RYA_TOKEN' or the X-Rya-Token header."))
         resp = await call_next(request)
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -672,12 +893,20 @@ def build_app(root: Path) -> FastAPI:
             """StaticFiles that stamps the console's security headers on every hit.
 
             A mount bypasses route-level `headers=`, so the CSP has to be attached
-            here or the bundle would be served with no policy at all.
+            here or the bundle would be served with no policy at all. Same for the
+            year-long `Cache-Control`: StaticFiles ships a validator (ETag +
+            Last-Modified) and nothing else, which buys a 304 per asset per page
+            load for files whose URL changes whenever their bytes do.
+
+            `setdefault`, not assignment: StaticFiles' own ETag and Last-Modified
+            stand. The stamp lands on the 304 from the conditional-request path as
+            well, which is correct — a 304 is how a client is told its cached copy's
+            freshness has been extended.
             """
 
             async def get_response(self, path, scope):
                 resp = await super().get_response(path, scope)
-                for k, v in _CONSOLE_HEADERS.items():
+                for k, v in _CONSOLE_ASSET_HEADERS.items():
                     resp.headers.setdefault(k, v)
                 return resp
 
@@ -704,9 +933,9 @@ def build_app(root: Path) -> FastAPI:
                 "then restart <code>rya serve</code>.</p>"
                 "<p>The API is unaffected: only this page needs the bundle.</p>",
                 status_code=503,
-                headers=_CONSOLE_HEADERS,
+                headers=_CONSOLE_UNBUILT_HEADERS,
             )
-        return HTMLResponse(html, headers=_CONSOLE_HEADERS)
+        return HTMLResponse(html, headers=_CONSOLE_INDEX_HEADERS)
 
     @api.get("/v2")
     @api.get("/v2/")
@@ -1062,7 +1291,8 @@ def build_app(root: Path) -> FastAPI:
                                 after: int = -1,
                                 plane: Plane = Depends(get_plane),
                                 authorization: Optional[str] = Header(None),
-                                x_rya_token: Optional[str] = Header(None)):
+                                x_rya_token: Optional[str] = Header(None),
+                                x_rya_user_token: Optional[str] = Header(None)):
         """Trigger a run and stream it back as Server-Sent Events.
 
         The default client transport (plain HTTP - works through ALBs, proxies,
@@ -1088,7 +1318,8 @@ def build_app(root: Path) -> FastAPI:
         body = await request.json()
         event_type = body.get("type", "message.received")
         payload = body.get("payload", {})
-        identity = _identity_from(authorization, x_rya_token, required=False)
+        identity = _identity_from(authorization, x_rya_token, required=False,
+                                  x_rya_user_token=x_rya_user_token)
 
         started = _turns.create_turn(_turn_source(plane, plane.agent(agent_id)),
                                      event_type, payload, identity=identity)
@@ -1125,12 +1356,14 @@ def build_app(root: Path) -> FastAPI:
     async def create_turn_ep(agent_id: str, request: Request, background: BackgroundTasks,
                              plane: Plane = Depends(get_plane),
                              authorization: Optional[str] = Header(None),
-                             x_rya_token: Optional[str] = Header(None)):
+                             x_rya_token: Optional[str] = Header(None),
+                             x_rya_user_token: Optional[str] = Header(None)):
         """Start a DURABLE chat turn. Returns ``{turnId}`` immediately; the turn
         runs on a worker (kicked inline here, reclaimed on crash) and streams via
         GET /agents/{id}/turns/{turnId}/stream."""
         body = await request.json()
-        identity = _identity_from(authorization, x_rya_token, required=False)
+        identity = _identity_from(authorization, x_rya_token, required=False,
+                                  x_rya_user_token=x_rya_user_token)
         res = _turns.create_turn(_turn_source(plane, plane.agent(agent_id)),
                                  body.get("type", "message.received"),
                                  body.get("payload", {}), identity=identity)
@@ -1453,7 +1686,9 @@ def build_app(root: Path) -> FastAPI:
 
     @api.post("/agents/{agent_id}/events")
     async def post_event(agent_id: str, request: Request, plane: Plane = Depends(get_plane),
-                         authorization: Optional[str] = Header(None), x_rya_token: Optional[str] = Header(None)):
+                         authorization: Optional[str] = Header(None),
+                         x_rya_token: Optional[str] = Header(None),
+                         x_rya_user_token: Optional[str] = Header(None)):
         """Fire an event at the agent.
 
         Returns a run id synchronously in every mode. Whether the run has already
@@ -1463,7 +1698,8 @@ def build_app(root: Path) -> FastAPI:
         the worker (D21). See `_dispatch_event`.
         """
         body = await request.json()
-        identity = _identity_from(authorization, x_rya_token, required=False)
+        identity = _identity_from(authorization, x_rya_token, required=False,
+                                  x_rya_user_token=x_rya_user_token)
         out = _dispatch_event(plane, plane.agent(agent_id),
                               body.get("type", "message.received"),
                               body.get("payload", {}), body.get("source", "api"),
@@ -1471,8 +1707,38 @@ def build_app(root: Path) -> FastAPI:
         return {**out, "identity": identity.to_dict() if identity else None}
 
     @api.get("/agents/{agent_id}/runs")
-    def list_runs(agent_id: str, plane: Plane = Depends(get_plane)):
-        return {"runs": plane.store.list_runs(plane.agent(agent_id).name)}
+    def list_runs(agent_id: str, limit: Optional[int] = None, offset: int = 0,
+                  status: Optional[str] = None, q: Optional[str] = None,
+                  summary: bool = False, plane: Plane = Depends(get_plane)):
+        """The agent's runs, newest first — optionally one filtered window at a time.
+
+        Unparameterised, this returns exactly what it always did: every run
+        document, traces included. That default is load-bearing (`rya runs list`
+        and the TypeScript SDK's `listRuns()` both read it), so paging is opt-in
+        and additive.
+
+        ``count`` is the size of the FILTERED set, not of the page. It is the N in
+        the console's "showing 50 of 412", and it deliberately cannot be derived
+        from a page — audit §5.1 is what happened when a client tried: it counted
+        a 30-row dashboard preview, so its filter pills disagreed with the
+        Overview tile and a search for an older run id answered "No runs match".
+
+        ``status`` is an equality match and ``q`` a case-insensitive substring of
+        the run id or the trigger; both are defined once, in ``store.run_matches``,
+        so the two store backends cannot answer the same filter differently.
+
+        ``summary=1`` returns the shared compact row instead of the document. Not
+        cosmetic: a run carries its whole trace, so a 50-row page of documents is
+        megabytes for a table that renders nine columns, and the trace already has
+        its own endpoint.
+        """
+        from ..snapshot import run_summary
+        page = plane.store.list_runs_page(
+            plane.agent(agent_id).name, status=status, query=q,
+            limit=_page_limit(limit), offset=max(0, offset))
+        rows = [run_summary(r) for r in page["runs"]] if summary else page["runs"]
+        return {"runs": rows, "count": page["count"],
+                "limit": _page_limit(limit), "offset": max(0, offset)}
 
     @api.post("/agents/{agent_id}/runs/ingest")
     async def ingest_run_for(agent_id: str, request: Request,
@@ -1723,13 +1989,31 @@ def build_app(root: Path) -> FastAPI:
         return {"query": query, "hits": scored[:int((body or {}).get("limit", 5))]}
 
     @api.get("/agents/{agent_id}/sessions")
-    def list_sessions_for(agent_id: str, plane: Plane = Depends(get_plane)):
-        return {"sessions": plane.store.list_sessions(plane.agent(agent_id).name)}
+    def list_sessions_for(agent_id: str, limit: Optional[int] = None, offset: int = 0,
+                          plane: Plane = Depends(get_plane)):
+        """The agent's conversations, most recently active first.
+
+        Paging is opt-in and additive for the same reason as `/runs` above, and
+        ``count`` is likewise the total rather than the page length: without it the
+        console cannot say "showing 50 of 137", and conversation 51 was simply
+        unreachable from the console (audit §5.2). These rows are already summaries
+        — the store strips ``messages`` — so there is no projection flag; the
+        transcript is `GET /sessions/{id}`.
+        """
+        return _sessions_page(plane, plane.agent(agent_id).name, limit, offset)
 
     @api.get("/sessions")
-    def list_sessions(response: Response, plane: Plane = Depends(get_plane)):
+    def list_sessions(response: Response, limit: Optional[int] = None, offset: int = 0,
+                      plane: Plane = Depends(get_plane)):
         ref = _addressed(plane, None, response)
-        return {"sessions": plane.store.list_sessions(ref.name)}
+        return _sessions_page(plane, ref.name, limit, offset)
+
+    def _sessions_page(plane: Plane, name: str, limit: Optional[int], offset: int) -> dict:
+        """Shared so the prefixed and unprefixed spellings cannot drift apart."""
+        page = plane.store.list_sessions_page(
+            name, limit=_page_limit(limit), offset=max(0, offset))
+        return {"sessions": page["sessions"], "count": page["count"],
+                "limit": _page_limit(limit), "offset": max(0, offset)}
 
     @api.get("/agents/{agent_id}/sessions/find")
     def find_session_for(agent_id: str, channel: str, externalId: str,
@@ -1985,10 +2269,9 @@ def build_app(root: Path) -> FastAPI:
     def _killswitches(store) -> dict:
         """Read the kill switches the runtime will actually honour.
 
-        §11.2 moved these out of the `_runtime_config` memory scope — which a
-        bundle could overwrite through ctx.memory.set — into privileged policy
-        state. The legacy scope is still READ so a switch set before the move
-        keeps working; nothing writes it any more.
+        Delegates to `sdk.context.read_killswitches`, which is the single reader
+        (§11.2's move out of the `_runtime_config` memory scope, and the legacy
+        read-through, are documented there).
 
         Still ONE workspace-wide map keyed `tool:<id>`, not per agent. That is
         defensible where the guard key was not: a kill switch answers "stop
@@ -1997,13 +2280,8 @@ def build_app(root: Path) -> FastAPI:
         the DECLARATIONS are the agent's; the override that beats them is the
         operator's.
         """
-        from ..sdk.context import POLICY_KILLSWITCHES
-        getter = getattr(store, "policy_get", None)
-        if getter is not None:
-            switches = getter(POLICY_KILLSWITCHES)
-            if switches is not None:
-                return switches
-        return (store.load_memory("_runtime_config") or {}).get("kv") or {}
+        from ..sdk.context import read_killswitches
+        return read_killswitches(store)
 
     def _tools_of(plane: Plane, ref: AgentRef):
         # Effective permission = manifest, unless a runtime kill switch overrides.

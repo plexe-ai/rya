@@ -700,6 +700,71 @@ def test_the_gate_names_every_unmet_condition_at_once():
         assert expected in e.value.message
 
 
+def test_the_gate_names_its_own_conditions_instead_of_each_reader_naming_them():
+    """Audit §5.7: the console kept its OWN three-entry copy of this list, so when D32
+    was added here nothing failed — the page went on rendering three rows that all said
+    "in force" under a tile reading INCOMPLETE, because `ok` and `unmet` counted the
+    fourth and the table could not see it. A reader that iterates `conditions` cannot
+    fall behind the gate, so the order and the labels are part of the contract."""
+    report = D.check_untrusted_posture(D.LocalDriver(), env=_gate_env())
+    body = report.describe()
+    assert [c["key"] for c in body["conditions"]] == [
+        "isolation", "broker", "egress", "topology"]
+    assert [c["label"] for c in body["conditions"]] == [
+        "Isolation (D23)", "Credential mediation (D18)", "Network egress (D24)",
+        "Broker topology (D32)"]
+    for cond in body["conditions"]:
+        # `prose` is `unmet`'s spelling and stays server-side: a payload carrying two
+        # labels per condition invites a client to render the wrong one.
+        assert set(cond) == {"key", "label", "ok", "detail"}
+        # The same fact as the flat key beside it, not a second copy that can drift.
+        assert (cond["ok"], cond["detail"]) == (body[cond["key"]]["ok"],
+                                                body[cond["key"]]["detail"])
+        assert isinstance(cond["ok"], bool) and cond["detail"]
+
+
+def test_the_three_views_of_one_unmet_condition_agree():
+    """`ok`, `unmet` and `conditions` are three renderings of the same evaluation, and
+    §5.7 was what it looks like when they disagree: a deployment refused by a condition
+    that no view listing the conditions mentioned."""
+    driver = _sandboxed_k8s()
+    driver.launched_unit = D.UNIT_SANDBOX          # D32 unsatisfiable, the rest in force
+    report = D.check_untrusted_posture(driver, env=_gate_env())
+    body = report.describe()
+
+    assert report.ok is False and body["ok"] is False
+    assert [u.split(":")[0] for u in report.unmet] == ["broker topology (D32)"]
+    assert [c["key"] for c in body["conditions"] if not c["ok"]] == ["topology"]
+    assert body["topology"]["ok"] is False
+    # ...and the three that ARE in force are still listed, because a table showing only
+    # failures cannot tell "met" from "not evaluated".
+    assert len(body["conditions"]) == 4
+
+
+def test_the_unmet_prose_is_lowercase_and_byte_for_byte_unchanged():
+    """`unmet` is quoted verbatim into `E_ISOLATION_INSUFFICIENT` and printed by
+    `rya posture`. It is derived from `conditions` now, which is only safe if the
+    derivation emits the same bytes — the console's headings are title-cased, and
+    letting that spelling reach here would silently rewrite an error message that
+    operators read and tests match on."""
+    report = D.PostureReport(untrusted=True,
+                             isolation_ok=False, isolation_detail="I",
+                             broker_ok=False, broker_detail="B",
+                             egress_ok=False, egress_detail="E",
+                             topology_ok=False, topology_detail="T")
+    assert report.unmet == ["isolation (D23): I",
+                            "credential mediation (D18): B",
+                            "network egress (D24): E",
+                            "broker topology (D32): T"]
+    # A met condition contributes nothing: `unmet` is what is MISSING, and `conditions`
+    # is what was checked.
+    met = D.PostureReport(untrusted=True, isolation_ok=True, isolation_detail="I",
+                          broker_ok=True, broker_detail="B", egress_ok=True,
+                          egress_detail="E", topology_ok=True, topology_detail="T")
+    assert met.unmet == [] and met.ok is True
+    assert len(met.describe()["conditions"]) == 4
+
+
 def test_an_unverifiable_sandbox_is_refused_not_assumed():
     """Matching `isolation_rank`'s treatment of an unknown level: the safe direction
     is the default one. An operator who cannot probe their cluster does not have a

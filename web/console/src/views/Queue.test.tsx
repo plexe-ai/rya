@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueueView, groupFrames } from './Queue'
-import type { QueueJob, TurnFrame } from './Queue'
-import type { ConsoleState } from '../lib/types'
+import type { QueueJob, QueueStatsFeed, TurnFrame } from './Queue'
+import type { ConsoleState, QueueCounts } from '../lib/types'
 
 const STATE = { agent: { name: 'acme' } } as unknown as ConsoleState
+
+/**
+ * The shell's polled `/queue/stats` result, which the view now receives instead of
+ * fetching (audit §5.5). `counts: null` is "not known yet", NOT an empty queue.
+ */
+const feed = (counts: QueueCounts | null = {}, over: Partial<QueueStatsFeed> = {}): QueueStatsFeed => ({
+  counts,
+  error: null,
+  loading: false,
+  ...over,
+})
 
 const job = (over: Partial<QueueJob> = {}): QueueJob => ({
   id: 'job_1',
@@ -43,24 +54,30 @@ const frame = (seq: number, kind: string, data: unknown) =>
  * stream. `streams` is consumed in order, so a reconnect gets the next one.
  */
 function stubFetch(opts: {
-  counts?: Record<string, number>
-  jobs?: QueueJob[]
+  // `jobs` may be a function so a test can change the answer between polls — the
+  // table re-reads itself now, and a fixed array cannot show that it did.
+  jobs?: QueueJob[] | (() => QueueJob[] | Error)
   streams?: (ReadableStream<Uint8Array> | (() => Response))[]
 }) {
   const streams = [...(opts.streams ?? [])]
   const fn = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
     const url = String(input)
-    const json = (body: unknown) =>
+    const json = (body: unknown, status = 200) =>
       Promise.resolve(
-        new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }),
+        new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }),
       )
     if (url.includes('/stream')) {
       const next = streams.shift()
       if (!next) return Promise.resolve(streamResponse(sseStream([])))
       return Promise.resolve(typeof next === 'function' ? next() : streamResponse(next))
     }
-    if (url.includes('/queue/stats')) return json({ counts: opts.counts ?? {} })
-    if (url.includes('/queue/jobs')) return json({ jobs: opts.jobs ?? [] })
+    if (url.includes('/queue/jobs')) {
+      const jobs = typeof opts.jobs === 'function' ? opts.jobs() : (opts.jobs ?? [])
+      if (jobs instanceof Error) {
+        return json({ ok: false, error: { code: 'E_INTERNAL', message: jobs.message } }, 500)
+      }
+      return json({ jobs })
+    }
     return json({})
   })
   vi.stubGlobal('fetch', fn)
@@ -71,30 +88,203 @@ describe('QueueView', () => {
   beforeEach(() => localStorage.setItem('rya_token', 'test-token'))
   afterEach(() => vi.unstubAllGlobals())
 
-  it('renders the counts and the job table from the payload', async () => {
-    stubFetch({
-      counts: { pending: 2, running: 1, completed: 7, failed: 1 },
+  it('renders the job table from the payload and the tiles from the shell poll', async () => {
+    const fetchMock = stubFetch({
       jobs: [job(), job({ id: 'job_turn', type: 'chat-turn', status: 'running', attempts: 1 })],
     })
-    render(<QueueView state={STATE} onToast={() => {}} />)
+    render(
+      <QueueView
+        state={STATE}
+        onToast={() => {}}
+        stats={feed({ pending: 2, running: 1, completed: 7, failed: 1 })}
+      />,
+    )
 
     await waitFor(() => expect(screen.getByText('job_1')).toBeTruthy())
     expect(screen.getByText('job_turn')).toBeTruthy()
     expect(screen.getByText('chat-turn')).toBeTruthy()
     expect(screen.getByText('turn')).toBeTruthy() // the chat-turn marker chip
     expect(screen.getByText('1/3')).toBeTruthy()
-    expect(screen.getByText('7')).toBeTruthy() // Completed tile
+    expect(screen.getByText('7')).toBeTruthy() // Completed tile, from the prop
+
+    // §5.5, structurally: the view must not read `/queue/stats` itself. The shell
+    // already polls it every 6s for the sidebar badge, and a second reader on its
+    // own clock is how the tiles came to disagree with the badge beside them.
+    expect(fetchMock.mock.calls.filter((c) => String(c[0]).includes('/queue/stats'))).toEqual([])
   })
 
   it('reads an empty queue as the healthy normal state', async () => {
-    stubFetch({ counts: { pending: 0 }, jobs: [] })
-    render(<QueueView state={STATE} onToast={() => {}} />)
+    stubFetch({ jobs: [] })
+    render(<QueueView state={STATE} onToast={() => {}} stats={feed({ pending: 0 })} />)
     await waitFor(() => expect(screen.getByText(/Queue is empty/)).toBeTruthy())
+  })
+
+  describe('the tiles (audit §5.4)', () => {
+    /** The four tile values, in render order: pending, running, completed, DLQ. */
+    const tileValues = () => Array.from(document.querySelectorAll('.stat .v')).map((n) => n.textContent)
+
+    /**
+     * The tiles read props, so asserting them is synchronous — but the job table's
+     * first poll resolves one microtask after the test body would otherwise end,
+     * and that state update would land outside `act` (audit §9 records the same
+     * pattern in `Knowledge.test.tsx`). Awaiting the settled table is what puts it
+     * inside one; every test here stubs an empty queue for that reason.
+     */
+    const settled = () => screen.findByText(/Queue is empty/)
+
+    it('shows a real zero as 0', async () => {
+      stubFetch({ jobs: [] })
+      render(
+        <QueueView
+          state={STATE}
+          onToast={() => {}}
+          stats={feed({ pending: 0, running: 0, completed: 0, failed: 0 })}
+        />,
+      )
+      await waitFor(() => expect(screen.getByText(/Queue is empty/)).toBeTruthy())
+      // A drained queue IS zero, and must still read as zero — the fix must not
+      // trade a false zero for a false unknown.
+      expect(tileValues()).toEqual(['0', '0', '0', '0'])
+    })
+
+    it('shows an unknown depth as — while the first poll is in flight', async () => {
+      stubFetch({ jobs: [] })
+      render(<QueueView state={STATE} onToast={() => {}} stats={feed(null, { loading: true })} />)
+      await settled()
+      // The bug: `num(undefined)` is '0', so every tile claimed a drained queue
+      // before anything had answered.
+      expect(tileValues()).toEqual(['—', '—', '—', '—'])
+      expect(screen.getAllByText('reading…').length).toBe(4)
+    })
+
+    it('shows an unknown depth as — and names the failure, never "Dead-letter 0"', async () => {
+      stubFetch({ jobs: [] })
+      render(
+        <QueueView
+          state={STATE}
+          onToast={() => {}}
+          stats={feed(null, { error: 'HTTP 500' })}
+        />,
+      )
+      await settled()
+      expect(tileValues()).toEqual(['—', '—', '—', '—'])
+      expect(screen.getByText(/Queue depth unavailable/)).toBeTruthy()
+      expect(screen.getByText('HTTP 500')).toBeTruthy()
+    })
+
+    it('distinguishes an unauthenticated console from an outage', async () => {
+      stubFetch({ jobs: [] })
+      render(
+        <QueueView state={STATE} onToast={() => {}} stats={feed(null, { error: 'unauthorized' })} />,
+      )
+      await settled()
+      expect(screen.getByText(/Connect to read queue depth/)).toBeTruthy()
+    })
+
+    it('keeps last-known counts on a failed refresh, marked as stale', async () => {
+      stubFetch({ jobs: [] })
+      render(
+        <QueueView
+          state={STATE}
+          onToast={() => {}}
+          stats={feed({ pending: 4, failed: 2 }, { error: 'HTTP 502' })}
+        />,
+      )
+      await settled()
+      // Real numbers stay — blanking a dashboard on one bad tick is its own lie —
+      // but they are labelled unconfirmed rather than presented as current.
+      expect(tileValues()).toEqual(['4', '0', '0', '2'])
+      expect(screen.getByText(/Queue depth is stale/)).toBeTruthy()
+    })
+  })
+
+  describe('the job table refresh (audit §5.5)', () => {
+    it('re-reads the table on its own interval', async () => {
+      vi.useFakeTimers()
+      try {
+        let jobs = [job({ id: 'job_first' })]
+        const fetchMock = stubFetch({ jobs: () => jobs })
+        render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        expect(screen.getByText('job_first')).toBeTruthy()
+        const first = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/queue/jobs')).length
+        expect(first).toBe(1)
+
+        // A job goes to the dead-letter queue while the operator is looking at the
+        // page. Before this fix the view loaded once on entry, so it never appeared
+        // — while the sidebar badge, polling the same queue, went amber.
+        jobs = [job({ id: 'job_first' }), job({ id: 'job_dlq', status: 'failed', deadLetter: true })]
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(6000)
+        })
+        expect(screen.getByText('job_dlq')).toBeTruthy()
+        expect(
+          fetchMock.mock.calls.filter((c) => String(c[0]).includes('/queue/jobs')).length,
+        ).toBeGreaterThan(first)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('stops polling once unmounted', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetchMock = stubFetch({ jobs: [job()] })
+        const { unmount } = render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        const before = fetchMock.mock.calls.length
+        unmount()
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(30_000)
+        })
+        // An interval that outlives the view is a leak that compounds every time the
+        // operator navigates back to this page.
+        expect(fetchMock.mock.calls.length).toBe(before)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('does not blank the table when one refresh fails', async () => {
+      vi.useFakeTimers()
+      try {
+        let answer: () => QueueJob[] | Error = () => [job({ id: 'job_kept' })]
+        stubFetch({ jobs: () => answer() })
+        render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        expect(screen.getByText('job_kept')).toBeTruthy()
+
+        answer = () => new Error('boom')
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(6000)
+        })
+        // The rows an operator was reading survive the blip, and the blip is
+        // visible rather than silent (console/AGENTS.md: don't clobber a live view).
+        expect(screen.getByText('job_kept')).toBeTruthy()
+        expect(screen.getByText(/Job list is stale/)).toBeTruthy()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('takes the screen with an error only when there is nothing to show', async () => {
+      stubFetch({ jobs: () => new Error('boom') })
+      render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
+      await waitFor(() => expect(screen.getByText(/Queue unavailable/)).toBeTruthy())
+      expect(screen.queryByText(/Queue is empty/)).toBeNull()
+    })
   })
 
   it('offers retry only on terminal jobs and cancel only on live ones', async () => {
     stubFetch({ jobs: [job({ id: 'job_dead', status: 'failed', deadLetter: true }), job({ id: 'job_live', status: 'running' })] })
-    render(<QueueView state={STATE} onToast={() => {}} />)
+    render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
 
     await waitFor(() => expect(screen.getByText('job_dead')).toBeTruthy())
     expect(screen.getAllByRole('button', { name: 'Retry' }).length).toBe(1)
@@ -105,7 +295,7 @@ describe('QueueView', () => {
   it('retries a dead-lettered job and toasts the outcome', async () => {
     const fetchMock = stubFetch({ jobs: [job({ id: 'job_dead', status: 'failed' })] })
     const toasts: string[] = []
-    render(<QueueView state={STATE} onToast={(m) => toasts.push(m)} />)
+    render(<QueueView state={STATE} onToast={(m) => toasts.push(m)} stats={feed()} />)
     await waitFor(() => expect(screen.getByText('job_dead')).toBeTruthy())
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
@@ -121,7 +311,7 @@ describe('QueueView', () => {
     const turnJob = [job({ id: 'turn_1', type: 'chat-turn', status: 'running' })]
 
     async function openInspector(fetchMock: ReturnType<typeof stubFetch>) {
-      render(<QueueView state={STATE} onToast={() => {}} />)
+      render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
       await waitFor(() => expect(screen.getByText('turn_1')).toBeTruthy())
       fireEvent.click(screen.getByRole('button', { name: 'Inspect turn stream turn_1' }))
       return fetchMock
@@ -223,7 +413,7 @@ describe('QueueView', () => {
         ],
         streams: [live, sseStream([frame(9, 'run', { status: 'completed', id: 'run_2', tokens: 3 })])],
       })
-      render(<QueueView state={STATE} onToast={() => {}} />)
+      render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
       await waitFor(() => expect(screen.getByText('turn_1')).toBeTruthy())
 
       fireEvent.click(screen.getByRole('button', { name: 'Inspect turn stream turn_1' }))
@@ -254,7 +444,7 @@ describe('QueueView', () => {
         },
       })
       const fetchMock = stubFetch({ jobs: turnJob, streams: [live] })
-      const { unmount } = render(<QueueView state={STATE} onToast={() => {}} />)
+      const { unmount } = render(<QueueView state={STATE} onToast={() => {}} stats={feed()} />)
       await waitFor(() => expect(screen.getByText('turn_1')).toBeTruthy())
       fireEvent.click(screen.getByRole('button', { name: 'Inspect turn stream turn_1' }))
       await waitFor(() => expect(screen.getByText('run.started')).toBeTruthy())

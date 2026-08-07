@@ -46,7 +46,7 @@ function stubFetch(switches: unknown[], opts: { failList?: boolean; failPut?: bo
     if (url.includes('/permission')) {
       if (opts.failPut)
         return Promise.resolve(
-          new Response(JSON.stringify({ detail: { message: 'policy writes unsupported' } }), {
+          new Response(JSON.stringify({ ok: false, error: { message: 'policy writes unsupported' } }), {
             status: 501,
             headers: { 'content-type': 'application/json' },
           }),
@@ -59,6 +59,26 @@ function stubFetch(switches: unknown[], opts: { failList?: boolean; failPut?: bo
   vi.stubGlobal('fetch', fn)
   return calls
 }
+
+/**
+ * Reach the confirmation the kill switch now sits behind (§5.15).
+ *
+ * Every policy write in this view goes through it, so the helper is what a test has
+ * to say out loud: the row button opens a decision, it does not take one.
+ */
+async function openSwitch(label: RegExp) {
+  await waitFor(() => expect(screen.getByRole('button', { name: label })).toBeTruthy())
+  fireEvent.click(screen.getByRole('button', { name: label }))
+  return screen.getByRole('dialog')
+}
+
+const typeReason = (text: string) =>
+  fireEvent.change(screen.getByLabelText(/^Reason/), { target: { value: text } })
+
+const pickTier = (tier: string) =>
+  fireEvent.change(screen.getByLabelText('New permission'), { target: { value: tier } })
+
+const puts = (calls: Call[]) => calls.filter((c) => c.method === 'PUT')
 
 describe('ToolsView', () => {
   beforeEach(() => localStorage.setItem('rya_token', 'test-token'))
@@ -102,7 +122,11 @@ describe('ToolsView', () => {
         id: 'email.send',
         permission: 'allowed',
         effectivePermission: 'disabled',
-        override: { permission: 'disabled', ts: '2026-08-05T09:00:00Z', reason: 'console kill switch' },
+        override: {
+          permission: 'disabled',
+          ts: '2026-08-05T09:00:00Z',
+          reason: 'vendor incident INC-4412 — refunds paused',
+        },
       },
     ])
     render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
@@ -113,29 +137,160 @@ describe('ToolsView', () => {
     expect(screen.getAllByText('allowed').length).toBeGreaterThan(1)
     expect(screen.getAllByText('disabled').length).toBeGreaterThan(1)
     // ...and the override says WHY, not just that it exists.
-    expect(screen.getByTitle(/console kill switch/)).toBeTruthy()
+    expect(screen.getByTitle(/INC-4412/)).toBeTruthy()
   })
 
-  it('PUTs the kill switch to the agent-prefixed path and toasts the result', async () => {
+  /**
+   * §5.15, the whole of it in one test: pressing the switch DECIDES nothing.
+   *
+   * The old column wrote privileged, append-only policy state on the first click, in a
+   * table a 6s poll keeps repainting — a mis-click refused every call to a live tool
+   * and there was no step at which the operator could have noticed which row they were
+   * on. The request must not exist until a human has confirmed it.
+   */
+  it('opens a confirmation and sends NO request until it is confirmed', async () => {
+    const calls = stubFetch([
+      { id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' },
+    ])
+    render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
+
+    const dialog = await openSwitch(/Disable/)
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    expect(puts(calls).length).toBe(0)
+    // ...and still nothing after the microtasks a write would have queued.
+    await waitFor(() => expect(screen.getByLabelText(/^Reason/)).toBeTruthy())
+    expect(puts(calls).length).toBe(0)
+  })
+
+  it('writes nothing when the confirmation is cancelled', async () => {
+    const calls = stubFetch([
+      { id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' },
+    ])
+    render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
+
+    await openSwitch(/Disable/)
+    typeReason('changed my mind')
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(puts(calls).length).toBe(0)
+  })
+
+  it('writes nothing when the confirmation is dismissed with Escape', async () => {
+    const calls = stubFetch([
+      { id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' },
+    ])
+    render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
+
+    await openSwitch(/Disable/)
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(puts(calls).length).toBe(0)
+  })
+
+  /**
+   * The reason on the wire is the OPERATOR'S, not a constant.
+   *
+   * `_set_tool_permission` stores it verbatim in a versioned, attributed, append-only
+   * policy record, and `GET /tools/log` reads that record back. The console used to
+   * fabricate `'console kill switch'` there, which says nothing the log's own actor and
+   * timestamp did not already say — and destroyed the only field that could have
+   * distinguished an incident response from a mis-click.
+   */
+  it('PUTs the reason the operator typed, not a hardcoded one', async () => {
     const calls = stubFetch([
       { id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' },
     ])
     const toasts: string[] = []
     render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={(m) => toasts.push(m)} />)
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /Disable/ })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: /Disable/ }))
+    await openSwitch(/Disable/)
+    typeReason('  vendor incident INC-4412 — refunds paused until the postmortem  ')
+    fireEvent.click(screen.getByRole('button', { name: 'Write override' }))
 
     await waitFor(() => expect(toasts.length).toBe(1))
-    const put = calls.find((c) => c.method === 'PUT')!
+    const put = puts(calls)[0]!
     expect(put.url).toBe(`/agents/${AGENT}/tools/email.send/permission`)
-    expect(JSON.parse(put.body!)).toEqual({ permission: 'disabled', reason: 'console kill switch' })
+    expect(JSON.parse(put.body!)).toEqual({
+      permission: 'disabled',
+      // Trimmed: leading whitespace in an audit record is noise that never washes out.
+      reason: 'vendor incident INC-4412 — refunds paused until the postmortem',
+    })
+    expect(put.body).not.toContain('console kill switch')
     expect(toasts[0]).toContain('Disabled email.send')
     expect(toasts[0]).toContain('v7')
     expect(toasts[0]).toContain('effective immediately')
     // Refresh-after-write: the table re-reads the server's view rather than
     // patching one cell from the response.
     await waitFor(() => expect(calls.filter((c) => c.url.endsWith('/tools')).length).toBe(2))
+    // The decision is made, so the dialog goes.
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  /**
+   * The tier that was documented and unreachable. The legend at the foot of this view
+   * explains that `approval_required` PAUSES the run for a human — the thing an
+   * operator actually wants mid-incident — while the column offered a hardcoded
+   * `disabled` and a clear, so the console described a capability it did not offer.
+   */
+  it('can put a tool behind approval, the tier the column could not reach', async () => {
+    const calls = stubFetch([
+      { id: 'billing.refund', permission: 'allowed', effectivePermission: 'allowed' },
+    ])
+    const toasts: string[] = []
+    render(<ToolsView state={stateWith([tool('billing.refund', 'allowed')])} onToast={(m) => toasts.push(m)} />)
+
+    await openSwitch(/Disable/)
+    pickTier('approval_required')
+    typeReason('every refund reviewed by hand while we audit the vendor')
+    fireEvent.click(screen.getByRole('button', { name: 'Write override' }))
+
+    await waitFor(() => expect(toasts.length).toBe(1))
+    expect(JSON.parse(puts(calls)[0]!.body!)).toEqual({
+      permission: 'approval_required',
+      reason: 'every refund reviewed by hand while we audit the vendor',
+    })
+    expect(toasts[0]).toContain('billing.refund → approval_required')
+  })
+
+  it('offers exactly the four tiers the legend documents', async () => {
+    stubFetch([{ id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' }])
+    render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
+
+    await openSwitch(/Disable/)
+    const sel = screen.getByLabelText('New permission') as HTMLSelectElement
+    expect([...sel.options].map((o) => o.value)).toEqual([
+      'allowed',
+      'read_only',
+      'approval_required',
+      'disabled',
+    ])
+    // `disabled` is preselected: this column is the kill switch, and killing the tool
+    // is what an operator reaching for it usually means. The rest are one keystroke
+    // away rather than absent.
+    expect(sel.value).toBe('disabled')
+  })
+
+  it('will not write an override until a reason is actually typed', async () => {
+    const calls = stubFetch([
+      { id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' },
+    ])
+    render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={() => {}} />)
+
+    await openSwitch(/Disable/)
+    const confirm = () => screen.getByRole('button', { name: 'Write override' }) as HTMLButtonElement
+    expect(confirm().disabled).toBe(true)
+    fireEvent.click(confirm())
+    expect(puts(calls).length).toBe(0)
+
+    // Whitespace is not a reason — an audit record of `'   '` is worse than the
+    // constant it replaced, because it looks deliberate.
+    typeReason('   ')
+    expect(confirm().disabled).toBe(true)
+
+    typeReason('paused pending the postmortem')
+    expect(confirm().disabled).toBe(false)
   })
 
   it('restores by CLEARING the override rather than writing the manifest value back', async () => {
@@ -145,12 +300,17 @@ describe('ToolsView', () => {
     const toasts: string[] = []
     render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={(m) => toasts.push(m)} />)
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /Restore/ })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: /Restore/ }))
+    await openSwitch(/Restore/)
+    // Confirmed, because re-enabling a tool somebody deliberately killed is itself
+    // consequential — quite possibly mid-incident. But no reason is asked for: the
+    // server drops the record rather than annotating it, so a reason typed here would
+    // go nowhere.
+    expect(screen.queryByLabelText(/^Reason/)).toBeNull()
+    expect(puts(calls).length).toBe(0)
 
+    fireEvent.click(screen.getByRole('button', { name: 'Drop override' }))
     await waitFor(() => expect(toasts.length).toBe(1))
-    const put = calls.find((c) => c.method === 'PUT')!
-    expect(JSON.parse(put.body!)).toEqual({ clear: true })
+    expect(JSON.parse(puts(calls)[0]!.body!)).toEqual({ clear: true })
     expect(toasts[0]).toContain('Restored email.send')
   })
 
@@ -158,23 +318,31 @@ describe('ToolsView', () => {
     const calls = stubFetch([{ id: 'a/b', permission: 'allowed', effectivePermission: 'allowed' }])
     render(<ToolsView state={stateWith([tool('a/b', 'allowed')])} onToast={() => {}} />)
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /Disable/ })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: /Disable/ }))
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true))
-    expect(calls.find((c) => c.method === 'PUT')!.url).toBe(`/agents/${AGENT}/tools/a%2Fb/permission`)
+    await openSwitch(/Disable/)
+    typeReason('encoding check')
+    fireEvent.click(screen.getByRole('button', { name: 'Write override' }))
+    await waitFor(() => expect(puts(calls).length).toBe(1))
+    expect(puts(calls)[0]!.url).toBe(`/agents/${AGENT}/tools/a%2Fb/permission`)
   })
 
-  it('surfaces a failed write as a toast and leaves the button usable', async () => {
+  it('surfaces a failed write as a toast, and keeps the typed reason to retry with', async () => {
     stubFetch([{ id: 'email.send', permission: 'allowed', effectivePermission: 'allowed' }], { failPut: true })
     const toasts: string[] = []
     render(<ToolsView state={stateWith([tool('email.send', 'allowed')])} onToast={(m) => toasts.push(m)} />)
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /Disable/ })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: /Disable/ }))
+    await openSwitch(/Disable/)
+    typeReason('vendor incident INC-4412')
+    fireEvent.click(screen.getByRole('button', { name: 'Write override' }))
 
     await waitFor(() => expect(toasts[0]).toMatch(/^Error —/))
+    // The dialog survives the failure: discarding a sentence the operator has just
+    // composed, because the server 501'd, teaches them to type '.' next time.
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect((screen.getByLabelText(/^Reason/) as HTMLTextAreaElement).value).toBe('vendor incident INC-4412')
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: /Disable/ }) as HTMLButtonElement).disabled).toBe(false),
+      expect((screen.getByRole('button', { name: 'Write override' }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
     )
   })
 

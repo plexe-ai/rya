@@ -1,0 +1,237 @@
+# Rya CI.
+#
+# Before this file existed nothing ran anywhere but on a developer's laptop, and the
+# two things most likely to break were the two nothing checked: the console bundle
+# (gitignored build output, so a clean clone silently has none) and the wheel that is
+# supposed to contain it (a missing bundle is a designed-legal 503, so the wheel
+# builds and publishes without complaint). Every job below exists because of a
+# specific way the release path can fail quietly.
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  # `deps-unlocked` is scheduled rather than gating — see that job.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+# A newer push to the same ref makes the older run's verdict irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The operator console: type-check, unit tests, and a real production build.
+  # ---------------------------------------------------------------------------
+  console:
+    name: console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/console
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/console/package-lock.json
+
+      # `ci`, not `install`: it installs the lockfile exactly and fails if
+      # package.json has drifted from it. A lockfile nothing enforces is a suggestion.
+      - run: npm ci --no-fund --no-audit
+
+      # Split from the build even though `npm run build` re-runs tsc, because "types
+      # are wrong" and "the bundle would not build" are different answers and the run
+      # should say which one it is.
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: Build the bundle
+        run: npm run build
+
+      # `vite build` reports success by exit code; this checks it actually wrote to the
+      # path the wheel force-includes (`artifacts` in pyproject.toml). Those two drift
+      # the moment someone edits `outDir` in vite.config.ts without reading
+      # docs/PACKAGING.md, and the failure mode is a wheel with no console.
+      - name: The bundle landed in the Python package tree
+        run: test -f ../../src/rya/console/dist/index.html
+
+      # Consumed by `wheel` and `image` so neither has to re-run Node, and downloadable
+      # from a PR when someone needs to see the exact bytes a change produced.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: console-dist
+          path: src/rya/console/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The platform. Locked installs on the floor and the ceiling of the declared
+  # `requires-python = ">=3.10"`.
+  # ---------------------------------------------------------------------------
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `--locked` is the point of this job. An UNLOCKED resolve of `mcp>=1.2.0`
+      # currently picks up mcp 2.0, which removed `streamablehttp_client` and takes the
+      # whole remote-MCP surface with it — three tests fail on a dependency release
+      # nobody in this repo made. Reproducible first; `deps-unlocked` below is where
+      # that drift gets noticed on purpose instead of during a PR review.
+      - name: Install (locked)
+        run: >
+          uv sync --locked --python ${{ matrix.python }}
+          --extra api --extra postgres --extra llm --extra mcp --extra s3 --extra dev
+
+      - run: uv run --no-sync pytest -q
+
+  # ---------------------------------------------------------------------------
+  # The release path, rehearsed on every PR.
+  #
+  # `uv build --wheel packaging/server` succeeds whether or not the console was
+  # built — the `artifacts` glob simply matches nothing — so "the wheel built" has
+  # never implied "the wheel is shippable". These assertions are the difference.
+  # ---------------------------------------------------------------------------
+  wheel:
+    name: wheels
+    runs-on: ubuntu-latest
+    needs: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Rather than re-running Node: same bytes the `console` job tested and built.
+      - uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: src/rya/console/dist
+
+      # NEVER the repo root — `uv build --wheel .` writes `rya-<version>.whl`, the exact
+      # filename PyPI takes as the thin SDK, containing the whole platform. Separate
+      # output directories so a stray root build cannot impersonate a distribution.
+      # See docs/PACKAGING.md.
+      - run: uv build --wheel packaging/sdk    -o dist/sdk
+      - run: uv build --wheel packaging/server -o dist/server
+
+      - name: The server wheel actually contains the console
+        run: |
+          python3 - dist/server/rya_server-*.whl <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          assets = [n for n in names if n.startswith('rya/console/dist/')]
+          if not assets:
+              sys.exit('console NOT bundled — the wheel would serve a 503 at /')
+          if 'rya/console/dist/index.html' not in assets:
+              sys.exit(f'console/dist present but has no index.html: {assets[:10]}')
+          print(f'console ok — {len(assets)} files')
+          PY
+
+      - name: The SDK wheel is the SDK and not the platform
+        run: |
+          python3 - dist/sdk/rya-*.whl <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          for leaked in ('rya/worker.py', 'rya/api/app.py'):
+              if leaked in names:
+                  sys.exit(f'this is the PLATFORM, not the SDK — found {leaked}')
+          # The thin SDK has no server, so it has no console to ship either.
+          if any(n.startswith('rya/console/dist/') for n in names):
+              sys.exit('the SDK wheel is carrying the console bundle')
+          print(f'sdk ok — {len(names)} entries')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The self-host path: `docker compose up` is the documented way to run Rya, and it
+  # was broken — no Node stage, so the image served the unbuilt-bundle 503 from a
+  # clean clone. Building is half the check; the other half is that the thing it
+  # built actually serves.
+  # ---------------------------------------------------------------------------
+  image:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # `load: true` puts it in the local daemon so the smoke test can run it. No
+      # registry and no credentials: this job proves the image works, it does not
+      # publish anything.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rya:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the container
+        run: |
+          docker run -d --name rya-ci -p 8787:8787 \
+            -v "$PWD/examples/followup_agent:/project" rya:ci
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8787/healthz && exit 0
+            sleep 1
+          done
+          echo "server never became healthy" >&2
+          docker logs rya-ci
+          exit 1
+
+      # Fetches the index the server serves, follows every hashed asset it references,
+      # and checks the CSP on the wire. Catches the two failures no unit test can see:
+      # an index/asset build mismatch, and a policy that blocks its own bundle.
+      - name: Smoke-test the console
+        run: ./scripts/smoke_console.sh http://127.0.0.1:8787
+
+      - name: Container logs
+        if: always()
+        run: docker logs rya-ci
+
+  # ---------------------------------------------------------------------------
+  # Deliberately NOT a gate.
+  #
+  # Resolves dependencies fresh, ignoring uv.lock, so an upstream release that breaks
+  # us shows up here on a schedule instead of in an unrelated PR. It is currently RED
+  # (mcp 2.0 renamed `streamablehttp_client`), which is the exact signal this job is
+  # for — a red weekly run is a to-do, not a broken build.
+  # ---------------------------------------------------------------------------
+  deps-unlocked:
+    name: dependencies (unlocked, advisory)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the newest thing that satisfies pyproject
+        run: uv pip install --system -e '.[api,postgres,llm,mcp,s3,dev]'
+      - run: pytest -q

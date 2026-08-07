@@ -172,7 +172,7 @@ def test_a_wrong_claimed_hash_is_refused(platform, client_project, tmp_path):
     payload, _ = _pack(client_project, tmp_path)
     r = _publish(c, payload, "0" * 64, env="prod")
     assert r.status_code == 409
-    assert r.json()["detail"]["code"] == "E_BUNDLE_MISMATCH"
+    assert r.json()["error"]["code"] == "E_BUNDLE_MISMATCH"
 
 
 def test_a_tampered_archive_is_refused(platform, client_project, tmp_path):
@@ -198,7 +198,7 @@ def test_a_tampered_archive_is_refused(platform, client_project, tmp_path):
 
     r = _publish(c, buf.getvalue(), digest, env="prod")
     assert r.status_code == 409
-    assert r.json()["detail"]["code"] == "E_BUNDLE_MISMATCH"
+    assert r.json()["error"]["code"] == "E_BUNDLE_MISMATCH"
 
 
 def test_mismatch_names_sdk_skew_when_that_is_the_cause(platform, client_project, tmp_path):
@@ -227,7 +227,7 @@ def test_mismatch_names_sdk_skew_when_that_is_the_cause(platform, client_project
 
     r = _publish(c, buf.getvalue(), "1" * 64, env="prod")
     assert r.status_code == 409
-    detail = r.json()["detail"]
+    detail = r.json()["error"]
     assert detail["code"] == "E_BUNDLE_MISMATCH"
     assert "9.9.9" in detail["message"]
     assert "SDK version" in (detail["hint"] or "")
@@ -249,7 +249,7 @@ def test_a_tar_escaping_member_is_rejected(platform, tmp_path):
 
     r = _publish(c, buf.getvalue(), "2" * 64, env="prod")
     assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "E_VALIDATION"
+    assert r.json()["error"]["code"] == "E_VALIDATION"
     assert not (tmp_path / "escaped.txt").exists()
 
 
@@ -262,14 +262,14 @@ def test_a_missing_hash_is_a_validation_error(platform, client_project, tmp_path
     r = c.post(f"/agents/{AGENT}/versions", content=payload,
                headers={"content-type": "application/gzip", "Authorization": f"Bearer {TOKEN}"})
     assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "E_VALIDATION"
+    assert r.json()["error"]["code"] == "E_VALIDATION"
 
 
 def test_an_empty_body_is_a_validation_error(platform):
     c, _ = platform
     r = _publish(c, b"", "3" * 64)
     assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "E_VALIDATION"
+    assert r.json()["error"]["code"] == "E_VALIDATION"
 
 
 def test_an_oversized_body_is_refused(platform, client_project, tmp_path, monkeypatch):
@@ -278,7 +278,7 @@ def test_an_oversized_body_is_refused(platform, client_project, tmp_path, monkey
     payload, digest = _pack(client_project, tmp_path)
     r = _publish(c, payload, digest)
     assert r.status_code == 413
-    assert r.json()["detail"]["code"] == "E_VALIDATION"
+    assert r.json()["error"]["code"] == "E_VALIDATION"
 
 
 def test_a_bundle_for_another_agent_is_refused(platform, tmp_path):
@@ -291,7 +291,7 @@ def test_a_bundle_for_another_agent_is_refused(platform, tmp_path):
 
     r = _publish(c, payload, digest, env="prod")
     assert r.status_code == 400
-    detail = r.json()["detail"]
+    detail = r.json()["error"]
     assert detail["code"] == "E_VALIDATION"
     assert "some-other-agent" in detail["message"] and AGENT in detail["message"]
 
@@ -304,7 +304,7 @@ def test_publish_requires_the_operator_token(platform, client_project, tmp_path)
     payload, digest = _pack(client_project, tmp_path)
     r = _publish(c, payload, digest, env="prod", token=None)
     assert r.status_code == 401
-    assert r.json()["detail"]["code"] == "E_UNAUTHORIZED"
+    assert r.json()["error"]["code"] == "E_UNAUTHORIZED"
 
 
 def test_a_wrong_token_is_refused(platform, client_project, tmp_path):
@@ -327,7 +327,7 @@ def test_an_open_control_plane_refuses_to_publish(tmp_path, monkeypatch, client_
     payload, digest = _pack(client_project, tmp_path)
     r = _publish(c, payload, digest, env="prod", token=None)
     assert r.status_code == 403
-    detail = r.json()["detail"]
+    detail = r.json()["error"]
     assert detail["code"] == "E_UNAUTHORIZED"
     assert "RYA_TOKEN" in detail["hint"]
 
@@ -369,7 +369,7 @@ def test_a_readiness_gate_blocks_promotion_on_this_path(platform, client_project
     payload, digest = _pack(client_project, tmp_path)
     r = _publish(c, payload, digest, env="prod")
     assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "E_PROMOTION_BLOCKED"
+    assert r.json()["error"]["code"] == "E_PROMOTION_BLOCKED"
 
     # ...but recording the version is still allowed; only the pointer flip is not.
     ok = _publish(c, payload, digest, env="prod", promote="false")

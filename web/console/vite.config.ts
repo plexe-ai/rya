@@ -41,5 +41,9 @@ export default defineConfig({
     globals: true,
     include: ['src/**/*.test.{ts,tsx}'],
     setupFiles: ['src/test-setup.ts'],
+    // Headroom over the 4s `asyncUtilTimeout` set in test-setup.ts, so a `waitFor`
+    // that is never going to resolve reports Testing Library's DOM dump instead of
+    // being cut off first by vitest's 5s default with no diagnostic.
+    testTimeout: 15_000,
   },
 })

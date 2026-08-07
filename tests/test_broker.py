@@ -156,6 +156,8 @@ def test_governance_writes_and_the_execution_plane_are_withheld(served):
                 "queue_counts",        # sibling volume
                 "queue_claim_one",     # subsumed by the claim SERVICE
                 "list_runs",           # enumerating the tenant's other runs
+                "list_runs_page",      # the same enumeration, one window at a time
+                "list_sessions_page",  # and the same for conversations
                 "journal_read",
                 "reseal_connections"]  # touches the seal key
     try:

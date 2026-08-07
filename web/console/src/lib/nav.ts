@@ -22,6 +22,27 @@ export type CountKey =
   | 'envs' | 'versions' | 'workers' | 'sessions' | 'queue'
   | 'violations' | 'approvals' | 'secrets'
 
+/**
+ * One sidebar count. **`value: null` means the count is not known**, which is a
+ * third state and not a zero.
+ *
+ * Audit §5.10: the badge rendered `{value || ''}`, so a real 0 and a count whose
+ * request failed came out as the same blank — "0 workers" and "the workers endpoint
+ * is down" were indistinguishable. That is the outage-vs-idle confusion the workers
+ * route's own comment says must never happen, reproduced one panel to the left.
+ *
+ * Three states, three renderings, and the shell has to choose between them
+ * deliberately: a number, `—` for known-to-be-unknown, and no badge at all for a
+ * nav row that simply has no count.
+ */
+export interface NavCount {
+  value: number | null
+  /** Render in amber when this is attention rather than decoration. */
+  amber?: boolean
+}
+
+export type NavCounts = Partial<Record<CountKey, NavCount>>
+
 export interface NavItem {
   id: ViewId
   label: string

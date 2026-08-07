@@ -35,6 +35,55 @@ def test_build_console_shape(tmp_path):
     assert len(c["approvals"]) == 1
 
 
+def test_a_pending_approval_carries_everything_needed_to_decide(tmp_path):
+    """An approval is the only irreversible human gate, so the snapshot must ship the
+    case for it — the body, the tool, and the ARGUMENTS the operator is consenting to.
+
+    All three were already here; the console rendered none of them and drew a mail icon
+    instead (audit §4.4). This pins the payload so a future trim of `build_console`
+    cannot quietly take the operator's evidence away again.
+    """
+    scaffold.write_project(tmp_path, "agg", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    engine = Engine(manifest, agent, Store(tmp_path), tmp_path)
+    engine.run_event("message.received", {"email": "ada@x.com"})
+
+    a = build_console(manifest, engine.store, agent, tmp_path)["approvals"][0]
+    assert a["title"] and a["runId"]
+    assert a["body"], "the human-readable case for the action"
+    assert a["action"] and a["action"].get("tool"), "which tool runs on approve"
+    assert isinstance(a["action"].get("input"), dict), "and with what arguments"
+
+
+def test_each_approval_says_which_agent_it_belongs_to(tmp_path):
+    """`list_approvals` is workspace-wide by design — `GET /approvals` is an inbox and
+    `app.py` says so. The snapshot's other keys are scoped to ONE agent, so every row
+    carries `agent` and the console marks the ones that are not the selected agent.
+
+    Narrowing here instead would be worse: hiding a pending gate because a different
+    agent happens to be selected is how a run waits forever.
+    """
+    scaffold.write_project(tmp_path, "agg", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    agent = load_agent(manifest, tmp_path)
+    store = Store(tmp_path)
+    engine = Engine(manifest, agent, store, tmp_path)
+    engine.run_event("message.received", {"email": "ada@x.com"})
+
+    # A second agent's paused run, in the same workspace.
+    other = {"id": store.new_run_id(), "agent": "other-agent", "status": "waiting_approval",
+             "trace": [], "journal": {}, "createdAt": "2026-08-07T00:00:00Z"}
+    store.save_run(other)
+    store.create_approval(other["id"], "Refund #9", "duplicate charge",
+                          {"tool": "payments.refund", "input": {"amount": 500000}})
+
+    rows = {a["title"]: a for a in build_console(manifest, store, agent, tmp_path)["approvals"]}
+    assert len(rows) == 2, "the inbox stays workspace-wide"
+    assert rows["Refund #9"]["agent"] == "other-agent"
+    assert next(v["agent"] for k, v in rows.items() if k != "Refund #9") == "agg"
+
+
 def test_console_page_is_served(tmp_path, monkeypatch):
     """`/` serves the React bundle's index.html — the one console there is.
 
@@ -112,6 +161,79 @@ def test_cors_allowlist_via_env(tmp_path, monkeypatch):
     c, _ = _client(tmp_path, monkeypatch)
     r = c.get("/console", headers={"Origin": "http://localhost:4321"})
     assert r.headers.get("access-control-allow-origin") == "http://localhost:4321"
+
+
+def _preflight(client, path, method, origin="http://localhost:4321"):
+    """The browser's actual first request for a non-simple method.
+
+    Worth doing on the wire rather than reading `allow_methods` back out of the
+    middleware: a preflight the middleware REJECTS is a 400 with no
+    `access-control-allow-*` at all, and that 400 — not the later DELETE — is what
+    the operator sees. Any path works, because CORS answers preflights ahead of
+    routing.
+    """
+    return client.options(path, headers={
+        "Origin": origin,
+        "Access-Control-Request-Method": method,
+        "Access-Control-Request-Headers": "authorization",
+    })
+
+
+def test_cors_preflights_the_destructive_verbs(tmp_path, monkeypatch):
+    """Revoking an API key and removing a member are `@api.delete`, and DELETE was
+    missing from `allow_methods` — so cross-origin, both died at the preflight with a
+    400 before the request was ever made. Invisible in both normal setups: `rya serve`
+    is same-origin, and the Vite dev server proxies.
+    """
+    monkeypatch.setenv("RYA_CORS_ORIGINS", "http://localhost:4321")
+    c, _ = _client(tmp_path, monkeypatch)
+
+    r = _preflight(c, "/v1/workspaces/ws_x/keys/key_y", "DELETE")
+    assert r.status_code != 400, "the preflight itself was refused: DELETE is not allowed"
+    assert r.status_code == 200
+    allowed = {m.strip() for m in r.headers.get("access-control-allow-methods", "").split(",")}
+    assert "DELETE" in allowed
+
+    # PATCH stays out: there is no @api.patch route, and this is an allow-list, so a
+    # verb nothing serves has no business being advertised. Guards a future widening,
+    # and passed before the DELETE fix too.
+    assert _preflight(c, "/v1/workspaces/ws_x/keys/key_y", "PATCH").status_code == 400
+
+
+def _router_methods(app):
+    """Every HTTP method the router actually exposes.
+
+    HEAD and OPTIONS are excluded: Starlette adds HEAD to every GET route for free,
+    and OPTIONS is the preflight the CORS middleware answers itself — neither is a
+    verb anyone declared, so neither belongs in a hand-written allow-list.
+    """
+    methods = set()
+    for route in app.routes:
+        methods |= set(getattr(route, "methods", None) or ())
+    return methods - {"HEAD", "OPTIONS"}
+
+
+def test_cors_allowlist_covers_every_method_the_router_exposes(tmp_path, monkeypatch):
+    """The drift alarm, and the actual fix for §5.18.
+
+    `allow_methods` in `create_app` is hand-written and derived from nothing, so it
+    silently stopped matching the router the moment the first `@api.delete` landed.
+    It cannot be derived at the call site (the router is still half-registered there,
+    and moving the registration would reorder the middleware), so instead: walk the
+    finished router, ask the running middleware what it permits, and fail loudly on
+    the next verb someone adds. Preflights again — the wire is the contract.
+    """
+    monkeypatch.setenv("RYA_CORS_ORIGINS", "http://localhost:4321")
+    c, _ = _client(tmp_path, monkeypatch)
+
+    declared = _router_methods(c.app)
+    assert {"GET", "POST", "PUT", "DELETE"} <= declared, \
+        "sanity: these verbs are all in use, so a walk that misses one is broken"
+
+    refused = sorted(m for m in declared if _preflight(c, "/console", m).status_code == 400)
+    assert not refused, (
+        f"the router serves {refused} but CORS rejects the preflight for them — add them "
+        "to allow_methods in create_app (and check nothing else drifted)")
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +376,7 @@ def test_deployment_panels_are_calm_on_a_fresh_install(tmp_path, monkeypatch):
     # an environment that was never promoted into is a clean 404 with a stable code
     missing = c.get("/agents/_/environments/prod")
     assert missing.status_code == 404
-    assert missing.json()["detail"]["code"] == "E_ENVIRONMENT_NOT_FOUND"
+    assert missing.json()["error"]["code"] == "E_ENVIRONMENT_NOT_FOUND"
     assert c.get("/gate/check", params={"env": "prod"}).status_code == 404
     assert c.get("/gate").json()["default"]["enforced"] is False
     # quota + usage answer even with no policy and no meter records
@@ -454,6 +576,89 @@ def test_console_assets_carry_security_headers(tmp_path, monkeypatch):
         assert r.headers.get("x-content-type-options") == "nosniff", ref
 
 
+def test_the_console_csp_permits_no_cross_origin_socket(tmp_path, monkeypatch):
+    """`connect-src` was `'self' ws: wss:`, and bare `ws:`/`wss:` are SCHEME sources —
+    a socket to any host on the internet, i.e. an exfiltration channel, sitting in the
+    directive whose only job is containment. Nothing in the console wanted it: no
+    `WebSocket`, no `EventSource` (the turn-stream inspector is `fetch` + `getReader()`
+    over SSE, which is a plain `connect-src` fetch to 'self').
+    """
+    c, _ = _client(tmp_path, monkeypatch)
+    csp = c.get("/").headers["content-security-policy"]
+
+    directives = {}
+    for d in csp.split(";"):
+        parts = d.split()
+        if parts:
+            directives[parts[0]] = parts[1:]
+    # Exactly 'self' and nothing beside it. Compared as a token LIST, not with `in`:
+    # "'self'" appears in five other directives, so a substring test over the whole
+    # header would pass with the scheme sources still present.
+    assert directives.get("connect-src") == ["'self'"], csp
+    # And no scheme source smuggled into any other directive either. Tokenised for the
+    # same reason in reverse: `"ws:" in csp` is satisfied by the "wss:" it is meant to
+    # be a separate check for, so it can never fail alone.
+    tokens = {t for v in directives.values() for t in v}
+    assert not tokens & {"ws:", "wss:"}, csp
+
+
+def test_console_cache_policy_is_immutable_assets_and_a_revalidated_index(tmp_path, monkeypatch):
+    """Shipped backwards, and the index half is an outage.
+
+    `index.html` names the current asset hashes and carried NO `Cache-Control` and no
+    validator at all, so an intermediary picks a heuristic TTL and pins it; after a
+    deploy the pinned index asks for hashes that no longer exist, the bundle 404s, and
+    the operator gets a blank page with nothing in any log. Meanwhile the assets —
+    content-hashed, so a change is a new URL — carried only a validator, buying a
+    conditional request on every page load for files that can never change.
+    """
+    import re
+
+    from rya.api import app as app_mod
+
+    if app_mod._CONSOLE_DIST is None:
+        pytest.skip("frontend not built (run `cd web/console && npm run build`)")
+
+    c, _ = _client(tmp_path, monkeypatch)
+    index = c.get("/")
+    assert index.status_code == 200
+    # Storable, but never reusable without asking first.
+    assert index.headers.get("cache-control") == "no-cache"
+
+    refs = [a for a in re.findall(r'(?:src|href)="([^"]+)"', index.text)
+            if a.startswith("/assets/")]
+    assert refs, "the built index.html should reference at least one hashed asset"
+    for ref in refs:
+        r = c.get(ref)
+        assert r.status_code == 200, ref
+        cc = r.headers.get("cache-control", "")
+        assert "immutable" in cc and "max-age=31536000" in cc, f"{ref}: {cc!r}"
+        # The security headers are still shared: only the cache policy differs.
+        assert r.headers.get("content-security-policy"), ref
+
+
+def test_the_unbuilt_bundle_explainer_is_never_stored(tmp_path, monkeypatch):
+    """A cached 503 outliving the build that fixes it is the pinned-index failure with
+    the sign flipped: a working deployment reporting itself broken, and no way to tell
+    it to stop.
+
+    `_CONSOLE_DIST` is a module global resolved at import; the `/assets` mount is
+    conditioned on it at build time and `_console_index()` reads it per call, so the
+    patch has to land before `build_app`.
+    """
+    from rya.api import app as app_mod
+
+    monkeypatch.setattr(app_mod, "_CONSOLE_DIST", None)
+    c, _ = _client(tmp_path, monkeypatch)
+
+    r = c.get("/")
+    assert r.status_code == 503, "this test is worthless unless it took the unbuilt branch"
+    assert "npm run build" in r.text
+    assert r.headers.get("cache-control") == "no-store"
+    # Same policy as every other console response — an error page is still a page.
+    assert "frame-ancestors 'none'" in r.headers.get("content-security-policy", "")
+
+
 def test_console_dist_detection_requires_an_index(tmp_path, monkeypatch):
     """A dist/ dir without index.html counts as not-built, not as a broken bundle.
 
@@ -472,3 +677,193 @@ def test_console_dist_detection_requires_an_index(tmp_path, monkeypatch):
 
     (dist / "index.html").write_text("<!doctype html>")
     assert app_mod._console_dist_dir() is not None  # index.html present -> built
+
+
+# ---------------------------------------------------------------------------
+# Governance reads the sources that ENFORCE (audit §4.5)
+# ---------------------------------------------------------------------------
+# Both of this view's governed sources had moved and neither read moved with
+# them: kill switches came from the pre-§11.2 `_runtime_config` memory scope
+# that nothing writes, and egress came from `rya.guard.yaml` while the editor
+# writes the store. The tests below are written against the ENFORCEMENT path —
+# they set a switch through the real endpoint and read the guard through the
+# real resolver — because a governance dashboard that agrees with a fixture but
+# not with the runtime is exactly the defect.
+
+
+def _gov(client, agent="console-agent"):
+    return client.get(f"/console?agent={agent}").json()["governance"]
+
+
+def test_a_live_kill_switch_appears_in_governance(tmp_path, monkeypatch):
+    """Kill a tool through the API; the screen an operator opens to confirm it must
+    not say "No overrides."."""
+    c, _ = _client(tmp_path, monkeypatch)
+    r = c.put("/tools/email.send/permission",
+              json={"permission": "disabled", "reason": "incident 42"})
+    assert r.status_code == 200
+
+    g = _gov(c)
+    assert [o["tool"] for o in g["switches"]["active"]] == ["email.send"]
+    assert g["switches"]["active"][0]["permission"] == "disabled"
+    assert g["switches"]["active"][0]["reason"] == "incident 42"
+    assert g["switches"]["error"] is None
+    # The document version, since the log versions the whole map and not each tool.
+    assert g["switches"]["version"] == 1
+
+
+def test_governance_counts_effective_permissions_not_declared_ones(tmp_path, monkeypatch):
+    """"Denied: 0" while a tool is killed is the same lie as an empty table."""
+    c, _ = _client(tmp_path, monkeypatch)
+    before = _gov(c)["policy"]
+    assert before["toolsGated"] == 1 and before["toolsDenied"] == 0
+    assert before["toolsOverridden"] == 0
+
+    c.put("/tools/email.send/permission", json={"permission": "disabled"})
+
+    after = _gov(c)["policy"]
+    assert after["toolsDenied"] == 1, "the killed tool must count as denied"
+    assert after["toolsGated"] == 0, "and must stop counting as merely gated"
+    assert after["toolsOverridden"] == 1
+    # The hash is described as the version an auditor pins a run to, so it has to
+    # cover the override. It was computed from manifest permissions alone.
+    assert after["hash"] != before["hash"]
+
+
+def test_kill_switch_history_is_derived_from_the_policy_log(tmp_path, monkeypatch):
+    """The log stores document snapshots; the console wants per-tool transitions.
+
+    Nothing records WHICH tool an operator touched, so the rows are diffed out of
+    each record's before/after. `actor` rides along — §12 risk 7 calls "who changed
+    this" a feature, and it was written on every record and shown nowhere.
+    """
+    c, _ = _client(tmp_path, monkeypatch)
+    c.put("/tools/email.send/permission", json={"permission": "disabled", "reason": "incident 42"})
+    c.put("/tools/email.send/permission", json={"clear": True})
+
+    hist = _gov(c)["switches"]["history"]
+    assert len(hist) == 2, hist
+    newest, oldest = hist  # newest first
+    assert oldest["tool"] == "email.send"
+    assert oldest["previous"] is None and oldest["permission"] == "disabled"
+    assert oldest["reason"] == "incident 42" and oldest["cleared"] is False
+    # Cleared: the override is gone and the MANIFEST governs again, so the row says
+    # what it went back to rather than leaving the operator to guess.
+    assert newest["cleared"] is True
+    assert newest["previous"] == "disabled"
+    assert newest["permission"] == "approval_required"
+    assert "actor" in newest and "version" in newest
+    # …and the switch really is gone, not merely logged.
+    assert _gov(c)["switches"]["active"] == []
+
+
+def test_a_record_that_changed_another_tool_yields_no_row(tmp_path, monkeypatch):
+    """One record can hold several tools; only the ones that moved are transitions."""
+    c, _ = _client(tmp_path, monkeypatch)
+    c.put("/tools/email.send/permission", json={"permission": "disabled"})
+    c.put("/tools/crm.lookup/permission", json={"permission": "disabled"})
+
+    hist = _gov(c)["switches"]["history"]
+    # Two writes, two rows — NOT three. The second record carries email.send in both
+    # its before and its after, unchanged.
+    assert [h["tool"] for h in hist] == ["crm.lookup", "email.send"]
+
+
+def test_governance_reads_the_guard_the_runtime_resolves(tmp_path, monkeypatch):
+    """Store first, file second — the precedence `_guard_source` writes under.
+
+    Two views a click apart used to describe the firewall from different sources.
+    """
+    from rya.guard import policy_key
+    from rya.store import Store
+
+    c, root = _client(tmp_path, monkeypatch)
+    file_rules = _gov(c)["policy"]["egressRules"]
+    assert _gov(c)["policy"]["egressSource"].startswith("file:")
+    assert file_rules > 1, "the scaffolded guard file ships several rules"
+
+    Store(root).policy_set(policy_key("console-agent"), {"policy": {
+        "default": "allow", "rules": [{"host": "api.stripe.com", "action": "allow"}]}})
+
+    p = _gov(c)["policy"]
+    assert p["egressSource"] == "store"
+    assert p["egressRules"] == 1 != file_rules
+    assert p["egressDefault"] == "allow"
+    assert p["egressVersion"], "the guard's own version, so the two screens can be matched"
+
+
+def test_the_policy_hash_moves_when_the_live_allowlist_changes(tmp_path, monkeypatch):
+    """It is described as the version an auditor pins a run to. Hashing the FILE
+    meant it never moved for a store-backed policy — an auditable pin to a document
+    nobody was enforcing."""
+    from rya.guard import policy_key
+    from rya.store import Store
+
+    c, root = _client(tmp_path, monkeypatch)
+    store = Store(root)
+    store.policy_set(policy_key("console-agent"),
+                     {"policy": {"default": "deny", "rules": [{"host": "a.example", "action": "allow"}]}})
+    before = _gov(c)["policy"]["hash"]
+
+    r = c.put("/guard", json={"policy": {"default": "deny",
+                                         "rules": [{"host": "attacker.example", "action": "allow"}]}})
+    assert r.status_code == 200
+    assert _gov(c)["policy"]["hash"] != before
+
+
+def test_a_published_bundle_with_no_guard_file_still_reports_its_policy(tmp_path, monkeypatch):
+    """A bundle need not ship `rya.guard.yaml`. Reading the file reported
+    "off · 0 rules · not configured" over a deny-default policy that was actively
+    refusing requests — the inverse error, and just as unusable."""
+    from rya.guard import policy_key
+    from rya.store import Store
+
+    c, root = _client(tmp_path, monkeypatch)
+    (root / "rya.guard.yaml").unlink()
+    Store(root).policy_set(policy_key("console-agent"), {"policy": {
+        "default": "deny",
+        "rules": [{"host": "api.stripe.com", "action": "allow"}],
+        "grounding": {"enabled": True}}})
+
+    g = _gov(c)
+    assert g["enforcement"]["egressGuard"] is True
+    assert g["enforcement"]["groundingGate"] is True
+    assert g["policy"]["egressRules"] == 1
+    assert g["policy"]["egressDefault"] == "deny"
+
+
+def test_no_policy_anywhere_is_reported_as_no_policy(tmp_path, monkeypatch):
+    """The one case that stays a no-op must still be distinguishable from a failure."""
+    c, root = _client(tmp_path, monkeypatch)
+    (root / "rya.guard.yaml").unlink()
+
+    g = _gov(c)
+    assert g["enforcement"]["egressGuard"] is False
+    assert g["policy"]["egressSource"] == "none"
+    assert g["policy"]["egressDefault"] is None
+    assert g["policy"]["egressError"] is None
+
+
+def test_an_unreadable_policy_store_is_reported_not_swallowed(tmp_path, monkeypatch):
+    """The §4.5 failure one layer up: an empty table and an unreachable store look
+    identical and mean opposite things."""
+    from rya.manifest import load_manifest
+    from rya.snapshot import build_console
+    from rya.store import Store
+
+    scaffold.write_project(tmp_path, "gov", template="demo")
+    manifest = load_manifest(tmp_path / "rya.agent.yaml")
+    store = Store(tmp_path)
+
+    def boom(key):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(store, "policy_get", boom)
+    g = build_console(manifest, store, None, tmp_path)["governance"]
+
+    assert g["switches"]["active"] == []
+    assert "connection refused" in (g["switches"]["error"] or "")
+    # The guard resolver fails CLOSED on the same error, and the view says so rather
+    # than describing the file as though it were in force.
+    assert "connection refused" in (g["policy"]["egressError"] or "")
+    assert g["policy"]["egressRules"] == 0

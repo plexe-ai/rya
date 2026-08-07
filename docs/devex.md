@@ -32,7 +32,8 @@ assume a command below is operator-only unless it is in the client list above.
   prompt in the tree is `rya deploy destroy`'s "delete ALL their data?"
   confirmation, and that one is skipped with `--yes`, not `--non-interactive`.
 - **Stable error codes** — every failure returns `{"ok": false, "error":
-  {"code": "E_*", "message", "hint", "exit_code"}}`.
+  {"code": "E_*", "message", "hint", "exit_code"}}`. **The HTTP API returns the
+  same envelope**, byte for byte — see [One error envelope](#one-error-envelope).
 - **Semantic exit codes** — branch on these without parsing prose.
   `_CODE_EXIT` in [src/rya/errors.py](../src/rya/errors.py) is the whole registry:
 
@@ -73,6 +74,97 @@ no envelope to re-raise. The common one is a reverse proxy's HTML 413 — nginx
 defaults `client_max_body_size` to 1 MB, well under Rya's 20 MB
 `RYA_MAX_BUNDLE_BYTES` — which carries no code and falls back to `E_REMOTE`,
 exit 1. Rya's own 413 does carry one.
+
+## One error envelope
+
+**Every failure from the HTTP API — no exceptions — serialises as:**
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "E_AGENT_NOT_FOUND",
+    "message": "No agent named 'nope' is served here.",
+    "hint": "Publish one with `rya deploy`, or GET /agents to see what is served.",
+    "exit_code": 4
+  }
+}
+```
+
+This is the same object `rya <cmd> --json` prints on failure, the same one an MCP
+tool reply carries, and the same one a broker reply carries. **One envelope for the
+whole product: learn it once, read it everywhere.** Branch on `code`, show `hint`,
+and never parse `message` — it is written for humans and will change.
+
+Three handlers in `src/rya/api/app.py` are the only places the shape is decided, so
+route code raises whatever is natural and normalisation happens once:
+
+| raised as | normalised by |
+|---|---|
+| `RyaError` (anywhere in the call stack) | `_rya_error_handler` |
+| `HTTPException(detail={code, message, hint})` | `_http_error_handler` |
+| `HTTPException(404, "Not Found")`, Starlette's own 404/405 | `_http_error_handler`, code inferred from the status |
+| FastAPI request validation (`{"detail": [{loc, msg}]}`) | `_validation_error_handler` → `E_VALIDATION`, flattened to prose |
+
+A failure that never had a code gets one inferred from the status — 404 →
+`E_NOT_FOUND`, 401/403 → `E_UNAUTHORIZED`, 400/413/422 → `E_VALIDATION`, 408/504 →
+`E_TIMEOUT`, else `E_RUNTIME`. That mapping is mirrored in
+`clients/typescript/src/errors.ts: inferCode`, so the server and the SDK never
+disagree about what a bare status means. 404 stays the generic noun deliberately:
+it could be a run, job, version or session, and guessing `E_RUN_NOT_FOUND` would
+send a caller hunting in the wrong place.
+
+`tests/test_api.py::_assert_envelope` is the executable form of this contract.
+
+> **History.** This used to be three shapes: `{"detail": {…}}` from
+> `HTTPException`, the bare error object from the `RyaError` handler, and
+> `{"detail": [{loc, msg}]}` from the validator. No client can read three envelopes
+> with one expression, so the operator console read one of them and rendered the
+> other two as the literal string `HTTP 400` — losing `message` and `hint` across
+> the whole quota, governance, versioning and agent-addressing vocabulary. The
+> envelope had never been written down for HTTP, only for the CLI, which is how the
+> divergence went unnoticed. Hence this section.
+
+## One paged-listing shape
+
+Written down for the same reason the envelope above is: the next route that needs a
+window should not have to invent `total` / `page` / `per_page` and leave a client
+guessing which listing speaks which dialect.
+
+Any listing that can grow without bound takes **`limit` and `offset`** and answers
+with the rows plus **`count`**, `limit` and `offset`:
+
+```
+GET /agents/{agent}/runs?limit=50&offset=0&status=failed&q=refund&summary=1
+{ "runs": [ … ], "count": 412, "limit": 50, "offset": 0 }
+
+GET /agents/{agent}/sessions?limit=50&offset=50
+{ "sessions": [ … ], "count": 137, "limit": 50, "offset": 50 }
+```
+
+Four rules, all of them load-bearing:
+
+- **`count` is the size of the filtered SET, never of the page.** It is what lets a
+  client say "showing 50 of 412" honestly. A client that tries to infer the total
+  from a page cannot, and the failure mode is not a missing number — it is a
+  confident wrong one (see the console audit §5.1: filter pills counted a 30-row
+  preview, so a search for an older run id answered "No runs match").
+- **Paging is opt-in.** With no `limit`, a listing returns everything, exactly as it
+  did before it learned to page — `rya runs list` and the TypeScript SDK read these
+  routes unparameterised.
+- **`limit` is clamped server-side** (1..500 via `_page_limit`). These routes project
+  every row they return, so an unclamped `?limit=1000000` is a way to ask one request
+  to materialise a whole workspace.
+- **Filters are defined once, server-side.** `store.run_matches` is the written
+  definition of `status` (equality) and `q` (case-insensitive substring of the run id
+  or trigger); both store backends implement that same predicate, one in Python and
+  one pushed into SQL, so the rows and the counts beside them cannot disagree
+  depending on which backend a workspace is on.
+
+`summary=1` on `/runs` is a projection, not a page: it returns
+`snapshot.run_summary` — the one run ROW shared by this listing, `/console`'s preview
+and the WebSocket's `run` frame — instead of the full run document, which carries its
+whole trace. Traces are fetched per run, from `GET /runs/{id}/trace`.
 
 ## Inspect → configure → deploy → verify
 

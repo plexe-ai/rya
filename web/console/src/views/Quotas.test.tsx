@@ -20,7 +20,7 @@ function stubFetch(routes: Record<string, unknown | Error>) {
         return Promise.resolve({
           ok: false,
           status: 500,
-          json: () => Promise.resolve({ detail: { message: 'boom' } }),
+          json: () => Promise.resolve({ ok: false, error: { message: 'boom' } }),
         } as unknown as Response)
       }
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as unknown as Response)
@@ -57,12 +57,33 @@ const QUOTAS = {
 
 const METER = { usage: { calls: 9, inputTokens: 1000, outputTokens: 200, costUsd: 0.1234 } }
 
+/**
+ * `GET /posture` as the server actually sends it, which is the point of these fixtures:
+ * `PostureReport.describe()` names its own conditions and there are FOUR of them. This
+ * shape is copied from the server rather than invented here — a fixture that lists the
+ * conditions the console *expects* would re-create audit §5.7 inside the test suite.
+ *
+ * `local` is the honest trusted deployment: no isolation, no mediation, no egress
+ * policy — and D32 satisfied in its weak form, because `local` does launch the claimer.
+ */
 const TRUSTED_POSTURE = {
   untrusted: false,
   ok: false,
+  unmet: [
+    'isolation (D23): the \'local\' driver provides \'none\'',
+    'credential mediation (D18): RYA_BROKER is not set, so a tenant process would hold the database credential',
+    'network egress (D24): RYA_EGRESS_MODE is \'none\', so nothing at the network layer stops tenant code',
+  ],
+  conditions: [
+    { key: 'isolation', label: 'Isolation (D23)', ok: false, detail: 'driver "local" gives no isolation' },
+    { key: 'broker', label: 'Credential mediation (D18)', ok: false, detail: 'broker not mediating' },
+    { key: 'egress', label: 'Network egress (D24)', ok: false, detail: 'no egress policy' },
+    { key: 'topology', label: 'Broker topology (D32)', ok: true, detail: 'the "local" driver launches the claimer' },
+  ],
   isolation: { ok: false, detail: 'driver "local" gives no isolation' },
   broker: { ok: false, detail: 'broker not mediating' },
   egress: { ok: false, detail: 'no egress policy' },
+  topology: { ok: true, detail: 'the "local" driver launches the claimer' },
   driver: { driver: 'local', isolation: 'none' },
   probe: null,
   credentials: { clean: true, violations: [] },
@@ -192,12 +213,103 @@ describe('QuotasView', () => {
 
     expect(await screen.findByText('trusted')).toBeTruthy()
     expect(screen.getByText('hostile-tenant isolation not claimed')).toBeTruthy()
-    // `ok` is false here, yet the posture tile is not flagged: the three conditions
-    // read "not in force" and the tile stays calm.
+    // `ok` is false here, yet the posture tile is not flagged: three of the four
+    // conditions read "not in force" and the tile stays calm.
     expect(screen.getAllByText('not in force').length).toBe(3)
     expect(screen.getByText('Posture').closest('.stat')?.querySelector('.v.amber')).toBeNull()
     // The trusted posture is supported, and the page says so.
     expect(screen.getByText(/the trusted posture is supported/)).toBeTruthy()
+    // ...and the unmet reasons are NOT raised as an alarm here. Unmet-on-trusted is the
+    // DESIGNED state; listing what a deployment would need if it were untrusted would
+    // make every self-host look broken, which is the mistake the badge already avoids.
+    expect(screen.queryByText(/refuses to start work for an untrusted tenant/)).toBeNull()
+    // `unmet` IS sent on this fixture, so this asserts the page discards it here on
+    // purpose rather than never having had it.
+    expect(TRUSTED_POSTURE.unmet.length).toBe(3)
+    expect(screen.queryByText(/driver provides 'none'/)).toBeNull()
+  })
+
+  /**
+   * Audit §5.7, executable. The gate has four conditions and this page used to declare
+   * three of them itself, so when D32 arrived server-side the table went on showing the
+   * three it knew — every one of them "in force" under a tile reading INCOMPLETE,
+   * because `ok`/`unmet` did count the fourth. The rows are the server's now.
+   */
+  it('renders every condition the SERVER names, D32 included, in the gate’s order', async () => {
+    stubFetch({ '/quotas': QUOTAS, '/usage': METER, '/posture': TRUSTED_POSTURE })
+    render(view())
+
+    expect(await screen.findByText('Broker topology (D32)')).toBeTruthy()
+    expect(screen.getByText('the "local" driver launches the claimer')).toBeTruthy()
+
+    const table = screen.getByText('Isolation (D23)').closest('table')
+    const rows = Array.from(table?.querySelectorAll('tbody tr') ?? []).map(
+      (r) => r.querySelector('td')?.textContent,
+    )
+    expect(rows).toEqual([
+      'Isolation (D23)',
+      'Credential mediation (D18)',
+      'Network egress (D24)',
+      'Broker topology (D32)',
+    ])
+  })
+
+  /**
+   * The proof that the drift class is closed, not just this instance of it: a condition
+   * added to the gate after this console shipped renders under the server's own label
+   * with no change here. A client-side list could not do this by construction.
+   */
+  it('renders a condition it has never heard of, labelled by the server', async () => {
+    stubFetch({
+      '/quotas': QUOTAS,
+      '/usage': METER,
+      '/posture': {
+        ...TRUSTED_POSTURE,
+        conditions: [
+          ...TRUSTED_POSTURE.conditions,
+          { key: 'attestation', label: 'Hardware attestation (D41)', ok: false, detail: 'no TPM quote' },
+        ],
+      },
+    })
+    render(view())
+
+    expect(await screen.findByText('Hardware attestation (D41)')).toBeTruthy()
+    expect(screen.getByText('no TPM quote')).toBeTruthy()
+    expect(screen.getAllByText('not in force').length).toBe(4)
+  })
+
+  /**
+   * The other half of §5.7: `unmet` was fetched and discarded, so the tile said
+   * INCOMPLETE and nothing on the page said what was missing. The server writes those
+   * sentences for an operator — they are the refusal message the deploy will produce.
+   */
+  it('says WHY an untrusted posture is incomplete, in the platform’s own words', async () => {
+    const unmet = [
+      "isolation (D23): the 'docker' driver provides 'container'",
+      "broker topology (D32): the 'docker' driver launches a credential-free sandbox, which cannot also be the claimer",
+    ]
+    stubFetch({
+      '/quotas': QUOTAS,
+      '/usage': METER,
+      '/posture': {
+        ...TRUSTED_POSTURE,
+        untrusted: true,
+        ok: false,
+        unmet,
+        conditions: [
+          { key: 'isolation', label: 'Isolation (D23)', ok: false, detail: "the 'docker' driver provides 'container'" },
+          { key: 'broker', label: 'Credential mediation (D18)', ok: true, detail: 'tenant processes are mediated' },
+          { key: 'egress', label: 'Network egress (D24)', ok: true, detail: 'the substrate restricts egress' },
+          { key: 'topology', label: 'Broker topology (D32)', ok: false, detail: 'launches a credential-free sandbox' },
+        ],
+      },
+    })
+    render(view())
+
+    expect(await screen.findByText('INCOMPLETE')).toBeTruthy()
+    // Both reasons, verbatim: an operator reading INCOMPLETE has to be able to act.
+    for (const reason of unmet) expect(screen.getByText(reason)).toBeTruthy()
+    expect(screen.getByText(/refuses to start work for an untrusted tenant/)).toBeTruthy()
   })
 
   it('flags an UNTRUSTED deployment whose conditions are not all in force', async () => {
@@ -209,6 +321,9 @@ describe('QuotasView', () => {
         untrusted: true,
         ok: false,
         egress: { ok: true, detail: 'egress allowlist enforced' },
+        conditions: TRUSTED_POSTURE.conditions.map((c) =>
+          c.key === 'egress' ? { ...c, ok: true, detail: 'egress allowlist enforced' } : c,
+        ),
         probe: { verified: false },
         credentials: { clean: false, violations: [{ group: 'aws' }] },
       },

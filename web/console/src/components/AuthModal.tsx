@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowRight, GitCommitVertical, LogIn, Plug, Plus, Sparkles } from 'lucide-react'
-import { API, authPost, saveSession, sessionPost, setToken } from '../lib/api'
+import { ArrowRight, GitCommitVertical, LogIn, Plug, Plus, Sparkles, X } from 'lucide-react'
+import { authPost, mintUserToken, runtimeInfo, saveSession, sessionPost, setToken } from '../lib/api'
 import type { RuntimeInfo, Workspace } from '../lib/types'
 
 type Tab = 'signup' | 'login' | 'key' | 'ws'
@@ -16,8 +16,25 @@ type Tab = 'signup' | 'login' | 'key' | 'ws'
  *
  * The session token (account-scoped) and the workspace API key are different
  * credentials stored under different keys — see lib/api.ts.
+ *
+ * `reason` is the server's account of the 401 that opened this dialog, when there was
+ * one. It matters because the static copy below can be wrong: on a runtime with
+ * `RYA_JWT_SECRET` set, `get_plane` skips `_check_token` entirely and answers "JWT
+ * required." to every request — so "This runtime requires an operator token", and the
+ * `rya_sk_… or operator token` placeholder beneath it, name a credential that cannot
+ * work. `reason` is also the only thing that separates "JWT is expired." (sign in
+ * again) from "JWT signature verification failed." (worth investigating); both are
+ * `E_UNAUTHORIZED`, so the code alone does not distinguish them.
  */
-export function AuthModal({ onClose, onAuthed }: { onClose: () => void; onAuthed: () => void }) {
+export function AuthModal({
+  onClose,
+  onAuthed,
+  reason,
+}: {
+  onClose: () => void
+  onAuthed: () => void
+  reason?: string | null
+}) {
   const [info, setInfo] = useState<RuntimeInfo | null>(null)
   const [tab, setTab] = useState<Tab>('signup')
   const [err, setErr] = useState('')
@@ -31,14 +48,19 @@ export function AuthModal({ onClose, onAuthed }: { onClose: () => void; onAuthed
   const multiTenant = !!info?.multiTenant
 
   useEffect(() => {
-    fetch(`${API}/v1/info`)
-      .then((r) => r.json())
-      .then((d: RuntimeInfo) => {
-        setInfo(d)
-        // No accounts in single-tenant mode: an operator token is the only way in.
-        if (!d.multiTenant) setTab('key')
-      })
-      .catch(() => setInfo({}))
+    let alive = true
+    // The SHARED probe (lib/api.ts), not a second fetch. The shell asks the same
+    // endpoint to decide whether to open this dialog at all (§5.12), and the two
+    // must be looking at one answer.
+    void runtimeInfo().then((d) => {
+      if (!alive) return
+      setInfo(d)
+      // No accounts in single-tenant mode: an operator token is the only way in.
+      if (!d.multiTenant) setTab('key')
+    })
+    return () => {
+      alive = false
+    }
   }, [])
 
   useEffect(() => {
@@ -99,7 +121,14 @@ export function AuthModal({ onClose, onAuthed }: { onClose: () => void; onAuthed
         '/v1/signup',
         { email, password, workspaceName },
       )
-      if (d.token) saveSession(d.token, email)
+      if (d.token) {
+        saveSession(d.token, email)
+        // Bridge the session to a user JWT straight away, so the very first request
+        // this console makes is attributed to a person rather than to the workspace.
+        // Awaited, not fired and forgotten: `enterWithKey` starts the poll, and a race
+        // there would send the opening requests unattributed.
+        await mintUserToken()
+      }
       // Show the key exactly once — it is not retrievable later.
       setIssuedKey({ name: d.workspace.name, key: d.apiKey })
       setTab('ws')
@@ -116,6 +145,7 @@ export function AuthModal({ onClose, onAuthed }: { onClose: () => void; onAuthed
         password,
       })
       saveSession(d.token, email)
+      await mintUserToken()
       setWorkspaces(d.workspaces || [])
       setTab('ws')
     })
@@ -163,16 +193,54 @@ export function AuthModal({ onClose, onAuthed }: { onClose: () => void; onAuthed
 
   return (
     <div className="authwrap" style={{ display: 'grid' }}>
-      <div className="authcard" role="dialog" aria-modal="true" aria-labelledby="authTitle" ref={cardRef}>
+      <div
+        className="authcard"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="authTitle"
+        ref={cardRef}
+        style={{ position: 'relative' }}
+      >
+        {/* Escape has always closed this dialog and nothing on screen said so, which
+            made a keyboard shortcut the only exit from a full-page modal — including
+            on a runtime that never wanted a credential in the first place (§5.12).
+            An affordance that exists but is invisible is not an affordance.
+
+            Closing is safe in both directions: on an open runtime the console simply
+            loads, and on one that does require a token the shell paints its
+            runtime-down card, which carries an "Enter token" button back here. */}
+        <button
+          className="btn sm"
+          aria-label="Close"
+          title="Close — the console will load without a credential if this runtime does not need one."
+          onClick={onClose}
+          style={{ position: 'absolute', top: 10, right: 10, padding: '4px 6px' }}
+        >
+          <X aria-hidden="true" focusable="false" />
+        </button>
         <div className="al">
           <GitCommitVertical aria-hidden="true" focusable="false" />
         </div>
         <h3 id="authTitle">Welcome to Rya</h3>
+        {/* Three states, because the dialog can now be reached on a runtime that does
+            not want a credential — the workspace button opens it deliberately. Telling
+            an operator "this runtime requires an operator token" when `authRequired`
+            is explicitly false is the same misstatement §5.12 is about, just arriving
+            through the other door. `undefined` keeps the old wording: the probe
+            failed, so a token may well be needed. */}
         <p>
           {multiTenant
             ? 'Create an account to get a workspace + API key, or connect with a key you have.'
-            : 'This runtime requires an operator token. It is stored only in your browser.'}
+            : info?.authRequired === false
+              ? 'This runtime accepts requests without a credential. You can close this and carry on, or paste a token to use one anyway.'
+              : 'This runtime requires an operator token. It is stored only in your browser.'}
         </p>
+
+        {reason && (
+          <div className="anote" role="status">
+            {reason}
+          </div>
+        )}
 
         <div className="authtabs">
           {(['signup', 'login', 'key'] as const).map((t) =>
